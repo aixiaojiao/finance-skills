@@ -1,28 +1,34 @@
 """
 个股看板 · Stock Dashboard — 单文件 Flask + yfinance Web 应用
 
-本地启动:
-    webapp/.venv/bin/python webapp/app.py
-浏览器打开 http://localhost:8000
+启动:  webapp/.venv/bin/python webapp/app.py  →  http://localhost:8000
 
-功能:
-- 实时报价 + K线(蜡烛+成交量)+ MA5/10/20/50/200 叠加
-- SEPA 趋势模板评分卡(Minervini 8 条件 + 四阶段判定 + 结论)   [skill: sepa-strategy]
-- 财报日 + 预期EPS + 历史 beat/miss                           [skill: earnings-preview]
-- 重要消息 / 新闻流                                           (yfinance news)
-- 大盘情绪指标(VIX 恐慌/贪婪代理)+ 大盘技术指标 + 市场环境    [skill: sepa-strategy/market-environment]
-- 流动性评分(ADTV / 美元成交额 / 价差)                       [skill: stock-liquidity]
-- 关键财务指标 + 分析师评级 / 目标价
+页面1「个股看板」: 概览 / 估值 / 期权 / 多股对比 四个子标签 + 自选股
+页面2「市场热力图」: 个股树状热力图(按板块分组)+ 板块 ETF 热力图
+
+后端接口与对应 finance-skills 技能:
+  /api/quote /api/history          基础行情 + MA            yfinance / sepa-strategy
+  /api/sepa                        SEPA 趋势模板评分卡       sepa-strategy
+  /api/earnings                    财报日 + beat/miss        earnings-preview
+  /api/news                        新闻流                    yfinance
+  /api/liquidity                   流动性评分                stock-liquidity
+  /api/market                      大盘情绪/技术/环境         sepa-strategy/market-environment
+  /api/quotes                      自选股批量行情            yfinance
+  /api/compare                     多股归一化对比 + 相关性    stock-correlation
+  /api/valuation                   DCF + 相对估值 + 预期趋势  company-valuation / estimate-analysis
+  /api/options/expiries /chain     期权链                    options-payoff
+  /api/heatmap                     全市场 + 板块热力图        (市场总览)
 
 数据来自 Yahoo Finance(yfinance),非实时、有延迟,仅供研究/学习,不构成投资建议。
-配套 finance-skills 仓库的 market-analysis 个股分析技能。
 """
 
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request, Response
 import yfinance as yf
 import pandas as pd
+import numpy as np
 
 app = Flask(__name__)
 
@@ -53,7 +59,6 @@ def _num(v):
         return None
 
 
-# 简单的内存 TTL 缓存,避免重复打 Yahoo
 _CACHE = {}
 
 def cached(ttl):
@@ -75,12 +80,8 @@ def rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
-    rs = gain / loss
-    out = 100 - 100 / (1 + rs)
-    return out
+    return 100 - 100 / (1 + gain / loss)
 
-
-# ============================ 数据获取(带缓存) ============================
 
 @cached(90)
 def get_info(ticker):
@@ -114,45 +115,34 @@ def api_quote():
         change = price - prev
         change_pct = change / prev * 100
 
-    data = {
+    return jsonify({
         "ticker": ticker,
         "name": _safe(info.get("longName") or info.get("shortName")),
         "currency": _safe(info.get("currency")) or "USD",
         "exchange": _safe(info.get("fullExchangeName") or info.get("exchange")),
-        "sector": _safe(info.get("sector")),
-        "industry": _safe(info.get("industry")),
+        "sector": _safe(info.get("sector")), "industry": _safe(info.get("industry")),
         "price": price, "prevClose": prev, "change": change, "changePct": change_pct,
         "dayHigh": _num(info.get("dayHigh")), "dayLow": _num(info.get("dayLow")),
         "open": _num(info.get("open") or info.get("regularMarketOpen")),
         "volume": _num(info.get("volume") or info.get("regularMarketVolume")),
         "financials": {
-            "marketCap": _num(info.get("marketCap")),
-            "trailingPE": _num(info.get("trailingPE")),
-            "forwardPE": _num(info.get("forwardPE")),
-            "priceToBook": _num(info.get("priceToBook")),
-            "eps": _num(info.get("trailingEps")),
-            "revenue": _num(info.get("totalRevenue")),
-            "profitMargin": _num(info.get("profitMargins")),
-            "grossMargin": _num(info.get("grossMargins")),
-            "dividendYield": _num(info.get("dividendYield")),
-            "beta": _num(info.get("beta")),
-            "fiftyTwoWeekHigh": _num(info.get("fiftyTwoWeekHigh")),
-            "fiftyTwoWeekLow": _num(info.get("fiftyTwoWeekLow")),
+            "marketCap": _num(info.get("marketCap")), "trailingPE": _num(info.get("trailingPE")),
+            "forwardPE": _num(info.get("forwardPE")), "priceToBook": _num(info.get("priceToBook")),
+            "eps": _num(info.get("trailingEps")), "revenue": _num(info.get("totalRevenue")),
+            "profitMargin": _num(info.get("profitMargins")), "grossMargin": _num(info.get("grossMargins")),
+            "dividendYield": _num(info.get("dividendYield")), "beta": _num(info.get("beta")),
+            "fiftyTwoWeekHigh": _num(info.get("fiftyTwoWeekHigh")), "fiftyTwoWeekLow": _num(info.get("fiftyTwoWeekLow")),
         },
         "analyst": {
-            "targetMean": _num(info.get("targetMeanPrice")),
-            "targetHigh": _num(info.get("targetHighPrice")),
-            "targetLow": _num(info.get("targetLowPrice")),
-            "recommendation": _safe(info.get("recommendationKey")),
+            "targetMean": _num(info.get("targetMeanPrice")), "targetHigh": _num(info.get("targetHighPrice")),
+            "targetLow": _num(info.get("targetLowPrice")), "recommendation": _safe(info.get("recommendationKey")),
             "numAnalysts": _num(info.get("numberOfAnalystOpinions")),
         },
-    }
-    return jsonify(data)
+    })
 
 
 # ============================ API: K线 + 均线 ============================
 
-# 显示窗口 -> 实际抓取区间(留足 200MA 预热)
 FETCH_MAP = {"1mo": "1y", "3mo": "2y", "6mo": "2y", "1y": "2y", "2y": "5y", "5y": "max"}
 DISPLAY_BARS = {"1mo": 22, "3mo": 66, "6mo": 126, "1y": 252, "2y": 504, "5y": 1300}
 MA_WINDOWS = [5, 10, 20, 50, 200]
@@ -164,9 +154,8 @@ def api_history():
     period = request.args.get("period", "6mo")
     if not ticker:
         return jsonify({"error": "缺少 ticker 参数"}), 400
-    fetch_period = FETCH_MAP.get(period, "2y")
     try:
-        df = get_history_df(ticker, fetch_period).copy()
+        df = get_history_df(ticker, FETCH_MAP.get(period, "2y")).copy()
     except Exception as e:
         return jsonify({"error": f"获取历史失败: {e}"}), 502
     if df is None or df.empty:
@@ -174,9 +163,7 @@ def api_history():
 
     for w in MA_WINDOWS:
         df[f"ma{w}"] = df["Close"].rolling(w).mean()
-
-    n = DISPLAY_BARS.get(period, 126)
-    df = df.tail(n)
+    df = df.tail(DISPLAY_BARS.get(period, 126))
 
     candles, volumes = [], []
     ma_series = {str(w): [] for w in MA_WINDOWS}
@@ -193,15 +180,13 @@ def api_history():
             mv = _num(row.get(f"ma{w}"))
             if mv is not None:
                 ma_series[str(w)].append({"time": ts, "value": mv})
-
     return jsonify({"ticker": ticker, "candles": candles, "volumes": volumes, "ma": ma_series})
 
 
-# ============================ API: SEPA 趋势模板 ============================
+# ============================ API: SEPA ============================
 
 @cached(300)
 def _spy_return_252():
-    """S&P500 近 252 交易日收益率,用于 RS 代理。"""
     try:
         df = get_history_df("^GSPC", "2y")
         if df is None or df.empty or len(df) < 252:
@@ -230,64 +215,47 @@ def api_sepa():
     ma50 = _num(close.rolling(50).mean().iloc[-1])
     ma150 = _num(close.rolling(150).mean().iloc[-1]) if len(df) >= 150 else None
     ma200 = _num(close.rolling(200).mean().iloc[-1]) if len(df) >= 200 else None
-    ma200_series = close.rolling(200).mean()
-    ma200_1mo = _num(ma200_series.iloc[-22]) if len(df) >= 222 else None
-
+    ma200_1mo = _num(close.rolling(200).mean().iloc[-22]) if len(df) >= 222 else None
     win = min(len(df), 252)
     hi52 = _num(df["High"].tail(win).max())
     lo52 = _num(df["Low"].tail(win).min())
 
-    # RS 代理:个股 vs S&P500 近 12 个月相对涨幅
-    rs_pass = None
-    rs_val = None
+    rs_pass = rs_val = None
     if len(df) >= 252:
         stock_ret = price / _num(close.iloc[-252]) - 1
         spy_ret = _spy_return_252()
         if spy_ret is not None:
-            rs_val = (stock_ret - spy_ret) * 100  # 相对跑赢百分点
+            rs_val = (stock_ret - spy_ret) * 100
             rs_pass = stock_ret > spy_ret
 
     def pct(a, b):
-        if a is None or b is None or b == 0:
-            return None
-        return (a / b - 1) * 100
-
+        return None if (a is None or b is None or b == 0) else (a / b - 1) * 100
     pct_above_low = pct(price, lo52)
-    pct_from_high = pct(price, hi52)  # 负数 = 低于高点
+    pct_from_high = pct(price, hi52)
 
     conds = []
     def cond(no, name, ok, val):
         conds.append({"no": no, "name": name, "pass": bool(ok) if ok is not None else None, "value": val})
-
     cond(1, "价格 > 150MA 且 > 200MA",
-         (ma150 is not None and ma200 is not None and price > ma150 and price > ma200),
+         (ma150 and ma200 and price > ma150 and price > ma200),
          f"价 {price:.2f} / 150MA {ma150:.2f} / 200MA {ma200:.2f}" if ma150 and ma200 else "数据不足")
-    cond(2, "150MA > 200MA",
-         (ma150 is not None and ma200 is not None and ma150 > ma200),
+    cond(2, "150MA > 200MA", (ma150 and ma200 and ma150 > ma200),
          f"{ma150:.2f} vs {ma200:.2f}" if ma150 and ma200 else "数据不足")
-    cond(3, "200MA 近 1 个月向上",
-         (ma200 is not None and ma200_1mo is not None and ma200 > ma200_1mo),
+    cond(3, "200MA 近 1 个月向上", (ma200 and ma200_1mo and ma200 > ma200_1mo),
          f"现 {ma200:.2f} vs 1月前 {ma200_1mo:.2f}" if ma200 and ma200_1mo else "数据不足")
-    cond(4, "50MA > 150MA 且 > 200MA",
-         (ma50 is not None and ma150 is not None and ma200 is not None and ma50 > ma150 and ma50 > ma200),
+    cond(4, "50MA > 150MA 且 > 200MA", (ma50 and ma150 and ma200 and ma50 > ma150 and ma50 > ma200),
          f"50MA {ma50:.2f}" if ma50 else "数据不足")
-    cond(5, "价格 > 50MA",
-         (ma50 is not None and price > ma50),
+    cond(5, "价格 > 50MA", (ma50 and price > ma50),
          f"价 {price:.2f} / 50MA {ma50:.2f}" if ma50 else "数据不足")
-    cond(6, "高于 52周低点 ≥ 30%",
-         (pct_above_low is not None and pct_above_low >= 30),
+    cond(6, "高于 52周低点 ≥ 30%", (pct_above_low is not None and pct_above_low >= 30),
          f"+{pct_above_low:.1f}%" if pct_above_low is not None else "—")
-    cond(7, "距 52周高点 ≤ 25%",
-         (pct_from_high is not None and pct_from_high >= -25),
+    cond(7, "距 52周高点 ≤ 25%", (pct_from_high is not None and pct_from_high >= -25),
          f"{pct_from_high:.1f}%" if pct_from_high is not None else "—")
-    cond(8, "相对强度 RS 跑赢大盘(代理)",
-         rs_pass,
-         (f"相对 S&P500 {rs_val:+.1f}pp" if rs_val is not None else "数据不足"))
+    cond(8, "相对强度 RS 跑赢大盘(代理)", rs_pass,
+         f"相对 S&P500 {rs_val:+.1f}pp" if rs_val is not None else "数据不足")
 
     passed = sum(1 for c in conds if c["pass"] is True)
-    total = len(conds)
 
-    # 四阶段判定(启发式)
     stage = "Stage 1 · 筑底"
     if ma200 is not None:
         below_all = (ma50 and price < ma50) and price < ma200 and (ma50 and ma50 < ma200)
@@ -302,36 +270,21 @@ def api_sepa():
         elif near_200:
             stage = "Stage 1 · 筑底"
 
-    # 基本面评级(用 info 季度同比)
     eps_growth = _num(info.get("earningsQuarterlyGrowth"))
-    rev_growth = _num(info.get("revenueGrowth"))
-    if eps_growth is None:
-        fgrade = "?"
-    elif eps_growth > 0.30:
-        fgrade = "A"
-    elif eps_growth >= 0.15:
-        fgrade = "B"
-    elif eps_growth >= 0:
-        fgrade = "C"
-    else:
-        fgrade = "D"
+    fgrade = "?" if eps_growth is None else ("A" if eps_growth > 0.30 else "B" if eps_growth >= 0.15 else "C" if eps_growth >= 0 else "D")
 
-    # 综合结论
-    if "Stage 2" in stage and passed == total and fgrade in ("A", "B"):
+    if "Stage 2" in stage and passed == 8 and fgrade in ("A", "B"):
         verdict, vclass = "Strong Buy Setup · 强势候选", "buy"
     elif passed >= 6 and "Stage 4" not in stage:
         verdict, vclass = "Watch List · 观察", "hold"
     else:
         verdict, vclass = "Pass · 暂不符合", "sell"
 
-    return jsonify({
-        "ticker": ticker, "price": price, "stage": stage,
-        "conditions": conds, "passed": passed, "total": total,
-        "fundamentalGrade": fgrade,
-        "epsGrowth": eps_growth, "revGrowth": rev_growth,
-        "verdict": verdict, "verdictClass": vclass,
-        "rsNote": "RS 为相对 S&P500 涨幅代理,非全市场百分位排名",
-    })
+    return jsonify({"ticker": ticker, "price": price, "stage": stage, "conditions": conds,
+                    "passed": passed, "total": 8, "fundamentalGrade": fgrade,
+                    "epsGrowth": eps_growth, "revGrowth": _num(info.get("revenueGrowth")),
+                    "verdict": verdict, "verdictClass": vclass,
+                    "rsNote": "RS 为相对 S&P500 涨幅代理,非全市场百分位排名"})
 
 
 # ============================ API: 财报 ============================
@@ -363,34 +316,22 @@ def api_earnings():
                 history.append({"date": date_str, "estimate": est, "reported": rep,
                                 "surprisePct": sur, "beat": (est is not None and rep >= est)})
         history = history[:6]
-
-    # 兜底:用 calendar 取下次财报日
     if upcoming is None:
         try:
             cal = t.calendar
-            if isinstance(cal, dict):
-                ds = cal.get("Earnings Date")
-                if ds:
-                    d0 = ds[0] if isinstance(ds, (list, tuple)) else ds
-                    upcoming = {"date": str(d0)[:10], "estimate": _num(cal.get("Earnings Average"))}
+            if isinstance(cal, dict) and cal.get("Earnings Date"):
+                ds = cal["Earnings Date"]
+                d0 = ds[0] if isinstance(ds, (list, tuple)) else ds
+                upcoming = {"date": str(d0)[:10], "estimate": _num(cal.get("Earnings Average"))}
         except Exception:
             pass
-
-    info = {}
     try:
         info = get_info(ticker)
     except Exception:
-        pass
-
-    return jsonify({
-        "ticker": ticker,
-        "upcoming": upcoming,
-        "history": history,
-        "epsForward": _num(info.get("forwardEps")),
-        "epsTrailing": _num(info.get("trailingEps")),
-        "revenueGrowth": _num(info.get("revenueGrowth")),
-        "earningsGrowth": _num(info.get("earningsQuarterlyGrowth")),
-    })
+        info = {}
+    return jsonify({"ticker": ticker, "upcoming": upcoming, "history": history,
+                    "epsForward": _num(info.get("forwardEps")), "epsTrailing": _num(info.get("trailingEps")),
+                    "revenueGrowth": _num(info.get("revenueGrowth")), "earningsGrowth": _num(info.get("earningsQuarterlyGrowth"))})
 
 
 # ============================ API: 新闻 ============================
@@ -400,25 +341,22 @@ def api_news():
     ticker = (request.args.get("ticker") or "").strip().upper()
     if not ticker:
         return jsonify({"error": "缺少 ticker 参数"}), 400
-    items = []
     try:
         raw = yf.Ticker(ticker).news or []
     except Exception:
         raw = []
+    items = []
     for it in raw[:12]:
-        # 兼容新旧两种结构
         c = it.get("content") if isinstance(it, dict) and "content" in it else it
         if not isinstance(c, dict):
             continue
         title = c.get("title")
-        pub = None
-        if isinstance(c.get("provider"), dict):
-            pub = c["provider"].get("displayName")
-        pub = pub or c.get("publisher")
+        pub = c["provider"].get("displayName") if isinstance(c.get("provider"), dict) else c.get("publisher")
         link = None
         if isinstance(c.get("canonicalUrl"), dict):
             link = c["canonicalUrl"].get("url")
-        link = link or (c.get("clickThroughUrl", {}) or {}).get("url") if isinstance(c.get("clickThroughUrl"), dict) else link
+        if not link and isinstance(c.get("clickThroughUrl"), dict):
+            link = c["clickThroughUrl"].get("url")
         link = link or c.get("link")
         ts = c.get("pubDate") or c.get("providerPublishTime") or c.get("displayTime")
         if isinstance(ts, (int, float)):
@@ -441,13 +379,10 @@ def api_liquidity():
         info = get_info(ticker)
     except Exception as e:
         return jsonify({"error": f"获取失败: {e}"}), 502
-
     price = _num(info.get("currentPrice") or info.get("regularMarketPrice"))
     adtv = _num(info.get("averageVolume") or info.get("averageDailyVolume10Day"))
-    bid = _num(info.get("bid"))
-    ask = _num(info.get("ask"))
+    bid, ask = _num(info.get("bid")), _num(info.get("ask"))
     shares = _num(info.get("sharesOutstanding"))
-
     dollar_vol = price * adtv if price and adtv else None
     spread_bps = None
     if bid and ask and ask > 0 and bid > 0:
@@ -455,7 +390,6 @@ def api_liquidity():
         if mid > 0:
             spread_bps = (ask - bid) / mid * 10000
     turnover = (adtv / shares * 100) if adtv and shares else None
-
     if dollar_vol is None:
         grade, gdesc = "?", "数据不足"
     elif dollar_vol >= 1e9:
@@ -466,15 +400,11 @@ def api_liquidity():
         grade, gdesc = "C", "中等 · 注意冲击成本"
     else:
         grade, gdesc = "D", "偏低 · 滑点风险高"
-
-    return jsonify({
-        "ticker": ticker, "adtv": adtv, "dollarVol": dollar_vol,
-        "bid": bid, "ask": ask, "spreadBps": spread_bps,
-        "turnover": turnover, "grade": grade, "gradeDesc": gdesc,
-    })
+    return jsonify({"ticker": ticker, "adtv": adtv, "dollarVol": dollar_vol, "bid": bid, "ask": ask,
+                    "spreadBps": spread_bps, "turnover": turnover, "grade": grade, "gradeDesc": gdesc})
 
 
-# ============================ API: 大盘(情绪 + 技术 + 环境) ============================
+# ============================ API: 大盘 ============================
 
 def _index_snapshot(symbol):
     try:
@@ -486,34 +416,27 @@ def _index_snapshot(symbol):
     c = df["Close"].dropna()
     price = _num(c.iloc[-1])
     prev = _num(c.iloc[-2]) if len(c) >= 2 else None
-    chg_pct = ((price / prev - 1) * 100) if price and prev else None
     ma50 = _num(c.rolling(50).mean().iloc[-1]) if len(c) >= 50 else None
     ma200 = _num(c.rolling(200).mean().iloc[-1]) if len(c) >= 200 else None
-    r = _num(rsi(c).iloc[-1]) if len(c) >= 15 else None
-    return {
-        "symbol": symbol, "price": price, "changePct": chg_pct,
-        "ma50": ma50, "ma200": ma200,
-        "above50": (price > ma50) if (price and ma50) else None,
-        "above200": (price > ma200) if (price and ma200) else None,
-        "pctVs200": ((price / ma200 - 1) * 100) if (price and ma200) else None,
-        "rsi": r,
-    }
+    return {"symbol": symbol, "price": price, "changePct": ((price / prev - 1) * 100) if price and prev else None,
+            "ma50": ma50, "ma200": ma200,
+            "above50": (price > ma50) if (price and ma50) else None,
+            "above200": (price > ma200) if (price and ma200) else None,
+            "pctVs200": ((price / ma200 - 1) * 100) if (price and ma200) else None,
+            "rsi": _num(rsi(c).iloc[-1]) if len(c) >= 15 else None}
 
 
 @app.route("/api/market")
 def api_market():
     spx = _index_snapshot("^GSPC")
     ndx = _index_snapshot("^IXIC")
-    vix_df = None
+    vix = None
     try:
-        vix_df = get_history_df("^VIX", "1mo")
+        vdf = get_history_df("^VIX", "1mo")
+        if vdf is not None and not vdf.empty:
+            vix = _num(vdf["Close"].dropna().iloc[-1])
     except Exception:
         pass
-    vix = None
-    if vix_df is not None and not vix_df.empty:
-        vix = _num(vix_df["Close"].dropna().iloc[-1])
-
-    # 市场环境(Bull / Choppy / Bear)— 依据 sepa market-environment 规则
     a200 = [x["above200"] for x in (spx, ndx) if x and x["above200"] is not None]
     env, env_class = "Choppy · 震荡", "hold"
     if a200:
@@ -521,35 +444,415 @@ def api_market():
             env, env_class = "Bull · 多头", "buy"
         elif not any(a200):
             env, env_class = "Bear · 空头", "sell"
-
-    # 情绪指标(0-100,越高越贪婪)— VIX + 指数相对 200MA + RSI 的合成代理
     parts = []
     if vix is not None:
-        parts.append(max(0, min(100, (40 - vix) / (40 - 12) * 100)))   # 低VIX=贪婪
+        parts.append(max(0, min(100, (40 - vix) / (40 - 12) * 100)))
     if spx and spx["pctVs200"] is not None:
-        parts.append(max(0, min(100, (spx["pctVs200"] + 10) / 20 * 100)))  # 高于200MA=贪婪
+        parts.append(max(0, min(100, (spx["pctVs200"] + 10) / 20 * 100)))
     if spx and spx["rsi"] is not None:
         parts.append(max(0, min(100, spx["rsi"])))
     sentiment = round(sum(parts) / len(parts)) if parts else None
-    if sentiment is None:
-        slabel = "—"
-    elif sentiment < 25:
-        slabel = "极度恐慌"
-    elif sentiment < 45:
-        slabel = "恐慌"
-    elif sentiment <= 55:
-        slabel = "中性"
-    elif sentiment <= 75:
-        slabel = "贪婪"
-    else:
-        slabel = "极度贪婪"
+    slabel = "—" if sentiment is None else ("极度恐慌" if sentiment < 25 else "恐慌" if sentiment < 45 else "中性" if sentiment <= 55 else "贪婪" if sentiment <= 75 else "极度贪婪")
+    return jsonify({"spx": spx, "ndx": ndx, "vix": vix, "environment": env, "environmentClass": env_class,
+                    "sentiment": sentiment, "sentimentLabel": slabel,
+                    "note": "情绪为 VIX/指数趋势/RSI 合成代理"})
 
-    return jsonify({
-        "spx": spx, "ndx": ndx, "vix": vix,
-        "environment": env, "environmentClass": env_class,
-        "sentiment": sentiment, "sentimentLabel": slabel,
-        "note": "情绪为 VIX/指数趋势/RSI 合成代理,非 CNN 官方恐惧贪婪指数",
-    })
+
+# ============================ API: 自选股批量行情 ============================
+
+@app.route("/api/quotes")
+def api_quotes():
+    raw = (request.args.get("tickers") or "").strip().upper()
+    tickers = [t for t in raw.replace(" ", ",").split(",") if t]
+    if not tickers:
+        return jsonify({"quotes": []})
+    out = []
+    try:
+        data = yf.download(tickers, period="5d", auto_adjust=False, progress=False, group_by="ticker")
+    except Exception:
+        data = None
+    for t in tickers:
+        price = prev = None
+        try:
+            sub = data[t] if (data is not None and t in data.columns.get_level_values(0)) else None
+            if sub is not None:
+                c = sub["Close"].dropna()
+                if len(c) >= 1:
+                    price = _num(c.iloc[-1])
+                if len(c) >= 2:
+                    prev = _num(c.iloc[-2])
+        except Exception:
+            pass
+        chg = ((price / prev - 1) * 100) if price and prev else None
+        out.append({"ticker": t, "price": price, "changePct": chg})
+    return jsonify({"quotes": out})
+
+
+# ============================ API: 多股对比(stock-correlation) ============================
+
+@app.route("/api/compare")
+def api_compare():
+    raw = (request.args.get("tickers") or "").strip().upper()
+    period = request.args.get("period", "1y")
+    tickers = [t for t in dict.fromkeys(raw.replace(" ", ",").split(",")) if t][:8]
+    if len(tickers) < 2:
+        return jsonify({"error": "至少需要 2 只股票"}), 400
+    try:
+        data = yf.download(tickers, period=period, auto_adjust=True, progress=False, group_by="column")
+        closes = data["Close"] if "Close" in data else data
+    except Exception as e:
+        return jsonify({"error": f"下载失败: {e}"}), 502
+    if isinstance(closes, pd.Series):
+        closes = closes.to_frame()
+    closes = closes.dropna(axis=1, how="all").dropna()
+    if closes.empty or closes.shape[1] < 2:
+        return jsonify({"error": "有效数据不足"}), 404
+
+    cols = list(closes.columns)
+    series = {}
+    for t in cols:
+        base = closes[t].iloc[0]
+        series[t] = [{"time": idx.strftime("%Y-%m-%d"), "value": round(closes[t].loc[idx] / base * 100, 2)}
+                     for idx in closes.index]
+
+    rets = np.log(closes / closes.shift(1)).dropna()
+    corr = rets.corr()
+    matrix = [[round(_num(corr.loc[a, b]) or 0, 2) for b in cols] for a in cols]
+
+    base_t = cols[0]
+    stats = []
+    for t in cols:
+        total_ret = (closes[t].iloc[-1] / closes[t].iloc[0] - 1) * 100
+        vol = rets[t].std() * math.sqrt(252) * 100
+        beta = None
+        if t != base_t:
+            cov = rets[[t, base_t]].cov()
+            denom = _num(cov.loc[base_t, base_t])
+            if denom:
+                beta = _num(cov.loc[t, base_t]) / denom
+        stats.append({"ticker": t, "totalReturn": round(total_ret, 1),
+                      "annVol": round(vol, 1), "beta": round(beta, 2) if beta is not None else None,
+                      "corrToBase": round(_num(corr.loc[t, base_t]) or 0, 2)})
+    return jsonify({"tickers": cols, "base": base_t, "series": series,
+                    "matrix": matrix, "stats": stats, "observations": len(rets), "period": period})
+
+
+# ============================ API: 估值(company-valuation + estimate-analysis) ============================
+
+def _compute_dcf(t, info):
+    try:
+        inc = t.income_stmt
+        cf = t.cashflow
+        if inc is None or inc.empty or "Total Revenue" not in inc.index:
+            return None
+        rev_row = inc.loc["Total Revenue"].dropna().astype(float)
+        rev = rev_row[::-1]  # 旧 -> 新
+        if len(rev) < 2:
+            return None
+        hist_cagr = (rev.iloc[-1] / rev.iloc[0]) ** (1 / (len(rev) - 1)) - 1
+        y1 = hist_cagr
+        try:
+            re = t.revenue_estimate
+            if re is not None and "+1y" in re.index:
+                g = _num(re.loc["+1y", "growth"])
+                if g is not None:
+                    y1 = g
+        except Exception:
+            pass
+        y1 = max(min(y1, 0.40), -0.10)
+        g_term = 0.025
+        path = np.linspace(y1, g_term + 0.01, 5)
+
+        def med_ratio(num_row, denom=rev_row, default=None):
+            try:
+                return float((num_row / denom).dropna().iloc[:3].median())
+            except Exception:
+                return default
+        if "Operating Income" not in inc.index:
+            return None
+        ebit_margin = med_ratio(inc.loc["Operating Income"].astype(float))
+        if ebit_margin is None:
+            return None
+        da_pct = med_ratio(cf.loc["Depreciation And Amortization"].abs().astype(float), default=0.03) if (cf is not None and "Depreciation And Amortization" in cf.index) else 0.03
+        capex_pct = med_ratio(cf.loc["Capital Expenditure"].abs().astype(float), default=0.04) if (cf is not None and "Capital Expenditure" in cf.index) else 0.04
+        nwc_pct = med_ratio(cf.loc["Change In Working Capital"].abs().astype(float), default=0.01) if (cf is not None and "Change In Working Capital" in cf.index) else 0.01
+        tax = 0.21
+
+        mcap = _num(info.get("marketCap"))
+        shares = _num(info.get("sharesOutstanding"))
+        debt = _num(info.get("totalDebt")) or 0
+        cash = _num(info.get("totalCash")) or 0
+        beta = _num(info.get("beta")) or 1.0
+        if not mcap or not shares:
+            return None
+
+        rf = 0.045
+        try:
+            tnx = get_history_df("^TNX", "5d")
+            if tnx is not None and not tnx.empty:
+                rf = float(tnx["Close"].dropna().iloc[-1]) / 100
+        except Exception:
+            pass
+        erp, kd = 0.055, 0.055
+        ke = rf + beta * erp
+        e_v = mcap / (mcap + debt)
+        wacc = e_v * ke + (1 - e_v) * kd * (1 - tax)
+        if wacc <= g_term:
+            wacc = g_term + 0.02
+
+        rev_t = float(rev.iloc[-1])
+        fcff = []
+        for g in path:
+            rev_t *= (1 + g)
+            nopat = rev_t * ebit_margin * (1 - tax)
+            fcff.append(nopat + rev_t * da_pct - rev_t * capex_pct - rev_t * nwc_pct)
+        tv = fcff[-1] * (1 + g_term) / (wacc - g_term)
+        pv_fcff = sum(f / (1 + wacc) ** (i + 1) for i, f in enumerate(fcff))
+        pv_tv = tv / (1 + wacc) ** 5
+        ev = pv_fcff + pv_tv
+        implied = (ev + cash - debt) / shares
+        if implied <= 0 or not math.isfinite(implied):
+            return None
+        return {"implied": round(implied, 2), "wacc": round(wacc * 100, 2), "termGrowth": round(g_term * 100, 1),
+                "rf": round(rf * 100, 2), "ebitMargin": round(ebit_margin * 100, 1),
+                "y1Growth": round(y1 * 100, 1), "tvWeight": round(pv_tv / ev * 100, 0)}
+    except Exception:
+        return None
+
+
+@app.route("/api/valuation")
+def api_valuation():
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    if not ticker:
+        return jsonify({"error": "缺少 ticker 参数"}), 400
+    t = yf.Ticker(ticker)
+    try:
+        info = get_info(ticker)
+    except Exception as e:
+        return jsonify({"error": f"获取失败: {e}"}), 502
+    price = _num(info.get("currentPrice") or info.get("regularMarketPrice"))
+
+    dcf = _compute_dcf(t, info)
+
+    # 相对估值锚:forwardPE × forwardEPS(若有)
+    rel = None
+    fpe, feps = _num(info.get("forwardPE")), _num(info.get("forwardEps"))
+    tpe, teps = _num(info.get("trailingPE")), _num(info.get("trailingEps"))
+    if feps and fpe and feps > 0:
+        rel = round(feps * fpe, 2)  # = forward price implied by current fwd PE(近似锚)
+    # 分析师目标
+    tgt = _num(info.get("targetMeanPrice"))
+
+    methods = []
+    if dcf:
+        methods.append(("DCF 内在价值", dcf["implied"]))
+    if tgt:
+        methods.append(("分析师平均目标价", tgt))
+    if rel:
+        methods.append(("远期PE隐含价", rel))
+    blended = round(float(np.mean([v for _, v in methods])), 2) if methods else None
+
+    upside = ((blended / price - 1) * 100) if (blended and price) else None
+    if upside is None:
+        verdict, vclass = "数据不足", "hold"
+    elif upside >= 15:
+        verdict, vclass = "低估 · Undervalued", "buy"
+    elif upside <= -15:
+        verdict, vclass = "高估 · Overvalued", "sell"
+    else:
+        verdict, vclass = "合理 · Fairly valued", "hold"
+
+    # 预期趋势 estimate-analysis
+    estimates = []
+    revisions = []
+    try:
+        ee = t.earnings_estimate
+        if ee is not None and not ee.empty:
+            label = {"0q": "本季", "+1q": "下季", "0y": "本年", "+1y": "明年"}
+            for p in ee.index:
+                estimates.append({"period": label.get(p, p), "avg": _num(ee.loc[p, "avg"]),
+                                  "low": _num(ee.loc[p, "low"]), "high": _num(ee.loc[p, "high"]),
+                                  "growth": _num(ee.loc[p, "growth"]),
+                                  "numAnalysts": _num(ee.loc[p, "numberOfAnalysts"])})
+    except Exception:
+        pass
+    try:
+        et = t.eps_trend
+        if et is not None and not et.empty:
+            label = {"0q": "本季", "+1q": "下季", "0y": "本年", "+1y": "明年"}
+            for p in et.index:
+                cur = _num(et.loc[p, "current"])
+                ago = _num(et.loc[p, "90daysAgo"])
+                trend = None
+                if cur is not None and ago is not None:
+                    if cur > ago * 1.002:
+                        trend = "up"
+                    elif cur < ago * 0.998:
+                        trend = "down"
+                    else:
+                        trend = "flat"
+                revisions.append({"period": label.get(p, p), "current": cur, "ago90": ago, "trend": trend})
+    except Exception:
+        pass
+
+    return jsonify({"ticker": ticker, "price": price, "dcf": dcf, "relative": rel, "target": tgt,
+                    "methods": [{"name": n, "value": v} for n, v in methods], "blended": blended,
+                    "upside": round(upside, 1) if upside is not None else None,
+                    "verdict": verdict, "verdictClass": vclass,
+                    "estimates": estimates, "revisions": revisions,
+                    "trailingPE": tpe, "forwardPE": fpe, "trailingEps": teps, "forwardEps": feps,
+                    "note": "DCF 为简化 5 年 FCFF 模型,默认参数(ERP 5.5%, 永续 2.5%),仅供参考"})
+
+
+# ============================ API: 期权(options-payoff) ============================
+
+@app.route("/api/options/expiries")
+def api_option_expiries():
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    if not ticker:
+        return jsonify({"error": "缺少 ticker 参数"}), 400
+    try:
+        exps = list(yf.Ticker(ticker).options or [])
+    except Exception as e:
+        return jsonify({"error": f"获取失败: {e}"}), 502
+    price = _num(get_info(ticker).get("currentPrice") or get_info(ticker).get("regularMarketPrice"))
+    return jsonify({"ticker": ticker, "expiries": exps, "spot": price})
+
+
+@app.route("/api/options/chain")
+def api_option_chain():
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    expiry = request.args.get("expiry")
+    if not ticker or not expiry:
+        return jsonify({"error": "缺少 ticker 或 expiry"}), 400
+    try:
+        oc = yf.Ticker(ticker).option_chain(expiry)
+    except Exception as e:
+        return jsonify({"error": f"获取期权链失败: {e}"}), 502
+    spot = _num(get_info(ticker).get("currentPrice") or get_info(ticker).get("regularMarketPrice"))
+
+    def pack(dfo):
+        rows = []
+        for _, r in dfo.iterrows():
+            rows.append({"strike": _num(r.get("strike")), "last": _num(r.get("lastPrice")),
+                         "bid": _num(r.get("bid")), "ask": _num(r.get("ask")),
+                         "iv": _num(r.get("impliedVolatility")), "volume": _num(r.get("volume")),
+                         "oi": _num(r.get("openInterest")), "itm": bool(r.get("inTheMoney"))})
+        return rows
+    calls, puts = pack(oc.calls), pack(oc.puts)
+    # 只取 ATM 上下各 ~12 档,减小体积
+    if spot:
+        def near(rows):
+            rows = [r for r in rows if r["strike"] is not None]
+            rows.sort(key=lambda r: abs(r["strike"] - spot))
+            return sorted(rows[:24], key=lambda r: r["strike"])
+        calls, puts = near(calls), near(puts)
+    return jsonify({"ticker": ticker, "expiry": expiry, "spot": spot, "calls": calls, "puts": puts})
+
+
+# ============================ API: 市场热力图 ============================
+
+SECTOR_ETFS = {
+    "科技 Technology": "XLK", "通信 Comm. Services": "XLC", "可选消费 Cons. Disc.": "XLY",
+    "必需消费 Cons. Staples": "XLP", "金融 Financials": "XLF", "医疗 Health Care": "XLV",
+    "工业 Industrials": "XLI", "能源 Energy": "XLE", "原材料 Materials": "XLB",
+    "公用事业 Utilities": "XLU", "房地产 Real Estate": "XLRE",
+}
+
+HEATMAP_UNIVERSE = {
+    "科技 Technology": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "ACN", "QCOM", "TXN", "INTC", "IBM", "NOW"],
+    "通信 Comm. Services": ["GOOGL", "META", "NFLX", "DIS", "TMUS", "VZ", "T", "CMCSA"],
+    "可选消费 Cons. Disc.": ["AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "BKNG"],
+    "必需消费 Cons. Staples": ["WMT", "PG", "KO", "PEP", "COST", "MDLZ", "PM"],
+    "金融 Financials": ["BRK-B", "JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "AXP", "SPGI"],
+    "医疗 Health Care": ["LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "ABT", "DHR"],
+    "工业 Industrials": ["GE", "CAT", "HON", "UNP", "BA", "RTX", "UPS", "DE"],
+    "能源 Energy": ["XOM", "CVX", "COP", "SLB", "EOG"],
+    "原材料 Materials": ["LIN", "SHW", "FCX", "NEM"],
+    "公用事业 Utilities": ["NEE", "DUK", "SO"],
+    "房地产 Real Estate": ["PLD", "AMT", "EQIX"],
+}
+
+
+def _mcap(tk):
+    try:
+        fi = yf.Ticker(tk).fast_info
+        mc = getattr(fi, "market_cap", None)
+        if mc:
+            return float(mc)
+        lp, sh = getattr(fi, "last_price", None), getattr(fi, "shares", None)
+        if lp and sh:
+            return float(lp) * float(sh)
+    except Exception:
+        pass
+    return None
+
+
+@cached(600)
+def compute_heatmap():
+    all_t = [t for lst in HEATMAP_UNIVERSE.values() for t in lst]
+    try:
+        data = yf.download(all_t, period="5d", auto_adjust=False, progress=False, group_by="ticker")
+    except Exception:
+        data = None
+
+    def change_of(t):
+        try:
+            c = data[t]["Close"].dropna()
+            vol = data[t]["Volume"].dropna()
+            if len(c) >= 2:
+                chg = (c.iloc[-1] / c.iloc[-2] - 1) * 100
+                dvol = float(c.iloc[-1]) * float(vol.iloc[-1]) if len(vol) else None
+                return _num(chg), _num(c.iloc[-1]), dvol
+        except Exception:
+            pass
+        return None, None, None
+
+    # 并行取市值
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        mcaps = dict(zip(all_t, ex.map(_mcap, all_t)))
+
+    sectors = []
+    for sector, tickers in HEATMAP_UNIVERSE.items():
+        children = []
+        for t in tickers:
+            chg, last, dvol = change_of(t)
+            if chg is None:
+                continue
+            size = mcaps.get(t) or dvol or 1e9
+            children.append({"ticker": t, "change": round(chg, 2), "price": last,
+                             "size": round(size / 1e9, 2)})  # 单位:十亿
+        if children:
+            tot = sum(c["size"] for c in children)
+            wavg = sum(c["change"] * c["size"] for c in children) / tot if tot else 0
+            children.sort(key=lambda c: -c["size"])
+            sectors.append({"sector": sector, "etf": SECTOR_ETFS.get(sector),
+                            "change": round(wavg, 2), "size": round(tot, 1), "stocks": children})
+
+    # 板块 ETF 行情
+    etf_list = list(SECTOR_ETFS.values())
+    etf_perf = {}
+    try:
+        edata = yf.download(etf_list, period="5d", auto_adjust=False, progress=False, group_by="ticker")
+        for e in etf_list:
+            try:
+                c = edata[e]["Close"].dropna()
+                if len(c) >= 2:
+                    etf_perf[e] = round((c.iloc[-1] / c.iloc[-2] - 1) * 100, 2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    sector_etfs = [{"sector": s, "etf": e, "change": etf_perf.get(e)} for s, e in SECTOR_ETFS.items()]
+    sector_etfs.sort(key=lambda x: (x["change"] is None, -(x["change"] or 0)))
+
+    return {"sectors": sectors, "sectorEtfs": sector_etfs,
+            "asof": time.strftime("%Y-%m-%d %H:%M"), "note": "面积≈市值(十亿美元),颜色=当日涨跌幅"}
+
+
+@app.route("/api/heatmap")
+def api_heatmap():
+    return jsonify(compute_heatmap())
 
 
 # ============================ 前端 ============================
@@ -566,67 +869,75 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>个股看板 · Stock Dashboard</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <style>
   :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--border:#21262d;--text:#e6edf3;--muted:#8b949e;--green:#26a69a;--red:#ef5350;--accent:#58a6ff;--yellow:#f6c343}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
   a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
-  /* 顶部大盘条 */
   .marketbar{display:flex;align-items:center;gap:14px;padding:8px 24px;background:#0a0d12;border-bottom:1px solid var(--border);flex-wrap:wrap;font-size:13px}
-  .mb-item{display:flex;gap:6px;align-items:baseline}
-  .mb-item .lbl{color:var(--muted)}
+  .mb-item{display:flex;gap:6px;align-items:baseline}.mb-item .lbl{color:var(--muted)}
   .badge{padding:3px 10px;border-radius:6px;font-weight:600;font-size:12px}
-  .buy{background:rgba(38,166,154,.15);color:var(--green)} .sell{background:rgba(239,83,80,.15);color:var(--red)} .hold{background:rgba(246,195,67,.15);color:var(--yellow)}
+  .buy{background:rgba(38,166,154,.15);color:var(--green)}.sell{background:rgba(239,83,80,.15);color:var(--red)}.hold{background:rgba(246,195,67,.15);color:var(--yellow)}
   .gauge{display:flex;align-items:center;gap:8px}
   .gauge .bar{width:120px;height:8px;border-radius:4px;background:linear-gradient(90deg,#ef5350,#f6c343,#26a69a);position:relative}
   .gauge .dot{position:absolute;top:-3px;width:14px;height:14px;border-radius:50%;background:#fff;border:2px solid #0a0d12;transform:translateX(-50%)}
-  header{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header{padding:12px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
   h1{font-size:18px;margin:0;font-weight:600}
-  .chips{display:flex;gap:6px;flex-wrap:wrap}
-  .chip{background:var(--panel);border:1px solid var(--border);padding:5px 10px;border-radius:16px;cursor:pointer;font-size:12px;color:var(--muted)}
-  .chip:hover{color:var(--text);border-color:var(--accent)}
+  .topnav{display:flex;gap:6px}
+  .topnav button{background:transparent;border:1px solid var(--border);color:var(--muted);padding:7px 16px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500}
+  .topnav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
   .search{display:flex;gap:8px;margin-left:auto}
-  .search input{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-size:14px;width:150px;text-transform:uppercase}
-  .search button{background:var(--accent);border:none;color:#fff;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500}
-  main{padding:20px 24px;max-width:1320px;margin:0 auto}
-  .quote-head{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-bottom:4px}
-  .quote-head .name{font-size:22px;font-weight:600}
-  .quote-head .tk{color:var(--muted);font-size:14px}
-  .price-row{display:flex;align-items:baseline;gap:14px;margin-bottom:12px}
-  .price{font-size:34px;font-weight:700}
-  .chg{font-size:16px;font-weight:600}
+  .search input{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-size:14px;width:140px;text-transform:uppercase}
+  .search button{background:var(--accent);border:none;color:#fff;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:14px}
+  .watchstrip{display:flex;gap:8px;padding:8px 24px;background:#0a0d12;border-bottom:1px solid var(--border);overflow-x:auto;align-items:center}
+  .watchstrip .lbl{color:var(--muted);font-size:12px;white-space:nowrap}
+  .wchip{display:flex;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--border);padding:5px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px}
+  .wchip .x{color:var(--muted);font-size:11px;padding-left:2px}.wchip .x:hover{color:var(--red)}
+  main{padding:20px 24px;max-width:1340px;margin:0 auto}
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:18px;flex-wrap:wrap}
+  .tabs button{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--muted);padding:10px 16px;cursor:pointer;font-size:14px}
+  .tabs button.active{color:var(--text);border-bottom-color:var(--accent)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}.chip{background:var(--panel);border:1px solid var(--border);padding:5px 10px;border-radius:16px;cursor:pointer;font-size:12px;color:var(--muted)}.chip:hover{color:var(--text);border-color:var(--accent)}
+  .quote-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:4px}.quote-head .name{font-size:22px;font-weight:600}.quote-head .tk{color:var(--muted);font-size:14px}
+  .star{cursor:pointer;font-size:20px}
+  .price-row{display:flex;align-items:baseline;gap:14px;margin-bottom:12px}.price{font-size:34px;font-weight:700}.chg{font-size:16px;font-weight:600}
   .meta{color:var(--muted);font-size:13px;margin-bottom:14px}
   .controls{display:flex;gap:6px;margin:10px 0;flex-wrap:wrap;align-items:center}
-  .controls button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px}
-  .controls button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-  .ma-toggles{display:flex;gap:10px;margin-left:8px;flex-wrap:wrap;font-size:12px}
-  .ma-toggles label{display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--muted)}
+  .controls button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px}.controls button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .ma-toggles{display:flex;gap:10px;margin-left:8px;flex-wrap:wrap;font-size:12px}.ma-toggles label{display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--muted)}
   #chart{width:100%;height:440px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
-  .section-title{font-size:15px;font-weight:600;margin:30px 0 10px;display:flex;align-items:center;gap:8px}
-  .section-title .tag{font-size:11px;color:var(--muted);font-weight:400;background:var(--panel);padding:2px 8px;border-radius:10px}
+  .section-title{font-size:15px;font-weight:600;margin:30px 0 10px;display:flex;align-items:center;gap:8px}.section-title .tag{font-size:11px;color:var(--muted);font-weight:400;background:var(--panel);padding:2px 8px;border-radius:10px}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px}
-  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px}
-  .card .k{color:var(--muted);font-size:12px;margin-bottom:6px}
-  .card .v{font-size:18px;font-weight:600}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)}
-  th{color:var(--muted);font-weight:500}
-  .green{color:var(--green)} .red{color:var(--red)} .muted{color:var(--muted)}
-  .pass{color:var(--green);font-weight:600} .fail{color:var(--red);font-weight:600} .unk{color:var(--muted)}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px}.card .k{color:var(--muted);font-size:12px;margin-bottom:6px}.card .v{font-size:18px;font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border)}th{color:var(--muted);font-weight:500}
+  .green{color:var(--green)}.red{color:var(--red)}.muted{color:var(--muted)}
+  .pass{color:var(--green);font-weight:600}.fail{color:var(--red);font-weight:600}.unk{color:var(--muted)}
   .sepa-head{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
-  .scorebig{font-size:26px;font-weight:700}
-  .gradechip{font-size:20px;font-weight:700;padding:4px 14px;border-radius:8px}
-  .gA{background:rgba(38,166,154,.18);color:var(--green)} .gB{background:rgba(88,166,255,.18);color:var(--accent)}
-  .gC{background:rgba(246,195,67,.18);color:var(--yellow)} .gD{background:rgba(239,83,80,.18);color:var(--red)} .gq{background:var(--panel2);color:var(--muted)}
-  .news-item{padding:10px 0;border-bottom:1px solid var(--border)}
-  .news-item .t{font-size:14px}
-  .news-item .m{font-size:12px;color:var(--muted);margin-top:3px}
-  .loading{color:var(--muted);padding:30px;text-align:center}
-  .error{color:var(--red);padding:20px;background:rgba(239,83,80,.1);border-radius:8px}
+  .scorebig{font-size:26px;font-weight:700}.gradechip{font-size:20px;font-weight:700;padding:4px 14px;border-radius:8px}
+  .gA{background:rgba(38,166,154,.18);color:var(--green)}.gB{background:rgba(88,166,255,.18);color:var(--accent)}.gC{background:rgba(246,195,67,.18);color:var(--yellow)}.gD{background:rgba(239,83,80,.18);color:var(--red)}.gq{background:var(--panel2);color:var(--muted)}
+  .news-item{padding:10px 0;border-bottom:1px solid var(--border)}.news-item .t{font-size:14px}.news-item .m{font-size:12px;color:var(--muted);margin-top:3px}
+  .loading{color:var(--muted);padding:30px;text-align:center}.error{color:var(--red);padding:20px;background:rgba(239,83,80,.1);border-radius:8px}
   .small{font-size:11px;color:var(--muted);margin-top:6px}
+  .two-col{display:grid;grid-template-columns:1fr 1fr;gap:24px}@media(max-width:880px){.two-col{grid-template-columns:1fr}}
   .disclaimer{color:var(--muted);font-size:11px;margin-top:36px;text-align:center}
-  .two-col{display:grid;grid-template-columns:1fr 1fr;gap:24px}
-  @media(max-width:880px){.two-col{grid-template-columns:1fr}}
+  .hidden{display:none}
+  /* 对比 */
+  #cmpChart{width:100%;height:420px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .cmpbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .cmpbar input{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-size:13px;width:320px;text-transform:uppercase}
+  .heat-cell{text-align:center;font-weight:600}
+  /* 期权 */
+  .legpick td{cursor:pointer}.legpick tr:hover{background:var(--panel2)}
+  #payoff{width:100%;height:360px;border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-top:12px}
+  .leg-tag{display:inline-flex;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--border);padding:4px 10px;border-radius:8px;font-size:12px;margin:3px}
+  /* 热力图 */
+  #treemap{width:100%;height:640px;border:1px solid var(--border);border-radius:10px}
+  .sectorgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:12px}
+  .stile{border-radius:10px;padding:14px;color:#fff;cursor:default}
+  .stile .s1{font-size:13px;opacity:.9}.stile .s2{font-size:22px;font-weight:700;margin-top:4px}.stile .s3{font-size:11px;opacity:.8}
+  .subtabs{display:flex;gap:6px;margin:14px 0}
+  .subtabs button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.subtabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -634,32 +945,86 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="marketbar" id="marketbar"><span class="muted">大盘加载中…</span></div>
 
 <header>
-  <h1>📈 个股看板</h1>
-  <div class="chips" id="chips"></div>
-  <div class="search">
+  <h1>📈 看板</h1>
+  <div class="topnav">
+    <button id="nav-stock" class="active" onclick="switchPage('stock')">个股看板</button>
+    <button id="nav-heatmap" onclick="switchPage('heatmap')">市场热力图</button>
+  </div>
+  <div class="search" id="stockSearch">
     <input id="tickerInput" placeholder="代码 如 AAPL" value="AAPL" />
     <button onclick="loadTicker()">查询</button>
   </div>
 </header>
 
+<div class="watchstrip" id="watchstrip"><span class="lbl">自选股</span></div>
+
 <main>
-  <div id="content"><div class="loading">加载中…</div></div>
+  <!-- 个股看板页 -->
+  <div id="page-stock">
+    <div class="tabs">
+      <button id="tab-overview" class="active" onclick="switchTab('overview')">概览</button>
+      <button id="tab-valuation" onclick="switchTab('valuation')">估值</button>
+      <button id="tab-options" onclick="switchTab('options')">期权</button>
+      <button id="tab-compare" onclick="switchTab('compare')">多股对比</button>
+    </div>
+    <div id="tabc-overview"><div class="loading">加载中…</div></div>
+    <div id="tabc-valuation" class="hidden"></div>
+    <div id="tabc-options" class="hidden"></div>
+    <div id="tabc-compare" class="hidden"></div>
+  </div>
+
+  <!-- 市场热力图页 -->
+  <div id="page-heatmap" class="hidden">
+    <div class="subtabs">
+      <button id="sub-stocks" class="active" onclick="switchHeat('stocks')">个股热力图</button>
+      <button id="sub-sectors" onclick="switchHeat('sectors')">板块热力图</button>
+      <button class="muted" style="margin-left:auto;cursor:pointer" onclick="loadHeatmap(true)">↻ 刷新</button>
+    </div>
+    <div id="heat-stocks"><div class="loading">热力图加载中(首次约 10-20 秒)…</div></div>
+    <div id="heat-sectors" class="hidden"></div>
+    <div class="small" id="heat-note"></div>
+  </div>
+
   <div class="disclaimer">
-    数据来源 Yahoo Finance(yfinance),非实时报价、有延迟,仅供研究与学习,不构成投资建议。<br>
-    SEPA 分析基于 Mark Minervini 趋势模板;RS 与情绪指标为代理算法。
+    数据来源 Yahoo Finance(yfinance),非实时、有延迟,仅供研究与学习,不构成投资建议。<br>
+    SEPA 基于 Minervini 趋势模板;估值为简化 DCF;RS/情绪/热力图面积为代理算法。
   </div>
 </main>
 
 <script>
-const POPULAR = ["AAPL","TSLA","NVDA","MSFT","GOOGL","AMZN","META","AMD","PLTR","COIN"];
-const MA_COLORS = {"5":"#f6c343","10":"#ff9f40","20":"#58a6ff","50":"#a78bfa","200":"#e6edf3"};
-const MA_DEFAULT_ON = {"5":false,"10":false,"20":true,"50":true,"200":true};
-let chart, candleSeries, volSeries, maSeries = {}, curTicker = "AAPL", curPeriod = "6mo";
+const POPULAR=["AAPL","TSLA","NVDA","MSFT","GOOGL","AMZN","META","AMD"];
+const MA_COLORS={"5":"#f6c343","10":"#ff9f40","20":"#58a6ff","50":"#a78bfa","200":"#e6edf3"};
+const MA_DEFAULT_ON={"5":false,"10":false,"20":true,"50":true,"200":true};
+let chart,candleSeries,volSeries,maSeries={},curTicker="AAPL",curPeriod="6mo",curTab="overview",curPage="stock";
+let loadedTabs={};
+let watchlist=JSON.parse(localStorage.getItem("watchlist")||'["AAPL","NVDA","TSLA"]');
 
 const fmtNum=(n,d=2)=>n==null?"—":Number(n).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmtBig=n=>{if(n==null)return"—";const a=Math.abs(n);if(a>=1e12)return(n/1e12).toFixed(2)+"T";if(a>=1e9)return(n/1e9).toFixed(2)+"B";if(a>=1e6)return(n/1e6).toFixed(2)+"M";if(a>=1e3)return(n/1e3).toFixed(2)+"K";return fmtNum(n)};
 const fmtPct=n=>n==null?"—":(n>=0?"+":"")+n.toFixed(2)+"%";
 const j=async u=>{const r=await fetch(u);return r.json();};
+const heatColor=c=>{if(c==null)return"#30363d";const x=Math.max(-3,Math.min(3,c))/3;if(x>=0){const g=Math.round(60+x*100);return`rgb(${Math.round(40-x*10)},${100+Math.round(x*66)},${Math.round(74+x*20)})`;}const r=-x;return`rgb(${120+Math.round(r*119)},${Math.round(60-r*30)},${Math.round(70-r*30)})`;};
+
+// ---------- 页面/标签切换 ----------
+function switchPage(p){
+  curPage=p;
+  document.getElementById("page-stock").classList.toggle("hidden",p!=="stock");
+  document.getElementById("page-heatmap").classList.toggle("hidden",p!=="heatmap");
+  document.getElementById("stockSearch").style.display=p==="stock"?"flex":"none";
+  document.getElementById("nav-stock").classList.toggle("active",p==="stock");
+  document.getElementById("nav-heatmap").classList.toggle("active",p==="heatmap");
+  if(p==="heatmap" && !window._heatLoaded) loadHeatmap();
+}
+function switchTab(t){
+  curTab=t;
+  ["overview","valuation","options","compare"].forEach(x=>{
+    document.getElementById("tab-"+x).classList.toggle("active",x===t);
+    document.getElementById("tabc-"+x).classList.toggle("hidden",x!==t);
+  });
+  if(t==="valuation"&&loadedTabs.valuation!==curTicker)loadValuation();
+  if(t==="options"&&loadedTabs.options!==curTicker)loadOptions();
+  if(t==="compare"&&!loadedTabs.compare)loadCompare();
+}
 
 // ---------- 大盘条 ----------
 async function loadMarket(){
@@ -667,190 +1032,276 @@ async function loadMarket(){
     const m=await j("/api/market");
     const idx=(name,o)=>!o?"":`<div class="mb-item"><span class="lbl">${name}</span><b>${fmtNum(o.price)}</b><span class="${(o.changePct||0)>=0?'green':'red'}">${fmtPct(o.changePct)}</span></div>`;
     const vixCls=m.vix==null?"":(m.vix>=25?"red":(m.vix<=16?"green":"hold"));
-    const dot=m.sentiment==null?50:m.sentiment;
     document.getElementById("marketbar").innerHTML=
       idx("标普500",m.spx)+idx("纳指",m.ndx)+
       `<div class="mb-item"><span class="lbl">VIX</span><b class="${vixCls}">${fmtNum(m.vix)}</b></div>`+
       `<div class="mb-item"><span class="lbl">环境</span><span class="badge ${m.environmentClass}">${m.environment}</span></div>`+
-      `<div class="gauge"><span class="lbl">情绪 ${m.sentiment??"—"} · ${m.sentimentLabel}</span><div class="bar"><div class="dot" style="left:${dot}%"></div></div></div>`;
-  }catch(e){ document.getElementById("marketbar").innerHTML='<span class="muted">大盘数据获取失败</span>'; }
+      `<div class="gauge"><span class="lbl">情绪 ${m.sentiment??"—"} · ${m.sentimentLabel}</span><div class="bar"><div class="dot" style="left:${m.sentiment??50}%"></div></div></div>`;
+  }catch(e){document.getElementById("marketbar").innerHTML='<span class="muted">大盘数据获取失败</span>';}
+}
+
+// ---------- 自选股 ----------
+function saveWatch(){localStorage.setItem("watchlist",JSON.stringify(watchlist));}
+function inWatch(t){return watchlist.includes(t);}
+function toggleWatch(t){t=t.toUpperCase();if(inWatch(t))watchlist=watchlist.filter(x=>x!==t);else watchlist.push(t);saveWatch();renderWatch();const s=document.getElementById("starBtn");if(s)s.textContent=inWatch(curTicker)?"★":"☆";}
+async function renderWatch(){
+  const el=document.getElementById("watchstrip");
+  el.innerHTML='<span class="lbl">自选股</span>'+watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="loadTicker('${t}')">${t} <span class="muted">…</span><span class="x" onclick="event.stopPropagation();toggleWatch('${t}')">✕</span></span>`).join("")||'<span class="lbl">自选股(空)</span>';
+  if(!watchlist.length)return;
+  const q=await j("/api/quotes?tickers="+watchlist.join(","));
+  q.quotes.forEach(x=>{const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`${x.ticker} <span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span>`;});
 }
 
 // ---------- 主入口 ----------
 async function loadTicker(t){
-  curTicker = t ? t : document.getElementById("tickerInput").value.trim().toUpperCase();
-  if(!curTicker) return;
-  if(t) document.getElementById("tickerInput").value=t;
-  document.getElementById("content").innerHTML='<div class="loading">加载 '+curTicker+' …</div>';
+  if(curPage!=="stock")switchPage("stock");
+  curTicker=t?t:document.getElementById("tickerInput").value.trim().toUpperCase();
+  if(!curTicker)return;
+  document.getElementById("tickerInput").value=curTicker;
+  loadedTabs={};
+  switchTab("overview");
+  document.getElementById("tabc-overview").innerHTML='<div class="loading">加载 '+curTicker+' …</div>';
   const q=await j("/api/quote?ticker="+encodeURIComponent(curTicker));
-  if(q.error){document.getElementById("content").innerHTML='<div class="error">'+q.error+'</div>';return;}
-  renderShell(q);
-  loadChart(curPeriod);
-  // 并行加载各深度板块
-  loadSepa(); loadEarnings(); loadLiquidity(); loadNews();
+  if(q.error){document.getElementById("tabc-overview").innerHTML='<div class="error">'+q.error+'</div>';return;}
+  renderOverview(q);
+  loadChart(curPeriod);loadSepa();loadEarnings();loadLiquidity();loadNews();
 }
-
 function card(k,v){return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;}
 
-function renderShell(q){
-  const up=(q.change||0)>=0, cls=up?"green":"red", f=q.financials, a=q.analyst;
+// ---------- 概览 ----------
+function renderOverview(q){
+  const up=(q.change||0)>=0,cls=up?"green":"red",f=q.financials,a=q.analyst;
   const recClass=!a.recommendation?"hold":(/buy/.test(a.recommendation)?"buy":(/sell|underperform/.test(a.recommendation)?"sell":"hold"));
   const maToggles=Object.keys(MA_COLORS).map(w=>`<label><input type="checkbox" ${MA_DEFAULT_ON[w]?"checked":""} onchange="toggleMA('${w}',this.checked)"><span style="color:${MA_COLORS[w]}">MA${w}</span></label>`).join("");
-  document.getElementById("content").innerHTML=`
-   <div class="quote-head"><span class="name">${q.name||q.ticker}</span><span class="tk">${q.ticker} · ${q.exchange||""} · ${q.currency}</span></div>
+  document.getElementById("tabc-overview").innerHTML=`
+   <div class="quote-head"><span class="name">${q.name||q.ticker}</span><span class="tk">${q.ticker} · ${q.exchange||""} · ${q.currency}</span>
+     <span class="star" id="starBtn" onclick="toggleWatch(curTicker)">${inWatch(q.ticker)?"★":"☆"}</span></div>
    <div class="price-row"><span class="price">${fmtNum(q.price)}</span><span class="chg ${cls}">${up?"▲":"▼"} ${fmtNum(q.change)} (${fmtPct(q.changePct)})</span></div>
    <div class="meta">${q.sector||""}${q.industry?" · "+q.industry:""} &nbsp;|&nbsp; 开 ${fmtNum(q.open)} · 高 ${fmtNum(q.dayHigh)} · 低 ${fmtNum(q.dayLow)} · 量 ${fmtBig(q.volume)}</div>
-
-   <div class="controls">
-     ${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}
-     <span class="ma-toggles">${maToggles}</span>
-   </div>
+   <div class="controls">${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}</span></div>
    <div id="chart"></div>
-
-   <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy · Minervini</span></div>
+   <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy</span></div>
    <div id="sepa"><div class="loading">分析中…</div></div>
-
    <div class="two-col">
-     <div>
-       <div class="section-title">关键财务指标</div>
-       <div class="grid">
-         ${card("市值",fmtBig(f.marketCap))}${card("市盈率 TTM",fmtNum(f.trailingPE))}${card("预期PE",fmtNum(f.forwardPE))}
-         ${card("市净率",fmtNum(f.priceToBook))}${card("EPS",fmtNum(f.eps))}${card("营收TTM",fmtBig(f.revenue))}
-         ${card("净利率",f.profitMargin!=null?fmtNum(f.profitMargin*100)+"%":"—")}${card("毛利率",f.grossMargin!=null?fmtNum(f.grossMargin*100)+"%":"—")}
-         ${card("Beta",fmtNum(f.beta))}${card("股息率",f.dividendYield!=null?fmtNum(f.dividendYield)+"%":"—")}
-         ${card("52周高",fmtNum(f.fiftyTwoWeekHigh))}${card("52周低",fmtNum(f.fiftyTwoWeekLow))}
-       </div>
-     </div>
-     <div>
-       <div class="section-title">分析师评级</div>
-       <div class="grid">
-         <div class="card"><div class="k">综合评级</div><div class="v"><span class="badge ${recClass}">${a.recommendation||"无"}</span></div></div>
-         ${card("平均目标价",fmtNum(a.targetMean))}${card("最高/最低",fmtNum(a.targetHigh)+" / "+fmtNum(a.targetLow))}
-         ${card("分析师数",a.numAnalysts!=null?a.numAnalysts:"—")}
-         ${card("目标空间",(a.targetMean&&q.price)?fmtPct((a.targetMean/q.price-1)*100):"—")}
-       </div>
-       <div class="section-title" style="margin-top:24px">流动性 <span class="tag">skill: stock-liquidity</span></div>
-       <div id="liquidity"><div class="loading">分析中…</div></div>
-     </div>
+     <div><div class="section-title">关键财务指标</div><div class="grid">
+       ${card("市值",fmtBig(f.marketCap))}${card("市盈率 TTM",fmtNum(f.trailingPE))}${card("预期PE",fmtNum(f.forwardPE))}${card("市净率",fmtNum(f.priceToBook))}
+       ${card("EPS",fmtNum(f.eps))}${card("营收TTM",fmtBig(f.revenue))}${card("净利率",f.profitMargin!=null?fmtNum(f.profitMargin*100)+"%":"—")}${card("毛利率",f.grossMargin!=null?fmtNum(f.grossMargin*100)+"%":"—")}
+       ${card("Beta",fmtNum(f.beta))}${card("股息率",f.dividendYield!=null?fmtNum(f.dividendYield)+"%":"—")}${card("52周高",fmtNum(f.fiftyTwoWeekHigh))}${card("52周低",fmtNum(f.fiftyTwoWeekLow))}</div></div>
+     <div><div class="section-title">分析师评级</div><div class="grid">
+       <div class="card"><div class="k">综合评级</div><div class="v"><span class="badge ${recClass}">${a.recommendation||"无"}</span></div></div>
+       ${card("平均目标价",fmtNum(a.targetMean))}${card("最高/最低",fmtNum(a.targetHigh)+" / "+fmtNum(a.targetLow))}${card("分析师数",a.numAnalysts!=null?a.numAnalysts:"—")}${card("目标空间",(a.targetMean&&q.price)?fmtPct((a.targetMean/q.price-1)*100):"—")}</div>
+       <div class="section-title" style="margin-top:24px">流动性 <span class="tag">skill: stock-liquidity</span></div><div id="liquidity"><div class="loading">分析中…</div></div></div>
    </div>
-
-   <div class="section-title">财报日 / 业绩 <span class="tag">skill: earnings-preview</span></div>
-   <div id="earnings"><div class="loading">加载中…</div></div>
-
-   <div class="section-title">重要消息 / 新闻</div>
-   <div id="news"><div class="loading">加载中…</div></div>
-  `;
+   <div class="section-title">财报日 / 业绩 <span class="tag">skill: earnings-preview</span></div><div id="earnings"><div class="loading">加载中…</div></div>
+   <div class="section-title">重要消息 / 新闻</div><div id="news"><div class="loading">加载中…</div></div>`;
   initChart();
 }
 
-// ---------- 图表 ----------
 function initChart(){
-  const el=document.getElementById("chart");
-  chart=LightweightCharts.createChart(el,{
-    layout:{background:{color:"#161b22"},textColor:"#8b949e"},
-    grid:{vertLines:{color:"#21262d"},horzLines:{color:"#21262d"}},
-    rightPriceScale:{borderColor:"#21262d"},timeScale:{borderColor:"#21262d"},
-    crosshair:{mode:0},width:el.clientWidth,height:440,
-  });
+  const el=document.getElementById("chart");if(!el)return;
+  chart=LightweightCharts.createChart(el,{layout:{background:{color:"#161b22"},textColor:"#8b949e"},grid:{vertLines:{color:"#21262d"},horzLines:{color:"#21262d"}},rightPriceScale:{borderColor:"#21262d"},timeScale:{borderColor:"#21262d"},crosshair:{mode:0},width:el.clientWidth,height:440});
   candleSeries=chart.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",borderVisible:false,wickUpColor:"#26a69a",wickDownColor:"#ef5350"});
-  maSeries={};
-  Object.keys(MA_COLORS).forEach(w=>{
-    maSeries[w]=chart.addLineSeries({color:MA_COLORS[w],lineWidth:w==="200"?2:1,priceLineVisible:false,lastValueVisible:false,visible:MA_DEFAULT_ON[w]});
-  });
-  volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:""});
-  volSeries.priceScale().applyOptions({scaleMargins:{top:0.85,bottom:0}});
+  maSeries={};Object.keys(MA_COLORS).forEach(w=>{maSeries[w]=chart.addLineSeries({color:MA_COLORS[w],lineWidth:w==="200"?2:1,priceLineVisible:false,lastValueVisible:false,visible:MA_DEFAULT_ON[w]});});
+  volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:""});volSeries.priceScale().applyOptions({scaleMargins:{top:0.85,bottom:0}});
   window.addEventListener("resize",()=>{if(chart)chart.applyOptions({width:el.clientWidth});});
 }
-function toggleMA(w,on){ if(maSeries[w]) maSeries[w].applyOptions({visible:on}); }
+function toggleMA(w,on){if(maSeries[w])maSeries[w].applyOptions({visible:on});}
 async function loadChart(period){
   curPeriod=period;
-  document.querySelectorAll(".controls > button").forEach(b=>b.classList.toggle("active",b.textContent===period));
-  if(!chart) initChart();
+  document.querySelectorAll("#tabc-overview .controls>button").forEach(b=>b.classList.toggle("active",b.textContent===period));
+  if(!chart)initChart();
   const d=await j(`/api/history?ticker=${encodeURIComponent(curTicker)}&period=${period}`);
   if(d.error||!d.candles)return;
-  candleSeries.setData(d.candles);
-  volSeries.setData(d.volumes);
-  Object.keys(MA_COLORS).forEach(w=>{ if(maSeries[w]&&d.ma&&d.ma[w]) maSeries[w].setData(d.ma[w]); });
+  candleSeries.setData(d.candles);volSeries.setData(d.volumes);
+  Object.keys(MA_COLORS).forEach(w=>{if(maSeries[w]&&d.ma&&d.ma[w])maSeries[w].setData(d.ma[w]);});
   chart.timeScale().fitContent();
 }
 
-// ---------- SEPA ----------
 async function loadSepa(){
-  const el=document.getElementById("sepa"); if(!el)return;
+  const el=document.getElementById("sepa");if(!el)return;
   const s=await j("/api/sepa?ticker="+encodeURIComponent(curTicker));
   if(s.error){el.innerHTML='<div class="muted">'+s.error+'</div>';return;}
   const stageCls=/Stage 2/.test(s.stage)?"buy":(/Stage 4/.test(s.stage)?"sell":"hold");
-  const rows=s.conditions.map(c=>{
-    const st=c.pass===true?'<span class="pass">✓ 通过</span>':(c.pass===false?'<span class="fail">✗ 不满足</span>':'<span class="unk">? 未知</span>');
-    return `<tr><td class="muted">${c.no}</td><td>${c.name}</td><td>${st}</td><td class="muted">${c.value}</td></tr>`;
-  }).join("");
-  const g=s.fundamentalGrade, gcls={"A":"gA","B":"gB","C":"gC","D":"gD"}[g]||"gq";
-  el.innerHTML=`
-    <div class="sepa-head">
-      <span class="badge ${s.verdictClass}" style="font-size:14px">${s.verdict}</span>
-      <span class="badge ${stageCls}">${s.stage}</span>
-      <span class="muted">趋势模板 <span class="scorebig ${s.passed===s.total?'green':(s.passed>=6?'':'red')}">${s.passed}/${s.total}</span></span>
-      <span class="muted">基本面 <span class="gradechip ${gcls}">${g}</span></span>
-      ${s.epsGrowth!=null?`<span class="muted">季度EPS同比 ${fmtPct(s.epsGrowth*100)}</span>`:""}
-    </div>
-    <table><thead><tr><th>#</th><th>条件</th><th>结果</th><th>实际值</th></tr></thead><tbody>${rows}</tbody></table>
-    <div class="small">${s.rsNote}</div>`;
+  const rows=s.conditions.map(c=>{const st=c.pass===true?'<span class="pass">✓ 通过</span>':(c.pass===false?'<span class="fail">✗ 不满足</span>':'<span class="unk">? 未知</span>');return `<tr><td class="muted">${c.no}</td><td>${c.name}</td><td>${st}</td><td class="muted">${c.value}</td></tr>`;}).join("");
+  const g=s.fundamentalGrade,gcls={"A":"gA","B":"gB","C":"gC","D":"gD"}[g]||"gq";
+  el.innerHTML=`<div class="sepa-head"><span class="badge ${s.verdictClass}" style="font-size:14px">${s.verdict}</span><span class="badge ${stageCls}">${s.stage}</span>
+    <span class="muted">趋势模板 <span class="scorebig ${s.passed===s.total?'green':(s.passed>=6?'':'red')}">${s.passed}/${s.total}</span></span>
+    <span class="muted">基本面 <span class="gradechip ${gcls}">${g}</span></span>${s.epsGrowth!=null?`<span class="muted">季度EPS同比 ${fmtPct(s.epsGrowth*100)}</span>`:""}</div>
+    <table><thead><tr><th>#</th><th>条件</th><th>结果</th><th>实际值</th></tr></thead><tbody>${rows}</tbody></table><div class="small">${s.rsNote}</div>`;
 }
-
-// ---------- 财报 ----------
 async function loadEarnings(){
-  const el=document.getElementById("earnings"); if(!el)return;
+  const el=document.getElementById("earnings");if(!el)return;
   const e=await j("/api/earnings?ticker="+encodeURIComponent(curTicker));
   if(e.error){el.innerHTML='<div class="muted">'+e.error+'</div>';return;}
   let head="";
-  if(e.upcoming){
-    const days=Math.round((new Date(e.upcoming.date)-new Date())/864e5);
-    head=`<div class="grid" style="margin-bottom:14px">
-      ${card("下次财报日",e.upcoming.date+(isFinite(days)?` <span class="muted" style="font-size:12px">(${days>=0?days+"天后":"约"})</span>`:""))}
-      ${card("预期EPS",fmtNum(e.upcoming.estimate))}
-      ${card("预期EPS(forward)",fmtNum(e.epsForward))}
-      ${card("营收同比",e.revenueGrowth!=null?fmtPct(e.revenueGrowth*100):"—")}
-    </div>`;
-  } else head='<div class="muted" style="margin-bottom:10px">暂无下次财报日数据</div>';
+  if(e.upcoming){const days=Math.round((new Date(e.upcoming.date)-new Date())/864e5);
+    head=`<div class="grid" style="margin-bottom:14px">${card("下次财报日",e.upcoming.date+(isFinite(days)?` <span class="muted" style="font-size:12px">(${days>=0?days+"天后":"约"})</span>`:""))}${card("预期EPS",fmtNum(e.upcoming.estimate))}${card("远期EPS",fmtNum(e.epsForward))}${card("营收同比",e.revenueGrowth!=null?fmtPct(e.revenueGrowth*100):"—")}</div>`;
+  }else head='<div class="muted" style="margin-bottom:10px">暂无下次财报日数据</div>';
   let hist="";
-  if(e.history&&e.history.length){
-    hist=`<table><thead><tr><th>财报日</th><th>预期EPS</th><th>实际EPS</th><th>意外%</th><th>结果</th></tr></thead><tbody>`+
-      e.history.map(h=>`<tr><td>${h.date}</td><td>${fmtNum(h.estimate)}</td><td>${fmtNum(h.reported)}</td>
-        <td class="${(h.surprisePct||0)>=0?'green':'red'}">${h.surprisePct!=null?fmtPct(h.surprisePct):"—"}</td>
-        <td>${h.beat?'<span class="pass">Beat</span>':'<span class="fail">Miss</span>'}</td></tr>`).join("")+
-      `</tbody></table>`;
-  }
+  if(e.history&&e.history.length)hist=`<table><thead><tr><th>财报日</th><th>预期EPS</th><th>实际EPS</th><th>意外%</th><th>结果</th></tr></thead><tbody>`+e.history.map(h=>`<tr><td>${h.date}</td><td>${fmtNum(h.estimate)}</td><td>${fmtNum(h.reported)}</td><td class="${(h.surprisePct||0)>=0?'green':'red'}">${h.surprisePct!=null?fmtPct(h.surprisePct):"—"}</td><td>${h.beat?'<span class="pass">Beat</span>':'<span class="fail">Miss</span>'}</td></tr>`).join("")+`</tbody></table>`;
   el.innerHTML=head+hist;
 }
-
-// ---------- 流动性 ----------
 async function loadLiquidity(){
-  const el=document.getElementById("liquidity"); if(!el)return;
+  const el=document.getElementById("liquidity");if(!el)return;
   const l=await j("/api/liquidity?ticker="+encodeURIComponent(curTicker));
   if(l.error){el.innerHTML='<div class="muted">'+l.error+'</div>';return;}
   const gcls={"A":"gA","B":"gB","C":"gC","D":"gD"}[l.grade]||"gq";
-  el.innerHTML=`<div class="grid">
-    <div class="card"><div class="k">流动性评级</div><div class="v"><span class="gradechip ${gcls}">${l.grade}</span> <span class="muted" style="font-size:12px">${l.gradeDesc}</span></div></div>
-    ${card("日均成交量",fmtBig(l.adtv))}${card("美元成交额",l.dollarVol!=null?"$"+fmtBig(l.dollarVol):"—")}
-    ${card("买卖价差",l.spreadBps!=null?fmtNum(l.spreadBps,1)+" bps":"—")}${card("换手率",l.turnover!=null?fmtNum(l.turnover)+"%":"—")}
-  </div>`;
+  el.innerHTML=`<div class="grid"><div class="card"><div class="k">流动性评级</div><div class="v"><span class="gradechip ${gcls}">${l.grade}</span> <span class="muted" style="font-size:12px">${l.gradeDesc}</span></div></div>${card("日均成交量",fmtBig(l.adtv))}${card("美元成交额",l.dollarVol!=null?"$"+fmtBig(l.dollarVol):"—")}${card("买卖价差",l.spreadBps!=null?fmtNum(l.spreadBps,1)+" bps":"—")}${card("换手率",l.turnover!=null?fmtNum(l.turnover)+"%":"—")}</div>`;
 }
-
-// ---------- 新闻 ----------
 async function loadNews(){
-  const el=document.getElementById("news"); if(!el)return;
+  const el=document.getElementById("news");if(!el)return;
   const n=await j("/api/news?ticker="+encodeURIComponent(curTicker));
   if(n.error||!n.news||!n.news.length){el.innerHTML='<div class="muted">暂无新闻</div>';return;}
-  el.innerHTML=n.news.map(it=>`<div class="news-item">
-    <div class="t">${it.link?`<a href="${it.link}" target="_blank" rel="noopener">${it.title}</a>`:it.title}</div>
-    <div class="m">${it.publisher||""}${it.time?" · "+it.time:""}</div></div>`).join("");
+  el.innerHTML=n.news.map(it=>`<div class="news-item"><div class="t">${it.link?`<a href="${it.link}" target="_blank" rel="noopener">${it.title}</a>`:it.title}</div><div class="m">${it.publisher||""}${it.time?" · "+it.time:""}</div></div>`).join("");
+}
+
+// ---------- 估值 ----------
+async function loadValuation(){
+  const el=document.getElementById("tabc-valuation");loadedTabs.valuation=curTicker;
+  el.innerHTML='<div class="loading">估值计算中…</div>';
+  const v=await j("/api/valuation?ticker="+encodeURIComponent(curTicker));
+  if(v.error){el.innerHTML='<div class="error">'+v.error+'</div>';return;}
+  const methodCards=v.methods.map(m=>card(m.name,fmtNum(m.value))).join("");
+  const dcfBlock=v.dcf?`<div class="grid" style="margin-top:10px">${card("WACC",v.dcf.wacc+"%")}${card("永续增速",v.dcf.termGrowth+"%")}${card("无风险利率",v.dcf.rf+"%")}${card("EBIT利润率",v.dcf.ebitMargin+"%")}${card("首年营收增速",v.dcf.y1Growth+"%")}${card("终值占比",v.dcf.tvWeight+"%")}</div>`:'<div class="muted">该公司财务结构不适用简化 DCF(如金融/REIT/亏损),已用分析师目标与远期PE 估值</div>';
+  const estRows=(v.estimates||[]).map(e=>`<tr><td>${e.period}</td><td>${fmtNum(e.avg)}</td><td class="muted">${fmtNum(e.low)} ~ ${fmtNum(e.high)}</td><td class="${(e.growth||0)>=0?'green':'red'}">${e.growth!=null?fmtPct(e.growth*100):"—"}</td><td class="muted">${e.numAnalysts??"—"}</td></tr>`).join("");
+  const revRows=(v.revisions||[]).map(r=>{const ar=r.trend==="up"?'<span class="pass">↑ 上修</span>':(r.trend==="down"?'<span class="fail">↓ 下修</span>':'<span class="muted">→ 持平</span>');return `<tr><td>${r.period}</td><td>${fmtNum(r.current)}</td><td class="muted">${fmtNum(r.ago90)}</td><td>${ar}</td></tr>`;}).join("");
+  el.innerHTML=`
+    <div class="section-title">估值三角定位 <span class="tag">skill: company-valuation</span></div>
+    <div class="sepa-head"><span class="badge ${v.verdictClass}" style="font-size:14px">${v.verdict}</span>
+      <span class="muted">现价 <b>${fmtNum(v.price)}</b></span><span class="muted">→ 合理价 <b>${fmtNum(v.blended)}</b></span>
+      <span class="muted">空间 <b class="${(v.upside||0)>=0?'green':'red'}">${fmtPct(v.upside)}</b></span></div>
+    <div class="grid">${methodCards}</div>
+    <div class="section-title" style="font-size:14px">DCF 假设</div>${dcfBlock}
+    <div class="section-title">分析师预期 <span class="tag">skill: estimate-analysis</span></div>
+    <table><thead><tr><th>周期</th><th>预期均值</th><th>区间</th><th>同比增速</th><th>分析师数</th></tr></thead><tbody>${estRows||'<tr><td colspan=5 class="muted">无预期数据</td></tr>'}</tbody></table>
+    <div class="section-title" style="font-size:14px">EPS 预期修正(当前 vs 90天前)</div>
+    <table><thead><tr><th>周期</th><th>当前预期</th><th>90天前</th><th>修正方向</th></tr></thead><tbody>${revRows||'<tr><td colspan=4 class="muted">无修正数据</td></tr>'}</tbody></table>
+    <div class="small">${v.note}</div>`;
+}
+
+// ---------- 期权 ----------
+let optChain=null,optSpot=null,legs=[];
+async function loadOptions(){
+  const el=document.getElementById("tabc-options");loadedTabs.options=curTicker;legs=[];
+  el.innerHTML='<div class="loading">加载期权到期日…</div>';
+  const e=await j("/api/options/expiries?ticker="+encodeURIComponent(curTicker));
+  if(e.error||!e.expiries||!e.expiries.length){el.innerHTML='<div class="muted">该标的无期权数据</div>';return;}
+  optSpot=e.spot;
+  el.innerHTML=`<div class="section-title">期权链 / 收益图 <span class="tag">skill: options-payoff</span></div>
+    <div class="cmpbar"><span class="muted">到期日</span><select id="expirySel" onchange="loadChain()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px 10px;border-radius:8px">${e.expiries.slice(0,16).map(x=>`<option>${x}</option>`).join("")}</select>
+    <span class="muted">现价 <b>${fmtNum(e.spot)}</b></span><span class="muted">点击下表 Call/Put 加入腿,构建到期收益曲线</span></div>
+    <div id="legbox"></div><div id="payoff"></div>
+    <div class="two-col" style="margin-top:16px"><div><div class="section-title" style="font-size:14px">Calls</div><div id="callTbl"></div></div><div><div class="section-title" style="font-size:14px">Puts</div><div id="putTbl"></div></div></div>`;
+  loadChain();
+}
+async function loadChain(){
+  const exp=document.getElementById("expirySel").value;
+  document.getElementById("callTbl").innerHTML='<div class="loading">加载…</div>';
+  const c=await j(`/api/options/chain?ticker=${encodeURIComponent(curTicker)}&expiry=${exp}`);
+  if(c.error){document.getElementById("callTbl").innerHTML='<div class="muted">'+c.error+'</div>';return;}
+  optChain=c;optSpot=c.spot;
+  document.getElementById("callTbl").innerHTML=optTable(c.calls,"call",exp);
+  document.getElementById("putTbl").innerHTML=optTable(c.puts,"put",exp);
+}
+function optTable(rows,type,exp){
+  return `<table class="legpick"><thead><tr><th>行权价</th><th>最新</th><th>买/卖</th><th>IV</th><th>OI</th></tr></thead><tbody>`+
+    rows.map(r=>`<tr onclick="addLeg('${type}',${r.strike},${r.last||r.ask||r.bid||0},'${exp}')" class="${r.itm?'':''}"><td class="${r.itm?'green':''}">${fmtNum(r.strike)}</td><td>${fmtNum(r.last)}</td><td class="muted">${fmtNum(r.bid)}/${fmtNum(r.ask)}</td><td class="muted">${r.iv!=null?(r.iv*100).toFixed(0)+"%":"—"}</td><td class="muted">${r.oi??"—"}</td></tr>`).join("")+`</tbody></table>`;
+}
+function addLeg(type,strike,prem,exp){legs.push({type,strike,prem:prem||0,dir:1,qty:1});renderLegs();drawPayoff();}
+function flipLeg(i){legs[i].dir*=-1;renderLegs();drawPayoff();}
+function delLeg(i){legs.splice(i,1);renderLegs();drawPayoff();}
+function renderLegs(){
+  document.getElementById("legbox").innerHTML=legs.length?legs.map((l,i)=>`<span class="leg-tag">${l.dir>0?'买':'卖'} ${l.type==='call'?'Call':'Put'} ${l.strike} @${fmtNum(l.prem)} <a onclick="flipLeg(${i})">⇄</a> <a onclick="delLeg(${i})" style="color:var(--red)">✕</a></span>`).join(""):'<span class="muted">未添加腿</span>';
+}
+function drawPayoff(){
+  const el=document.getElementById("payoff");if(!el)return;
+  if(!legs.length){echarts.getInstanceByDom(el)?.clear();return;}
+  const strikes=legs.map(l=>l.strike);const lo=Math.min(optSpot||strikes[0],...strikes)*0.7,hi=Math.max(optSpot||strikes[0],...strikes)*1.3;
+  const xs=[],ys=[];let netCost=0;legs.forEach(l=>netCost+=l.dir*l.prem*100);
+  for(let i=0;i<=120;i++){const S=lo+(hi-lo)*i/120;let pl=-netCost;legs.forEach(l=>{const intr=l.type==='call'?Math.max(S-l.strike,0):Math.max(l.strike-S,0);pl+=l.dir*intr*100;});xs.push(S.toFixed(1));ys.push(+pl.toFixed(1));}
+  const maxP=Math.max(...ys),minP=Math.min(...ys);
+  const ch=echarts.init(el,'dark');
+  ch.setOption({backgroundColor:'#161b22',grid:{left:60,right:20,top:40,bottom:40},
+    title:{text:`到期盈亏  最大盈利 ${maxP>1e7?'∞':fmtNum(maxP,0)} / 最大亏损 ${fmtNum(minP,0)}`,textStyle:{fontSize:13,color:'#8b949e'}},
+    tooltip:{trigger:'axis',formatter:p=>`标的 ${p[0].axisValue}<br/>盈亏 ${fmtNum(p[0].data,0)}`},
+    xAxis:{type:'category',data:xs,axisLine:{lineStyle:{color:'#30363d'}},axisLabel:{color:'#8b949e'}},
+    yAxis:{type:'value',axisLine:{lineStyle:{color:'#30363d'}},splitLine:{lineStyle:{color:'#21262d'}},axisLabel:{color:'#8b949e'}},
+    series:[{type:'line',data:ys,showSymbol:false,lineStyle:{width:2,color:'#58a6ff'},
+      markLine:{symbol:'none',data:[{yAxis:0,lineStyle:{color:'#8b949e',type:'dashed'}},{xAxis:String((optSpot||0).toFixed(1)),lineStyle:{color:'#f6c343',type:'dotted'},label:{formatter:'现价',color:'#f6c343'}}]},
+      areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(38,166,154,.3)'},{offset:1,color:'rgba(239,83,80,.3)'}])}}]});
+}
+
+// ---------- 多股对比 ----------
+let cmpChart=null;
+function loadCompare(){
+  loadedTabs.compare=true;
+  const el=document.getElementById("tabc-compare");
+  const def=[curTicker,...watchlist.filter(t=>t!==curTicker)].slice(0,5).join(",");
+  el.innerHTML=`<div class="section-title">多股归一化对比 + 相关性 <span class="tag">skill: stock-correlation</span></div>
+    <div class="cmpbar"><input id="cmpInput" value="${def}" placeholder="逗号分隔,如 AAPL,MSFT,NVDA"><select id="cmpPeriod" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:8px;border-radius:8px"><option>6mo</option><option selected>1y</option><option>2y</option></select><button class="search" style="margin:0" onclick="runCompare()">对比</button></div>
+    <div id="cmpChart"></div><div id="cmpStats"></div>`;
+  runCompare();
+}
+async function runCompare(){
+  const tickers=document.getElementById("cmpInput").value,period=document.getElementById("cmpPeriod").value;
+  document.getElementById("cmpStats").innerHTML='<div class="loading">计算中…</div>';
+  const d=await j(`/api/compare?tickers=${encodeURIComponent(tickers)}&period=${period}`);
+  if(d.error){document.getElementById("cmpStats").innerHTML='<div class="error">'+d.error+'</div>';return;}
+  const el=document.getElementById("cmpChart");if(cmpChart)cmpChart.remove?.();
+  cmpChart=LightweightCharts.createChart(el,{layout:{background:{color:"#161b22"},textColor:"#8b949e"},grid:{vertLines:{color:"#21262d"},horzLines:{color:"#21262d"}},rightPriceScale:{borderColor:"#21262d"},timeScale:{borderColor:"#21262d"},width:el.clientWidth,height:420});
+  const palette=["#58a6ff","#26a69a","#f6c343","#ef5350","#a78bfa","#ff9f40","#e6edf3","#56d364"];
+  d.tickers.forEach((t,i)=>{const s=cmpChart.addLineSeries({color:palette[i%palette.length],lineWidth:2,title:t,priceLineVisible:false});s.setData(d.series[t]);});
+  cmpChart.timeScale().fitContent();
+  const statRows=d.stats.map(s=>`<tr><td><b>${s.ticker}</b></td><td class="${s.totalReturn>=0?'green':'red'}">${fmtPct(s.totalReturn)}</td><td>${fmtNum(s.annVol)}%</td><td>${s.beta!=null?fmtNum(s.beta):"基准"}</td><td>${fmtNum(s.corrToBase)}</td></tr>`).join("");
+  const hdr=d.tickers.map(t=>`<th>${t}</th>`).join("");
+  const matrixRows=d.tickers.map((t,i)=>`<tr><td><b>${t}</b></td>${d.matrix[i].map(v=>`<td class="heat-cell" style="background:${heatCorr(v)}">${v.toFixed(2)}</td>`).join("")}</tr>`).join("");
+  document.getElementById("cmpStats").innerHTML=`
+    <div class="section-title" style="font-size:14px">区间表现(基准 ${d.base},${d.observations} 交易日)</div>
+    <table><thead><tr><th>代码</th><th>区间涨幅</th><th>年化波动</th><th>Beta(对基准)</th><th>相关性(对基准)</th></tr></thead><tbody>${statRows}</tbody></table>
+    <div class="section-title" style="font-size:14px">相关性矩阵</div>
+    <table><thead><tr><th></th>${hdr}</tr></thead><tbody>${matrixRows}</tbody></table>
+    <div class="small">归一化=区间起点 rebase 至 100。相关性基于日对数收益。相关≠因果,历史相关不保证未来。</div>`;
+}
+const heatCorr=v=>{const x=Math.max(-1,Math.min(1,v));if(x>=0)return`rgba(38,166,154,${0.12+x*0.5})`;return`rgba(239,83,80,${0.12+(-x)*0.5})`;};
+
+// ---------- 市场热力图 ----------
+let curHeat="stocks";
+function switchHeat(h){curHeat=h;document.getElementById("sub-stocks").classList.toggle("active",h==="stocks");document.getElementById("sub-sectors").classList.toggle("active",h==="sectors");document.getElementById("heat-stocks").classList.toggle("hidden",h!=="stocks");document.getElementById("heat-sectors").classList.toggle("hidden",h!=="sectors");if(h==="stocks"&&window._heatData)setTimeout(renderTreemap,50);}
+async function loadHeatmap(force){
+  window._heatLoaded=true;
+  if(force)window._heatData=null;
+  if(window._heatData){renderTreemap();renderSectors();return;}
+  document.getElementById("heat-stocks").innerHTML='<div class="loading">热力图加载中(首次约 10-20 秒,抓取近百只个股)…</div>';
+  const d=await j("/api/heatmap");
+  if(d.error){document.getElementById("heat-stocks").innerHTML='<div class="error">'+d.error+'</div>';return;}
+  window._heatData=d;
+  document.getElementById("heat-stocks").innerHTML='<div id="treemap"></div>';
+  document.getElementById("heat-note").textContent=`更新于 ${d.asof} · ${d.note}`;
+  renderTreemap();renderSectors();
+}
+function renderTreemap(){
+  const d=window._heatData;if(!d)return;const el=document.getElementById("treemap");if(!el)return;
+  const data=d.sectors.map(s=>({name:s.sector,value:s.size,children:s.stocks.map(st=>({name:st.ticker,value:st.size,change:st.change,itemStyle:{color:heatColor(st.change)}}))}));
+  const ch=echarts.init(el,'dark');
+  ch.setOption({backgroundColor:'#161b22',tooltip:{formatter:p=>{const c=p.data.change;return `<b>${p.name}</b>${c!=null?'<br/>涨跌 '+fmtPct(c)+'<br/>市值 ~$'+fmtNum(p.value,1)+'B':''}`;}},
+    series:[{type:'treemap',roam:false,nodeClick:false,breadcrumb:{show:false},width:'100%',height:'100%',
+      levels:[{itemStyle:{borderColor:'#0d1117',borderWidth:3,gapWidth:3}},{itemStyle:{borderColor:'#0d1117',borderWidth:1,gapWidth:1},upperLabel:{show:true,height:22,color:'#e6edf3',fontWeight:600,fontSize:12}}],
+      label:{show:true,formatter:p=>p.data.change!=null?`${p.name}\n${(p.data.change>=0?'+':'')+p.data.change.toFixed(1)}%`:p.name,color:'#fff',fontSize:11,fontWeight:600},
+      data:data}]});
+  window.addEventListener("resize",()=>ch.resize());
+}
+function renderSectors(){
+  const d=window._heatData;if(!d)return;
+  const tiles=d.sectorEtfs.map(s=>`<div class="stile" style="background:${heatColor(s.change)}"><div class="s1">${s.sector}</div><div class="s2">${fmtPct(s.change)}</div><div class="s3">${s.etf}</div></div>`).join("");
+  const secAgg=[...d.sectors].sort((a,b)=>b.change-a.change).map(s=>`<div class="stile" style="background:${heatColor(s.change)}"><div class="s1">${s.sector}</div><div class="s2">${fmtPct(s.change)}</div><div class="s3">市值加权 · ${s.stocks.length}只</div></div>`).join("");
+  document.getElementById("heat-sectors").innerHTML=`
+    <div class="section-title" style="font-size:14px">板块 ETF 当日表现(SPDR XL*)</div><div class="sectorgrid">${tiles}</div>
+    <div class="section-title" style="font-size:14px">板块市值加权涨跌(成分股聚合)</div><div class="sectorgrid">${secAgg}</div>`;
 }
 
 // ---------- 启动 ----------
-document.getElementById("chips").innerHTML=POPULAR.map(t=>`<span class="chip" onclick="loadTicker('${t}')">${t}</span>`).join("");
 document.getElementById("tickerInput").addEventListener("keydown",e=>{if(e.key==="Enter")loadTicker();});
-loadMarket();
-loadTicker("AAPL");
+loadMarket();renderWatch();loadTicker("AAPL");
 </script>
 </body>
 </html>"""
