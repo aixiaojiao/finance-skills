@@ -23,14 +23,74 @@
 """
 
 import math
+import os
 import time
+import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, g
 import yfinance as yf
 import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
+
+# ============================ SQLite 持久化 ============================
+# 持仓 / 自选 / 预警 / 设置 落盘,跨设备。路径可用 DASHBOARD_DB 覆盖。
+
+DB_PATH = os.environ.get("DASHBOARD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dashboard.db"))
+
+
+def get_db():
+    db = getattr(g, "_db", None)
+    if db is None:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        db = g._db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+    return db
+
+
+@app.teardown_appcontext
+def _close_db(exc):
+    db = getattr(g, "_db", None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS positions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL, shares REAL NOT NULL,
+        entry REAL NOT NULL, stop REAL, target REAL,
+        opened_at TEXT, status TEXT DEFAULT 'open',
+        exit_price REAL, closed_at TEXT, note TEXT
+    );
+    CREATE TABLE IF NOT EXISTS alerts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL, kind TEXT NOT NULL,
+        level REAL, note TEXT, active INTEGER DEFAULT 1, created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS watchlist(
+        ticker TEXT PRIMARY KEY, added_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY, value TEXT
+    );
+    """)
+    # 自选股默认值(仅首次为空时)
+    cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
+    if cur[0] == 0:
+        con.executemany("INSERT INTO watchlist(ticker, added_at) VALUES(?, ?)",
+                        [("AAPL", ""), ("NVDA", ""), ("TSLA", "")])
+    con.commit()
+    con.close()
+
+
+init_db()
 
 
 # ============================ 通用工具 ============================
@@ -855,6 +915,173 @@ def api_heatmap():
     return jsonify(compute_heatmap())
 
 
+# ============================ API: 持仓 / 交易记录 ============================
+
+def _live_prices(tickers):
+    """批量取最新价 + 前收,复用 yf.download。"""
+    out = {}
+    tickers = [t for t in tickers if t]
+    if not tickers:
+        return out
+    try:
+        data = yf.download(list(set(tickers)), period="5d", auto_adjust=False, progress=False, group_by="ticker")
+    except Exception:
+        data = None
+    for t in set(tickers):
+        try:
+            sub = data[t] if (data is not None and t in data.columns.get_level_values(0)) else None
+            c = sub["Close"].dropna() if sub is not None else None
+            out[t] = {"price": _num(c.iloc[-1]) if c is not None and len(c) else None,
+                      "ma20": _num(c.rolling(20).mean().iloc[-1]) if c is not None and len(c) >= 20 else None}
+        except Exception:
+            out[t] = {"price": None, "ma20": None}
+    return out
+
+
+@app.route("/api/positions", methods=["GET", "POST"])
+def api_positions():
+    db = get_db()
+    if request.method == "POST":
+        d = request.get_json(force=True, silent=True) or {}
+        tk = (d.get("ticker") or "").strip().upper()
+        if not tk or not d.get("shares") or not d.get("entry"):
+            return jsonify({"error": "ticker / shares / entry 必填"}), 400
+        db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note) VALUES(?,?,?,?,?,?, 'open', ?)",
+                   (tk, float(d["shares"]), float(d["entry"]), _num(d.get("stop")), _num(d.get("target")),
+                    time.strftime("%Y-%m-%d"), d.get("note") or ""))
+        db.commit()
+        return jsonify({"ok": True})
+    # GET: 带实时盈亏
+    rows = [dict(r) for r in db.execute("SELECT * FROM positions ORDER BY id DESC").fetchall()]
+    open_rows = [r for r in rows if r["status"] == "open"]
+    live = _live_prices([r["ticker"] for r in open_rows])
+    acct = _get_setting("accountValue")
+    acct = float(acct) if acct else None
+    total_mv = total_cost = total_pl = total_risk = 0.0
+    for r in rows:
+        lp = live.get(r["ticker"], {})
+        price = lp.get("price") if r["status"] == "open" else r.get("exit_price")
+        r["price"] = price
+        r["ma20"] = lp.get("ma20")
+        cost = r["shares"] * r["entry"]
+        r["cost"] = cost
+        if price is not None:
+            mv = r["shares"] * price
+            r["marketValue"] = mv
+            r["pl"] = mv - cost
+            r["plPct"] = (price / r["entry"] - 1) * 100
+            r["toStopPct"] = ((price / r["stop"] - 1) * 100) if r["stop"] else None
+            if r["stop"] and r["status"] == "open":
+                rps = r["entry"] - r["stop"]
+                r["rMultiple"] = (price - r["entry"]) / rps if rps else None
+            if r["status"] == "open":
+                total_mv += mv
+                total_cost += cost
+                total_pl += mv - cost
+                if r["stop"]:
+                    total_risk += max(0.0, (price - r["stop"]) * r["shares"])
+    summary = {"openCount": len(open_rows), "totalMarketValue": total_mv, "totalCost": total_cost,
+               "totalPL": total_pl, "totalPLPct": (total_pl / total_cost * 100) if total_cost else None,
+               "totalRisk": total_risk, "account": acct,
+               "investedPct": (total_cost / acct * 100) if acct else None,
+               "riskPct": (total_risk / acct * 100) if acct else None}
+    return jsonify({"positions": rows, "summary": summary})
+
+
+@app.route("/api/positions/<int:pid>", methods=["PUT", "DELETE"])
+def api_position_one(pid):
+    db = get_db()
+    if request.method == "DELETE":
+        db.execute("DELETE FROM positions WHERE id=?", (pid,))
+        db.commit()
+        return jsonify({"ok": True})
+    d = request.get_json(force=True, silent=True) or {}
+    if d.get("action") == "close":
+        db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=? WHERE id=?",
+                   (_num(d.get("exit_price")), time.strftime("%Y-%m-%d"), pid))
+    else:
+        for field in ("stop", "target", "note"):
+            if field in d:
+                db.execute(f"UPDATE positions SET {field}=? WHERE id=?", (_num(d[field]) if field != "note" else d[field], pid))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+# ============================ API: 自选股 / 设置 / 预警(持久化) ============================
+
+@app.route("/api/watchlist", methods=["GET", "POST", "DELETE"])
+def api_watchlist():
+    db = get_db()
+    if request.method == "GET":
+        rows = db.execute("SELECT ticker FROM watchlist ORDER BY added_at, ticker").fetchall()
+        return jsonify({"watchlist": [r["ticker"] for r in rows]})
+    tk = ((request.get_json(force=True, silent=True) or {}).get("ticker") or request.args.get("ticker") or "").strip().upper()
+    if not tk:
+        return jsonify({"error": "缺少 ticker"}), 400
+    if request.method == "POST":
+        db.execute("INSERT OR IGNORE INTO watchlist(ticker, added_at) VALUES(?, ?)", (tk, time.strftime("%Y-%m-%d %H:%M:%S")))
+    else:
+        db.execute("DELETE FROM watchlist WHERE ticker=?", (tk,))
+    db.commit()
+    rows = db.execute("SELECT ticker FROM watchlist ORDER BY added_at, ticker").fetchall()
+    return jsonify({"watchlist": [r["ticker"] for r in rows]})
+
+
+def _get_setting(key):
+    row = get_db().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    db = get_db()
+    if request.method == "GET":
+        rows = db.execute("SELECT key, value FROM settings").fetchall()
+        return jsonify({r["key"]: r["value"] for r in rows})
+    d = request.get_json(force=True, silent=True) or {}
+    for k, v in d.items():
+        db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/alerts", methods=["GET", "POST", "DELETE"])
+def api_alerts():
+    db = get_db()
+    if request.method == "POST":
+        d = request.get_json(force=True, silent=True) or {}
+        tk = (d.get("ticker") or "").strip().upper()
+        if not tk or not d.get("kind"):
+            return jsonify({"error": "ticker / kind 必填"}), 400
+        db.execute("INSERT INTO alerts(ticker,kind,level,note,active,created_at) VALUES(?,?,?,?,1,?)",
+                   (tk, d["kind"], _num(d.get("level")), d.get("note") or "", time.strftime("%Y-%m-%d %H:%M")))
+        db.commit()
+        return jsonify({"ok": True})
+    if request.method == "DELETE":
+        aid = request.args.get("id")
+        if aid:
+            db.execute("DELETE FROM alerts WHERE id=?", (aid,))
+            db.commit()
+        return jsonify({"ok": True})
+    # GET: 评估触发状态
+    rows = [dict(r) for r in db.execute("SELECT * FROM alerts WHERE active=1 ORDER BY id DESC").fetchall()]
+    live = _live_prices([r["ticker"] for r in rows])
+    for r in rows:
+        lp = live.get(r["ticker"], {})
+        price, ma20 = lp.get("price"), lp.get("ma20")
+        r["price"] = price
+        triggered = False
+        if price is not None:
+            if r["kind"] == "above" and r["level"]:
+                triggered = price >= r["level"]
+            elif r["kind"] in ("below", "stop") and r["level"]:
+                triggered = price <= r["level"]
+            elif r["kind"] == "break_ma20" and ma20:
+                triggered = price < ma20
+        r["triggered"] = triggered
+    return jsonify({"alerts": rows})
+
+
 # ============================ 前端 ============================
 
 @app.route("/")
@@ -956,6 +1183,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <h1>📈 看板</h1>
   <div class="topnav">
     <button id="nav-stock" class="active" onclick="switchPage('stock')">个股看板</button>
+    <button id="nav-positions" onclick="switchPage('positions')">持仓</button>
     <button id="nav-heatmap" onclick="switchPage('heatmap')">市场热力图</button>
   </div>
   <div class="search" id="stockSearch">
@@ -983,6 +1211,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div id="tabc-compare" class="hidden"></div>
   </div>
 
+  <!-- 持仓页 -->
+  <div id="page-positions" class="hidden"><div class="loading">加载持仓…</div></div>
+
   <!-- 市场热力图页 -->
   <div id="page-heatmap" class="hidden">
     <div class="subtabs">
@@ -1007,7 +1238,7 @@ const MA_COLORS={"5":"#f6c343","10":"#ff9f40","20":"#58a6ff","50":"#a78bfa","200
 const MA_DEFAULT_ON={"5":false,"10":false,"20":true,"50":true,"200":true};
 let chart,candleSeries,volSeries,maSeries={},curTicker="AAPL",curPeriod="6mo",curTab="overview",curPage="stock";
 let loadedTabs={};
-let watchlist=JSON.parse(localStorage.getItem("watchlist")||'["AAPL","NVDA","TSLA"]');
+let watchlist=[];
 
 const fmtNum=(n,d=2)=>n==null?"—":Number(n).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmtBig=n=>{if(n==null)return"—";const a=Math.abs(n);if(a>=1e12)return(n/1e12).toFixed(2)+"T";if(a>=1e9)return(n/1e9).toFixed(2)+"B";if(a>=1e6)return(n/1e6).toFixed(2)+"M";if(a>=1e3)return(n/1e3).toFixed(2)+"K";return fmtNum(n)};
@@ -1018,12 +1249,13 @@ const heatColor=c=>{if(c==null)return"#30363d";const x=Math.max(-3,Math.min(3,c)
 // ---------- 页面/标签切换 ----------
 function switchPage(p){
   curPage=p;
-  document.getElementById("page-stock").classList.toggle("hidden",p!=="stock");
-  document.getElementById("page-heatmap").classList.toggle("hidden",p!=="heatmap");
+  ["stock","positions","heatmap"].forEach(x=>{
+    document.getElementById("page-"+x).classList.toggle("hidden",p!==x);
+    document.getElementById("nav-"+x).classList.toggle("active",p===x);
+  });
   document.getElementById("stockSearch").style.display=p==="stock"?"flex":"none";
-  document.getElementById("nav-stock").classList.toggle("active",p==="stock");
-  document.getElementById("nav-heatmap").classList.toggle("active",p==="heatmap");
   if(p==="heatmap" && !window._heatLoaded) loadHeatmap();
+  if(p==="positions") loadPositions();
 }
 function switchTab(t){
   curTab=t;
@@ -1051,10 +1283,16 @@ async function loadMarket(){
   }catch(e){document.getElementById("marketbar").innerHTML='<span class="muted">大盘数据获取失败</span>';}
 }
 
-// ---------- 自选股 ----------
-function saveWatch(){localStorage.setItem("watchlist",JSON.stringify(watchlist));}
-function inWatch(t){return watchlist.includes(t);}
-function toggleWatch(t){t=t.toUpperCase();if(inWatch(t))watchlist=watchlist.filter(x=>x!==t);else watchlist.push(t);saveWatch();renderWatch();const s=document.getElementById("starBtn");if(s)s.textContent=inWatch(curTicker)?"★":"☆";}
+// ---------- 设置(后端 SQLite,localStorage 兜底) ----------
+let settings={};
+async function loadSettings(){try{settings=await j("/api/settings")||{};}catch(e){settings={};}}
+function getSetting(k,def){if(settings[k]!=null&&settings[k]!=="")return settings[k];const ls=localStorage.getItem(k);return ls!=null?ls:def;}
+function setSetting(k,v){settings[k]=String(v);localStorage.setItem(k,v);fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({[k]:String(v)})}).catch(()=>{});}
+
+// ---------- 自选股(后端持久化) ----------
+function inWatch(t){return watchlist.includes(t.toUpperCase());}
+async function loadWatch(){try{const d=await j("/api/watchlist");watchlist=d.watchlist||[];}catch(e){}renderWatch();}
+async function toggleWatch(t){t=t.toUpperCase();const method=inWatch(t)?"DELETE":"POST";try{const d=await(await fetch("/api/watchlist?ticker="+t,{method})).json();watchlist=d.watchlist||watchlist;}catch(e){}renderWatch();const s=document.getElementById("starBtn");if(s)s.textContent=inWatch(curTicker)?"★":"☆";}
 async function renderWatch(){
   const el=document.getElementById("watchstrip");
   el.innerHTML='<span class="lbl">自选股</span>'+watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="loadTicker('${t}')">${t} <span class="muted">…</span><span class="x" onclick="event.stopPropagation();toggleWatch('${t}')">✕</span></span>`).join("")||'<span class="lbl">自选股(空)</span>';
@@ -1171,13 +1409,13 @@ async function loadNews(){
 function loadPosition(){
   loadedTabs.position=curTicker;
   const el=document.getElementById("tabc-position");
-  const acct=localStorage.getItem("accountValue")||"100000";
+  const acct=getSetting("accountValue","100000");
   const entry=window._curPrice?window._curPrice.toFixed(2):"";
   const stop=window._curPrice?(window._curPrice*0.92).toFixed(2):"";  // 默认 -8%
-  const posUnit=localStorage.getItem("posUnit")||"%";
-  const riskUnit=localStorage.getItem("riskUnit")||"%";
-  const posVal=localStorage.getItem("posVal")||"25";
-  const riskVal=localStorage.getItem("riskVal")||"1";
+  const posUnit=getSetting("posUnit","%");
+  const riskUnit=getSetting("riskUnit","%");
+  const posVal=getSetting("posVal","25");
+  const riskVal=getSetting("riskVal","1");
   const unitSel=(id,u)=>`<select id="${id}" onchange="calcPosition()"><option ${u==="%"?"selected":""}>%</option><option ${u==="$"?"selected":""}>$</option></select>`;
   el.innerHTML=`
    <div class="section-title">仓位计算器 <span class="tag">skill: sepa-strategy/position-sizing</span></div>
@@ -1198,9 +1436,10 @@ function calcPosition(){
   const maxPosIn=num("posMaxPos"),maxRiskIn=num("posMaxRisk");
   const posUnit=document.getElementById("posMaxPosUnit").value,riskUnit=document.getElementById("posMaxRiskUnit").value;
   // 记忆
-  if(account>0)localStorage.setItem("accountValue",account);
-  localStorage.setItem("posUnit",posUnit);localStorage.setItem("riskUnit",riskUnit);
-  if(maxPosIn>=0)localStorage.setItem("posVal",maxPosIn);if(maxRiskIn>=0)localStorage.setItem("riskVal",maxRiskIn);
+  if(account>0)setSetting("accountValue",account);
+  setSetting("posUnit",posUnit);setSetting("riskUnit",riskUnit);
+  if(maxPosIn>=0)setSetting("posVal",maxPosIn);if(maxRiskIn>=0)setSetting("riskVal",maxRiskIn);
+  window._lastCalc={entry,stop,shares:0};
 
   const res=document.getElementById("posResult");
   const setHint=(id,t)=>{const e=document.getElementById(id);if(e)e.textContent=t;};
@@ -1220,6 +1459,7 @@ function calcPosition(){
   const shares=Math.max(0,Math.min(sharesByRisk,sharesByPos));
   const binding=sharesByRisk<=sharesByPos?"风险上限":"仓位上限";
   const bindClass=sharesByRisk<=sharesByPos?"sell":"hold";
+  window._lastCalc={entry,stop,shares};
 
   const capital=shares*entry;
   const riskDollar=shares*riskPerShare;
@@ -1233,6 +1473,7 @@ function calcPosition(){
    <div class="bindbox">
      <div><div class="muted" style="font-size:12px">建议最大买入</div><div class="shares-big">${shares.toLocaleString()} <span style="font-size:18px;font-weight:600">股</span></div></div>
      <span class="badge ${bindClass}">受「${binding}」约束</span>
+     <button class="search" style="margin:0" onclick="addPositionFromCalc()">＋ 记入持仓</button>
    </div>
    <div class="grid">
      ${card("投入资金",`$${fmtBig(capital)}`)}
@@ -1254,6 +1495,76 @@ function calcPosition(){
      <tr><td>目标2</td><td class="green">$${fmtNum(t2)}</td><td class="green">+15%</td><td>${rr2.toFixed(2)}:1</td><td class="muted">再卖25%,余下跟踪20MA</td></tr>
    </tbody></table>
    <div class="small">公式:股数 = min( 总风险额÷每股风险 , 总仓位额÷买入价 )。SEPA 建议单笔风险 0.5–2%、盈亏比≥2:1、止损 7–8% 内。本工具仅为计算,不构成投资建议。</div>`;
+}
+async function addPositionFromCalc(){
+  const c=window._lastCalc;
+  if(!c||!c.shares){alert("请先得到有效的可买股数");return;}
+  await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({ticker:curTicker,shares:c.shares,entry:c.entry,stop:c.stop,target:(c.entry*1.15).toFixed(2)})});
+  alert(`已记入持仓:${curTicker} ${c.shares} 股 @ ${fmtNum(c.entry)}`);
+}
+
+// ---------- 持仓页 ----------
+async function loadPositions(){
+  const el=document.getElementById("page-positions");
+  el.innerHTML='<div class="loading">加载持仓…</div>';
+  const d=await j("/api/positions");
+  const s=d.summary||{};
+  const open=d.positions.filter(p=>p.status==="open"),closed=d.positions.filter(p=>p.status==="closed");
+  const sumCards=`<div class="grid" style="margin-bottom:18px">
+    ${card("持仓数",s.openCount||0)}
+    ${card("总市值",s.totalMarketValue!=null?"$"+fmtBig(s.totalMarketValue):"—")}
+    ${card("总成本",s.totalCost!=null?"$"+fmtBig(s.totalCost):"—")}
+    <div class="card"><div class="k">总浮盈亏</div><div class="v ${(s.totalPL||0)>=0?'green':'red'}">${s.totalPL!=null?(s.totalPL>=0?"+":"")+"$"+fmtBig(Math.abs(s.totalPL)):"—"} ${s.totalPLPct!=null?`(${fmtPct(s.totalPLPct)})`:""}</div></div>
+    ${card("仓位占账户",s.investedPct!=null?s.investedPct.toFixed(1)+"%":"—")}
+    <div class="card"><div class="k">组合风险敞口</div><div class="v ${(s.riskPct||0)>6?'red':''}">${s.totalRisk!=null?"$"+fmtBig(s.totalRisk):"—"} ${s.riskPct!=null?`(${s.riskPct.toFixed(2)}%)`:""}</div></div>
+  </div>`;
+  const openRows=open.map(p=>{
+    const plc=(p.pl||0)>=0?"green":"red";
+    const stopc=p.toStopPct!=null&&p.toStopPct<5?"red":"";
+    return `<tr>
+      <td><b class="wchip" style="cursor:pointer;padding:2px 6px" onclick="loadTicker('${p.ticker}')">${p.ticker}</b></td>
+      <td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}</td>
+      <td class="${plc}">${p.pl!=null?(p.pl>=0?"+":"")+fmtBig(p.pl):"—"} ${p.plPct!=null?`(${fmtPct(p.plPct)})`:""}</td>
+      <td>${fmtNum(p.stop)}</td><td class="${stopc}">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
+      <td>${p.rMultiple!=null?p.rMultiple.toFixed(2)+"R":"—"}</td>
+      <td class="muted">${p.note||""}</td>
+      <td><a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
+    </tr>`;}).join("");
+  const closedRows=closed.map(p=>{
+    const pl=(p.exit_price!=null)?(p.exit_price-p.entry)*p.shares:null;
+    return `<tr class="muted"><td>${p.ticker}</td><td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.exit_price)}</td>
+      <td class="${(pl||0)>=0?'green':'red'}">${pl!=null?(pl>=0?"+":"")+fmtBig(pl):"—"}</td><td>${p.opened_at||""}→${p.closed_at||""}</td>
+      <td><a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td></tr>`;}).join("");
+  el.innerHTML=`
+    <div class="section-title" style="margin-top:6px">我的持仓 <span class="tag">SQLite 持久化</span></div>
+    ${sumCards}
+    <div class="cmpbar"><b>手动添加:</b>
+      <input id="npTicker" placeholder="代码" style="width:90px;text-transform:uppercase;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+      <input id="npShares" placeholder="股数" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+      <input id="npEntry" placeholder="买入价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+      <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+      <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
+    ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>R</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可在「仓位计算」算好后一键记入,或上方手动添加。</div>'}
+    ${closed.length?`<div class="section-title" style="font-size:14px">已平仓 / 交易记录</div><table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>平仓价</th><th>盈亏</th><th>持有</th><th></th></tr></thead><tbody>${closedRows}</tbody></table>`:""}
+    <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
+}
+async function addPositionManual(){
+  const tk=document.getElementById("npTicker").value.trim().toUpperCase();
+  const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value);
+  if(!tk||!shares||!entry){alert("代码/股数/买入价必填");return;}
+  await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null})});
+  loadPositions();
+}
+async function closePosition(id,price){
+  const px=prompt("平仓价格",price?price.toFixed(2):"");
+  if(px===null)return;
+  await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"close",exit_price:parseFloat(px)})});
+  loadPositions();
+}
+async function delPosition(id){
+  if(!confirm("确认删除该记录?"))return;
+  await fetch("/api/positions/"+id,{method:"DELETE"});loadPositions();
 }
 
 // ---------- 估值 ----------
@@ -1415,7 +1726,7 @@ function renderSectorTreemap(){
 
 // ---------- 启动 ----------
 document.getElementById("tickerInput").addEventListener("keydown",e=>{if(e.key==="Enter")loadTicker();});
-loadMarket();renderWatch();loadTicker("AAPL");
+loadMarket();loadSettings();loadWatch();loadTicker("AAPL");
 </script>
 </body>
 </html>"""

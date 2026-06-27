@@ -10,3 +10,4 @@ webapp/__pycache__/
 webapp/*.log
 __pycache__/
 *.pyc
+webapp/data/
