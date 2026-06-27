@@ -810,6 +810,148 @@ def api_option_chain():
     return jsonify({"ticker": ticker, "expiry": expiry, "spot": spot, "calls": calls, "puts": puts})
 
 
+# ============================ API: 期权墙(Max Pain / OI 墙 / GEX) ============================
+
+def _norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def _bs_gamma(S, K, T, r, sigma):
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (r + sigma * sigma / 2) * T) / (sigma * math.sqrt(T))
+    return _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+
+
+@cached(300)
+def _risk_free():
+    try:
+        tnx = get_history_df("^TNX", "5d")
+        if tnx is not None and not tnx.empty:
+            return float(tnx["Close"].dropna().iloc[-1]) / 100
+    except Exception:
+        pass
+    return 0.045
+
+
+@app.route("/api/options/walls")
+def api_option_walls():
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    expiry = request.args.get("expiry")
+    if not ticker or not expiry:
+        return jsonify({"error": "缺少 ticker 或 expiry"}), 400
+    try:
+        oc = yf.Ticker(ticker).option_chain(expiry)
+    except Exception as e:
+        return jsonify({"error": f"获取期权链失败: {e}"}), 502
+    spot = _num(get_info(ticker).get("currentPrice") or get_info(ticker).get("regularMarketPrice"))
+    if not spot:
+        return jsonify({"error": "无法获取现价"}), 502
+
+    # 剩余到期(年)
+    try:
+        exp_t = time.mktime(time.strptime(expiry, "%Y-%m-%d"))
+        days = max(0.5, (exp_t - time.time()) / 86400)
+    except Exception:
+        days = 7
+    T = days / 365.0
+    r = _risk_free()
+
+    calls = oc.calls.fillna(0)
+    puts = oc.puts.fillna(0)
+
+    # 按行权价聚合 OI / Volume / IV
+    def by_strike(df):
+        m = {}
+        for _, row in df.iterrows():
+            k = _num(row.get("strike"))
+            if k is None:
+                continue
+            m[k] = {"oi": _num(row.get("openInterest")) or 0, "vol": _num(row.get("volume")) or 0,
+                    "iv": _num(row.get("impliedVolatility")) or 0}
+        return m
+    cmap, pmap = by_strike(calls), by_strike(puts)
+    strikes = sorted(set(cmap) | set(pmap))
+    if not strikes:
+        return jsonify({"error": "无有效行权价"}), 404
+
+    # Max Pain:使期权买方总收益(=卖方赔付)最小的结算价
+    def payout(S):
+        tot = 0.0
+        for k in strikes:
+            tot += (cmap.get(k, {}).get("oi", 0)) * max(S - k, 0)
+            tot += (pmap.get(k, {}).get("oi", 0)) * max(k - S, 0)
+        return tot
+    max_pain = min(strikes, key=payout)
+
+    # OI 墙
+    call_walls = sorted([{"strike": k, "oi": cmap[k]["oi"]} for k in cmap if cmap[k]["oi"] > 0],
+                        key=lambda x: -x["oi"])[:6]
+    put_walls = sorted([{"strike": k, "oi": pmap[k]["oi"]} for k in pmap if pmap[k]["oi"] > 0],
+                       key=lambda x: -x["oi"])[:6]
+
+    # GEX:每档 (OI_call·γ - OI_put·γ)·S²·1%·100(在当前现价下的剖面)
+    gex_by_strike = []
+    for k in strikes:
+        civ = cmap.get(k, {}).get("iv", 0)
+        piv = pmap.get(k, {}).get("iv", 0)
+        gc = _bs_gamma(spot, k, T, r, civ) if civ > 0 else 0
+        gp = _bs_gamma(spot, k, T, r, piv) if piv > 0 else 0
+        gex = (cmap.get(k, {}).get("oi", 0) * gc - pmap.get(k, {}).get("oi", 0) * gp) * spot * spot * 0.01 * 100
+        gex_by_strike.append({"strike": k, "gex": gex})
+    net_gex = sum(x["gex"] for x in gex_by_strike)
+
+    # Gamma Flip:净做市商 gamma 随假设现价 S 变化、由负转正的价位(零伽马)
+    def gex_at(S):
+        tot = 0.0
+        for k in strikes:
+            civ = cmap.get(k, {}).get("iv", 0)
+            piv = pmap.get(k, {}).get("iv", 0)
+            gc = _bs_gamma(S, k, T, r, civ) if civ > 0 else 0
+            gp = _bs_gamma(S, k, T, r, piv) if piv > 0 else 0
+            tot += (cmap.get(k, {}).get("oi", 0) * gc - pmap.get(k, {}).get("oi", 0) * gp)
+        return tot * S * S
+    gamma_flip = None
+    lo_s, hi_s = spot * 0.6, spot * 1.4
+    steps = 80
+    prev_s = lo_s
+    prev_v = gex_at(prev_s)
+    best = None
+    for i in range(1, steps + 1):
+        s = lo_s + (hi_s - lo_s) * i / steps
+        v = gex_at(s)
+        if prev_v == 0 or (prev_v < 0 < v) or (prev_v > 0 > v):
+            # 线性插值交叉点
+            cross = prev_s if v == prev_v else prev_s + (s - prev_s) * (0 - prev_v) / (v - prev_v)
+            if best is None or abs(cross - spot) < abs(best - spot):
+                best = cross
+        prev_s, prev_v = s, v
+    if best is not None:
+        gamma_flip = round(best, 2)
+
+    oi_call = sum(v["oi"] for v in cmap.values())
+    oi_put = sum(v["oi"] for v in pmap.values())
+    vol_call = sum(v["vol"] for v in cmap.values())
+    vol_put = sum(v["vol"] for v in pmap.values())
+
+    # 给前端画图用的 OI 分布(限制档数,ATM 附近)
+    near = sorted(strikes, key=lambda k: abs(k - spot))[:40]
+    near = sorted(near)
+    oi_dist = [{"strike": k, "call": cmap.get(k, {}).get("oi", 0), "put": pmap.get(k, {}).get("oi", 0)} for k in near]
+    gex_dist = [x for x in gex_by_strike if x["strike"] in set(near)]
+
+    return jsonify({
+        "ticker": ticker, "expiry": expiry, "spot": spot, "daysToExpiry": round(days, 1),
+        "maxPain": max_pain, "maxPainVsSpot": round((max_pain / spot - 1) * 100, 2),
+        "callWalls": call_walls, "putWalls": put_walls,
+        "netGex": net_gex, "gammaFlip": gamma_flip,
+        "pcRatioOI": round(oi_put / oi_call, 2) if oi_call else None,
+        "pcRatioVol": round(vol_put / vol_call, 2) if vol_call else None,
+        "oiDist": oi_dist, "gexDist": gex_dist,
+        "note": "GEX 用 BS gamma(IV/剩余到期/无风险利率)估算,Gamma Flip 为累计净GEX过零点近似",
+    })
+
+
 # ============================ API: 市场热力图 ============================
 
 SECTOR_ETFS = {
@@ -1201,7 +1343,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <button id="tab-overview" class="active" onclick="switchTab('overview')">概览</button>
       <button id="tab-position" onclick="switchTab('position')">仓位计算</button>
       <button id="tab-valuation" onclick="switchTab('valuation')">估值</button>
-      <button id="tab-options" onclick="switchTab('options')">期权</button>
+      <button id="tab-options" onclick="switchTab('options')">期权墙</button>
       <button id="tab-compare" onclick="switchTab('compare')">多股对比</button>
     </div>
     <div id="tabc-overview"><div class="loading">加载中…</div></div>
@@ -1328,7 +1470,7 @@ function renderOverview(q){
      <span class="star" id="starBtn" onclick="toggleWatch(curTicker)">${inWatch(q.ticker)?"★":"☆"}</span></div>
    <div class="price-row"><span class="price">${fmtNum(q.price)}</span><span class="chg ${cls}">${up?"▲":"▼"} ${fmtNum(q.change)} (${fmtPct(q.changePct)})</span></div>
    <div class="meta">${q.sector||""}${q.industry?" · "+q.industry:""} &nbsp;|&nbsp; 开 ${fmtNum(q.open)} · 高 ${fmtNum(q.dayHigh)} · 低 ${fmtNum(q.dayLow)} · 量 ${fmtBig(q.volume)}</div>
-   <div class="controls">${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}</span></div>
+   <div class="controls">${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}<label style="margin-left:6px"><input type="checkbox" id="wallOverlay" onchange="toggleOptionWall(this.checked)"><span style="color:#f6c343">期权墙</span></label></span></div>
    <div id="chart"></div>
    <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy</span></div>
    <div id="sepa"><div class="loading">分析中…</div></div>
@@ -1356,6 +1498,24 @@ function initChart(){
   window.addEventListener("resize",()=>{if(chart)chart.applyOptions({width:el.clientWidth});});
 }
 function toggleMA(w,on){if(maSeries[w])maSeries[w].applyOptions({visible:on});}
+let wallLines=[];
+async function toggleOptionWall(on){
+  wallLines.forEach(l=>{try{candleSeries.removePriceLine(l);}catch(e){}});wallLines=[];
+  if(!on||!candleSeries)return;
+  let d=window._walls;
+  if(!d||d.ticker!==curTicker){
+    const e=await j("/api/options/expiries?ticker="+encodeURIComponent(curTicker));
+    if(e.error||!e.expiries||!e.expiries.length){const cb=document.getElementById("wallOverlay");if(cb)cb.checked=false;return;}
+    const exp=pickMonthlyExpiry(e.expiries.slice(0,16));
+    d=await j(`/api/options/walls?ticker=${encodeURIComponent(curTicker)}&expiry=${exp}`);
+    if(d.error)return;window._walls=d;
+  }
+  const add=(price,color,title)=>{if(price==null)return;wallLines.push(candleSeries.createPriceLine({price,color,lineWidth:1,lineStyle:2,axisLabelVisible:true,title}));};
+  add(d.maxPain,"#f6c343","Max Pain");
+  if(d.callWalls&&d.callWalls[0])add(d.callWalls[0].strike,"#ef5350","Call墙(压力)");
+  if(d.putWalls&&d.putWalls[0])add(d.putWalls[0].strike,"#26a69a","Put墙(支撑)");
+  add(d.gammaFlip,"#58a6ff","Gamma Flip");
+}
 async function loadChart(period){
   curPeriod=period;
   document.querySelectorAll("#tabc-overview .controls>button").forEach(b=>b.classList.toggle("active",b.textContent===period));
@@ -1591,57 +1751,78 @@ async function loadValuation(){
     <div class="small">${v.note}</div>`;
 }
 
-// ---------- 期权 ----------
-let optChain=null,optSpot=null,legs=[];
+// ---------- 期权墙(对股价的影响) ----------
 async function loadOptions(){
-  const el=document.getElementById("tabc-options");loadedTabs.options=curTicker;legs=[];
+  const el=document.getElementById("tabc-options");loadedTabs.options=curTicker;
   el.innerHTML='<div class="loading">加载期权到期日…</div>';
   const e=await j("/api/options/expiries?ticker="+encodeURIComponent(curTicker));
   if(e.error||!e.expiries||!e.expiries.length){el.innerHTML='<div class="muted">该标的无期权数据</div>';return;}
-  optSpot=e.spot;
-  el.innerHTML=`<div class="section-title">期权链 / 收益图 <span class="tag">skill: options-payoff</span></div>
-    <div class="cmpbar"><span class="muted">到期日</span><select id="expirySel" onchange="loadChain()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px 10px;border-radius:8px">${e.expiries.slice(0,16).map(x=>`<option>${x}</option>`).join("")}</select>
-    <span class="muted">现价 <b>${fmtNum(e.spot)}</b></span><span class="muted">点击下表 Call/Put 加入腿,构建到期收益曲线</span></div>
-    <div id="legbox"></div><div id="payoff"></div>
-    <div class="two-col" style="margin-top:16px"><div><div class="section-title" style="font-size:14px">Calls</div><div id="callTbl"></div></div><div><div class="section-title" style="font-size:14px">Puts</div><div id="putTbl"></div></div></div>`;
-  loadChain();
+  const exps=e.expiries.slice(0,16);
+  const def=pickMonthlyExpiry(exps);
+  el.innerHTML=`<div class="section-title">期权墙 · 对股价的影响 <span class="tag">Max Pain / OI 墙 / GEX</span></div>
+    <div class="muted" style="font-size:13px;margin-bottom:12px">期权未平仓量(OI)与做市商 Gamma 敞口会牵引股价:Max Pain 是到期吸引位,大 Call OI=上方压力墙,大 Put OI=下方支撑墙,正 GEX 倾向钉价/抑波动、负 GEX 放大波动。</div>
+    <div class="cmpbar"><span class="muted">到期日</span><select id="wallExpiry" onchange="loadWalls()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px 10px;border-radius:8px">${exps.map(x=>`<option ${x===def?"selected":""}>${x}</option>`).join("")}</select>
+    <span class="muted">现价 <b>${fmtNum(e.spot)}</b></span></div>
+    <div id="wallSummary"></div>
+    <div class="two-col" style="margin-top:8px"><div><div class="section-title" style="font-size:14px">未平仓量 OI 分布(墙)</div><div id="oiChart" style="height:420px;border:1px solid var(--border);border-radius:10px"></div></div>
+    <div><div class="section-title" style="font-size:14px">Gamma 敞口 GEX 剖面</div><div id="gexChart" style="height:420px;border:1px solid var(--border);border-radius:10px"></div></div></div>
+    <div class="small" id="wallNote"></div>`;
+  loadWalls();
 }
-async function loadChain(){
-  const exp=document.getElementById("expirySel").value;
-  document.getElementById("callTbl").innerHTML='<div class="loading">加载…</div>';
-  const c=await j(`/api/options/chain?ticker=${encodeURIComponent(curTicker)}&expiry=${exp}`);
-  if(c.error){document.getElementById("callTbl").innerHTML='<div class="muted">'+c.error+'</div>';return;}
-  optChain=c;optSpot=c.spot;
-  document.getElementById("callTbl").innerHTML=optTable(c.calls,"call",exp);
-  document.getElementById("putTbl").innerHTML=optTable(c.puts,"put",exp);
+function pickMonthlyExpiry(exps){ // 选 ~2-5 周后的到期,信息量更足
+  const today=new Date();
+  for(const x of exps){const d=(new Date(x)-today)/864e5;if(d>=14&&d<=45)return x;}
+  return exps[Math.min(2,exps.length-1)];
 }
-function optTable(rows,type,exp){
-  return `<table class="legpick"><thead><tr><th>行权价</th><th>最新</th><th>买/卖</th><th>IV</th><th>OI</th></tr></thead><tbody>`+
-    rows.map(r=>`<tr onclick="addLeg('${type}',${r.strike},${r.last||r.ask||r.bid||0},'${exp}')" class="${r.itm?'':''}"><td class="${r.itm?'green':''}">${fmtNum(r.strike)}</td><td>${fmtNum(r.last)}</td><td class="muted">${fmtNum(r.bid)}/${fmtNum(r.ask)}</td><td class="muted">${r.iv!=null?(r.iv*100).toFixed(0)+"%":"—"}</td><td class="muted">${r.oi??"—"}</td></tr>`).join("")+`</tbody></table>`;
+async function loadWalls(){
+  const exp=document.getElementById("wallExpiry").value;
+  document.getElementById("wallSummary").innerHTML='<div class="loading">计算期权墙…</div>';
+  const d=await j(`/api/options/walls?ticker=${encodeURIComponent(curTicker)}&expiry=${exp}`);
+  if(d.error){document.getElementById("wallSummary").innerHTML='<div class="muted">'+d.error+'</div>';return;}
+  window._walls=d;
+  const gexPos=d.netGex>=0;
+  const gexLabel=gexPos?"正 GEX · 倾向钉价/抑制波动":"负 GEX · 放大波动/助涨助跌";
+  const pcBias=d.pcRatioOI==null?"":(d.pcRatioOI<0.7?"偏看涨":(d.pcRatioOI>1.0?"偏看跌":"中性"));
+  document.getElementById("wallSummary").innerHTML=`<div class="grid">
+    <div class="card"><div class="k">Max Pain 最大痛点</div><div class="v">$${fmtNum(d.maxPain)} <span class="${d.maxPainVsSpot>=0?'green':'red'}" style="font-size:13px">(${fmtPct(d.maxPainVsSpot)})</span></div></div>
+    <div class="card"><div class="k">净 Gamma 敞口</div><div class="v ${gexPos?'green':'red'}" style="font-size:15px">${gexLabel}</div></div>
+    ${card("Gamma Flip 翻转点",d.gammaFlip!=null?"$"+fmtNum(d.gammaFlip):"—")}
+    <div class="card"><div class="k">Put/Call 比率(OI)</div><div class="v">${d.pcRatioOI??"—"} <span class="muted" style="font-size:12px">${pcBias}</span></div></div>
+    ${card("Put/Call(成交量)",d.pcRatioVol??"—")}
+    ${card("到期天数",d.daysToExpiry+" 天")}
+  </div>`;
+  document.getElementById("wallNote").textContent=d.note;
+  drawOIChart(d);drawGexChart(d);
 }
-function addLeg(type,strike,prem,exp){legs.push({type,strike,prem:prem||0,dir:1,qty:1});renderLegs();drawPayoff();}
-function flipLeg(i){legs[i].dir*=-1;renderLegs();drawPayoff();}
-function delLeg(i){legs.splice(i,1);renderLegs();drawPayoff();}
-function renderLegs(){
-  document.getElementById("legbox").innerHTML=legs.length?legs.map((l,i)=>`<span class="leg-tag">${l.dir>0?'买':'卖'} ${l.type==='call'?'Call':'Put'} ${l.strike} @${fmtNum(l.prem)} <a onclick="flipLeg(${i})">⇄</a> <a onclick="delLeg(${i})" style="color:var(--red)">✕</a></span>`).join(""):'<span class="muted">未添加腿</span>';
-}
-function drawPayoff(){
-  const el=document.getElementById("payoff");if(!el)return;
-  if(!legs.length){echarts.getInstanceByDom(el)?.clear();return;}
-  const strikes=legs.map(l=>l.strike);const lo=Math.min(optSpot||strikes[0],...strikes)*0.7,hi=Math.max(optSpot||strikes[0],...strikes)*1.3;
-  const xs=[],ys=[];let netCost=0;legs.forEach(l=>netCost+=l.dir*l.prem*100);
-  for(let i=0;i<=120;i++){const S=lo+(hi-lo)*i/120;let pl=-netCost;legs.forEach(l=>{const intr=l.type==='call'?Math.max(S-l.strike,0):Math.max(l.strike-S,0);pl+=l.dir*intr*100;});xs.push(S.toFixed(1));ys.push(+pl.toFixed(1));}
-  const maxP=Math.max(...ys),minP=Math.min(...ys);
+function drawOIChart(d){
+  const el=document.getElementById("oiChart");if(!el)return;echarts.getInstanceByDom(el)?.dispose();
+  const ks=d.oiDist.map(x=>x.strike);
   const ch=echarts.init(el,'dark');
-  ch.setOption({backgroundColor:'#161b22',grid:{left:60,right:20,top:40,bottom:40},
-    title:{text:`到期盈亏  最大盈利 ${maxP>1e7?'∞':fmtNum(maxP,0)} / 最大亏损 ${fmtNum(minP,0)}`,textStyle:{fontSize:13,color:'#8b949e'}},
-    tooltip:{trigger:'axis',formatter:p=>`标的 ${p[0].axisValue}<br/>盈亏 ${fmtNum(p[0].data,0)}`},
-    xAxis:{type:'category',data:xs,axisLine:{lineStyle:{color:'#30363d'}},axisLabel:{color:'#8b949e'}},
-    yAxis:{type:'value',axisLine:{lineStyle:{color:'#30363d'}},splitLine:{lineStyle:{color:'#21262d'}},axisLabel:{color:'#8b949e'}},
-    series:[{type:'line',data:ys,showSymbol:false,lineStyle:{width:2,color:'#58a6ff'},
-      markLine:{symbol:'none',data:[{yAxis:0,lineStyle:{color:'#8b949e',type:'dashed'}},{xAxis:String((optSpot||0).toFixed(1)),lineStyle:{color:'#f6c343',type:'dotted'},label:{formatter:'现价',color:'#f6c343'}}]},
-      areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:'rgba(38,166,154,.3)'},{offset:1,color:'rgba(239,83,80,.3)'}])}}]});
+  ch.setOption({backgroundColor:'#161b22',grid:{left:55,right:20,top:30,bottom:30},
+    legend:{data:['Call OI','Put OI'],textStyle:{color:'#8b949e'},top:4},
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},
+    xAxis:{type:'value',axisLabel:{color:'#8b949e'},splitLine:{lineStyle:{color:'#21262d'}}},
+    yAxis:{type:'category',data:ks,axisLabel:{color:'#8b949e'},inverse:false},
+    series:[
+      {name:'Call OI',type:'bar',stack:'x',data:d.oiDist.map(x=>x.call),itemStyle:{color:'rgba(239,83,80,.75)'}},
+      {name:'Put OI',type:'bar',stack:'y',data:d.oiDist.map(x=>-x.put),itemStyle:{color:'rgba(38,166,154,.75)'},
+       markLine:{symbol:'none',silent:true,data:[
+         {yAxis:nearestIdx(ks,d.spot),lineStyle:{color:'#f6c343',type:'dashed'},label:{formatter:'现价',color:'#f6c343'}},
+         {yAxis:nearestIdx(ks,d.maxPain),lineStyle:{color:'#58a6ff',type:'dotted'},label:{formatter:'MaxPain',color:'#58a6ff'}}]}}
+    ]});
 }
+function drawGexChart(d){
+  const el=document.getElementById("gexChart");if(!el)return;echarts.getInstanceByDom(el)?.dispose();
+  const ks=d.gexDist.map(x=>x.strike);
+  const ch=echarts.init(el,'dark');
+  ch.setOption({backgroundColor:'#161b22',grid:{left:55,right:20,top:20,bottom:30},
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:p=>`行权价 ${p[0].axisValue}<br/>GEX ${(p[0].data/1e6).toFixed(1)}M`},
+    xAxis:{type:'value',axisLabel:{color:'#8b949e',formatter:v=>(v/1e6).toFixed(0)+'M'},splitLine:{lineStyle:{color:'#21262d'}}},
+    yAxis:{type:'category',data:ks,axisLabel:{color:'#8b949e'}},
+    series:[{type:'bar',data:d.gexDist.map(x=>x.gex),itemStyle:{color:p=>p.data>=0?'rgba(38,166,154,.8)':'rgba(239,83,80,.8)'},
+      markLine:{symbol:'none',silent:true,data:[{yAxis:nearestIdx(ks,d.spot),lineStyle:{color:'#f6c343',type:'dashed'},label:{formatter:'现价',color:'#f6c343'}}]}}]});
+}
+const nearestIdx=(arr,v)=>{if(v==null)return -1;let bi=0,bd=1e18;arr.forEach((x,i)=>{const dd=Math.abs(x-v);if(dd<bd){bd=dd;bi=i;}});return bi;};
 
 // ---------- 多股对比 ----------
 let cmpChart=null;
