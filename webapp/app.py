@@ -1290,6 +1290,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .small{font-size:11px;color:var(--muted);margin-top:6px}
   .two-col{display:grid;grid-template-columns:1fr 1fr;gap:24px}@media(max-width:880px){.two-col{grid-template-columns:1fr}}
   .disclaimer{color:var(--muted);font-size:11px;margin-top:36px;text-align:center}
+  #alertBanner:not(:empty){padding:8px 24px;background:rgba(239,83,80,.12);border-bottom:1px solid var(--red)}
+  #alertBanner .ab{color:var(--red);font-size:13px;font-weight:600;margin-right:14px}
   .hidden{display:none}
   /* 对比 */
   #cmpChart{width:100%;height:420px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
@@ -1335,6 +1337,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </header>
 
 <div class="watchstrip" id="watchstrip"><span class="lbl">自选股</span></div>
+<div id="alertBanner"></div>
 
 <main>
   <!-- 个股看板页 -->
@@ -1456,7 +1459,7 @@ async function loadTicker(t){
   if(q.error){document.getElementById("tabc-overview").innerHTML='<div class="error">'+q.error+'</div>';return;}
   window._curPrice=q.price;
   renderOverview(q);
-  loadChart(curPeriod);loadSepa();loadEarnings();loadLiquidity();loadNews();
+  loadChart(curPeriod);loadSepa();loadEarnings();loadLiquidity();loadNews();loadDecision();loadAlerts();
 }
 function card(k,v){return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;}
 
@@ -1470,6 +1473,7 @@ function renderOverview(q){
      <span class="star" id="starBtn" onclick="toggleWatch(curTicker)">${inWatch(q.ticker)?"★":"☆"}</span></div>
    <div class="price-row"><span class="price">${fmtNum(q.price)}</span><span class="chg ${cls}">${up?"▲":"▼"} ${fmtNum(q.change)} (${fmtPct(q.changePct)})</span></div>
    <div class="meta">${q.sector||""}${q.industry?" · "+q.industry:""} &nbsp;|&nbsp; 开 ${fmtNum(q.open)} · 高 ${fmtNum(q.dayHigh)} · 低 ${fmtNum(q.dayLow)} · 量 ${fmtBig(q.volume)}</div>
+   <div id="decisionCard" style="margin-bottom:16px"></div>
    <div class="controls">${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}<label style="margin-left:6px"><input type="checkbox" id="wallOverlay" onchange="toggleOptionWall(this.checked)"><span style="color:#f6c343">期权墙</span></label></span></div>
    <div id="chart"></div>
    <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy</span></div>
@@ -1485,6 +1489,7 @@ function renderOverview(q){
        <div class="section-title" style="margin-top:24px">流动性 <span class="tag">skill: stock-liquidity</span></div><div id="liquidity"><div class="loading">分析中…</div></div></div>
    </div>
    <div class="section-title">财报日 / 业绩 <span class="tag">skill: earnings-preview</span></div><div id="earnings"><div class="loading">加载中…</div></div>
+   <div class="section-title">价格 / 止损预警 <span class="tag">到价 · 跌破20MA · 止损</span></div><div id="alertsPanel"></div>
    <div class="section-title">重要消息 / 新闻</div><div id="news"><div class="loading">加载中…</div></div>`;
   initChart();
 }
@@ -1539,6 +1544,49 @@ async function loadSepa(){
     <span class="muted">基本面 <span class="gradechip ${gcls}">${g}</span></span>${s.epsGrowth!=null?`<span class="muted">季度EPS同比 ${fmtPct(s.epsGrowth*100)}</span>`:""}</div>
     <table><thead><tr><th>#</th><th>条件</th><th>结果</th><th>实际值</th></tr></thead><tbody>${rows}</tbody></table><div class="small">${s.rsNote}</div>`;
 }
+
+// ---------- 一键决策卡 ----------
+async function loadDecision(){
+  const el=document.getElementById("decisionCard");if(!el)return;
+  const tk=curTicker;
+  el.innerHTML='<div class="card"><div class="muted">综合决策分析中…</div></div>';
+  // 并行拉三块;期权墙需先取到期日
+  const wallsP=(async()=>{try{const e=await j("/api/options/expiries?ticker="+tk);if(e.error||!e.expiries||!e.expiries.length)return null;const exp=pickMonthlyExpiry(e.expiries.slice(0,16));return await j(`/api/options/walls?ticker=${tk}&expiry=${exp}`);}catch(_){return null;}})();
+  const [sepa,val,walls]=await Promise.all([j("/api/sepa?ticker="+tk).catch(()=>null),j("/api/valuation?ticker="+tk).catch(()=>null),wallsP]);
+  if(tk!==curTicker)return; // 期间切换了
+  let score=0;const reasons=[];
+  // SEPA
+  if(sepa&&!sepa.error){let sc=0;if(/Stage 2/.test(sepa.stage)&&sepa.passed>=7)sc=1;else if(/Stage 4/.test(sepa.stage)||sepa.passed<=3)sc=-1;score+=sc;
+    reasons.push({k:"SEPA 趋势",v:`${sepa.stage} · 模板 ${sepa.passed}/${sepa.total} · 基本面 ${sepa.fundamentalGrade}`,c:sc>0?"buy":(sc<0?"sell":"hold")});}
+  // 估值
+  if(val&&!val.error&&val.upside!=null){let vc=0;if(val.upside>=15)vc=1;else if(val.upside<=-15)vc=-1;score+=vc;
+    reasons.push({k:"估值",v:`${val.verdict} · 现价${fmtNum(val.price)}→合理${fmtNum(val.blended)} (${fmtPct(val.upside)})`,c:vc>0?"buy":(vc<0?"sell":"hold")});}
+  // 期权墙(轻权重:P/C 持仓偏向 + GEX 体制)
+  if(walls&&!walls.error){let oc=0;if(walls.pcRatioOI!=null){if(walls.pcRatioOI<0.7)oc=1;else if(walls.pcRatioOI>1.1)oc=-1;}score+=oc;
+    const mp=walls.maxPainVsSpot;const gex=walls.netGex>=0?"正GEX(抑波)":"负GEX(放大波动)";
+    reasons.push({k:"期权墙",v:`MaxPain ${fmtNum(walls.maxPain)}(${fmtPct(mp)}) · P/C ${walls.pcRatioOI??"—"} · ${gex}`,c:oc>0?"buy":(oc<0?"sell":"hold")});}
+  // 建议仓位(用已存设置)
+  const acct=parseFloat(getSetting("accountValue","100000"))||0;
+  const riskUnit=getSetting("riskUnit","%"),riskVal=parseFloat(getSetting("riskVal","1"))||1;
+  const posUnit=getSetting("posUnit","%"),posVal=parseFloat(getSetting("posVal","25"))||25;
+  let sizeNote="";
+  if(sepa&&sepa.price){const entry=sepa.price,stop=entry*0.92;const rps=entry-stop;
+    const riskD=riskUnit==="%"?acct*riskVal/100:riskVal,posD=posUnit==="%"?acct*posVal/100:posVal;
+    const shares=Math.max(0,Math.min(Math.floor(riskD/rps),Math.floor(posD/entry)));
+    sizeNote=`按你的设置(账户$${fmtBig(acct)}、风险${riskVal}${riskUnit}、仓位${posVal}${posUnit}、止损-8%)建议约 <b>${shares.toLocaleString()}</b> 股(投入$${fmtBig(shares*entry)})`;}
+  let verdict,vclass;
+  if(score>=2){verdict="倾向买入 · 多个信号共振";vclass="buy";}
+  else if(score<=-2){verdict="倾向回避 · 信号偏空";vclass="sell";}
+  else{verdict="观察 · 信号不一致或不足";vclass="hold";}
+  el.innerHTML=`<div class="card" style="border-left:4px solid ${vclass==='buy'?'var(--green)':vclass==='sell'?'var(--red)':'var(--yellow)'}">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+      <span style="font-size:13px;color:var(--muted)">一键决策</span>
+      <span class="badge ${vclass}" style="font-size:15px">${verdict}</span>
+      <span class="muted" style="font-size:12px">综合分 ${score>0?'+':''}${score}</span></div>
+    <div style="display:flex;gap:18px;flex-wrap:wrap">${reasons.map(r=>`<div style="font-size:13px"><span class="badge ${r.c}" style="font-size:11px">${r.k}</span> <span class="muted">${r.v}</span></div>`).join("")}</div>
+    ${sizeNote?`<div class="small" style="margin-top:8px">${sizeNote} · <a onclick="switchTab('position')">去仓位计算</a></div>`:""}
+    <div class="small">综合 SEPA/估值/期权墙的启发式打分,仅供参考,不构成投资建议。</div></div>`;
+}
 async function loadEarnings(){
   const el=document.getElementById("earnings");if(!el)return;
   const e=await j("/api/earnings?ticker="+encodeURIComponent(curTicker));
@@ -1564,6 +1612,36 @@ async function loadNews(){
   if(n.error||!n.news||!n.news.length){el.innerHTML='<div class="muted">暂无新闻</div>';return;}
   el.innerHTML=n.news.map(it=>`<div class="news-item"><div class="t">${it.link?`<a href="${it.link}" target="_blank" rel="noopener">${it.title}</a>`:it.title}</div><div class="m">${it.publisher||""}${it.time?" · "+it.time:""}</div></div>`).join("");
 }
+
+// ---------- 预警 ----------
+let allAlerts=[];
+async function loadAlerts(){
+  try{const d=await j("/api/alerts");allAlerts=d.alerts||[];}catch(e){allAlerts=[];}
+  renderAlertBanner();renderAlertsPanel();
+}
+function renderAlertBanner(){
+  const el=document.getElementById("alertBanner");if(!el)return;
+  const trig=allAlerts.filter(a=>a.triggered);
+  el.innerHTML=trig.length?trig.map(a=>`<span class="ab">⚠ ${a.ticker} ${alertText(a)} 已触发(现价 ${fmtNum(a.price)})</span>`).join(""):"";
+}
+function alertText(a){return a.kind==="above"?`≥ ${fmtNum(a.level)}`:a.kind==="below"?`≤ ${fmtNum(a.level)}`:a.kind==="stop"?`止损 ${fmtNum(a.level)}`:a.kind==="break_ma20"?"跌破20MA":a.kind;}
+function renderAlertsPanel(){
+  const el=document.getElementById("alertsPanel");if(!el)return;
+  const mine=allAlerts.filter(a=>a.ticker===curTicker);
+  const rows=mine.map(a=>`<span class="leg-tag">${alertText(a)} ${a.triggered?'<span class="red">●触发</span>':'<span class="muted">待触发</span>'} <a style="color:var(--red)" onclick="delAlert(${a.id})">✕</a></span>`).join("");
+  el.innerHTML=`<div class="cmpbar">
+    <select id="alKind" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px;border-radius:8px"><option value="above">价格 ≥</option><option value="below">价格 ≤</option><option value="stop">触及止损 ≤</option><option value="break_ma20">跌破20MA</option></select>
+    <input id="alLevel" type="number" placeholder="价格" style="width:100px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+    <button class="search" style="margin:0" onclick="addAlert()">为 ${curTicker} 添加预警</button>
+    <span style="margin-left:8px">${rows||'<span class="muted">该股暂无预警</span>'}</span></div>`;
+}
+async function addAlert(){
+  const kind=document.getElementById("alKind").value;const level=parseFloat(document.getElementById("alLevel").value);
+  if(kind!=="break_ma20"&&!level){alert("请输入价格");return;}
+  await fetch("/api/alerts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:curTicker,kind,level:level||null})});
+  loadAlerts();
+}
+async function delAlert(id){await fetch("/api/alerts?id="+id,{method:"DELETE"});loadAlerts();}
 
 // ---------- 仓位计算 ----------
 function loadPosition(){
@@ -1908,6 +1986,7 @@ function renderSectorTreemap(){
 // ---------- 启动 ----------
 document.getElementById("tickerInput").addEventListener("keydown",e=>{if(e.key==="Enter")loadTicker();});
 loadMarket();loadSettings();loadWatch();loadTicker("AAPL");
+setInterval(loadAlerts,60000);
 </script>
 </body>
 </html>"""
