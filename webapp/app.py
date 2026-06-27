@@ -932,10 +932,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #payoff{width:100%;height:360px;border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-top:12px}
   .leg-tag{display:inline-flex;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--border);padding:4px 10px;border-radius:8px;font-size:12px;margin:3px}
   /* 热力图 */
-  #treemap{width:100%;height:640px;border:1px solid var(--border);border-radius:10px}
+  #treemap,#sectreemap{width:100%;height:640px;border:1px solid var(--border);border-radius:10px}
   .sectorgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:12px}
   .stile{border-radius:10px;padding:14px;color:#fff;cursor:default}
   .stile .s1{font-size:13px;opacity:.9}.stile .s2{font-size:22px;font-weight:700;margin-top:4px}.stile .s3{font-size:11px;opacity:.8}
+  .pform{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;max-width:940px;margin-bottom:18px}
+  .pform label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}
+  .pform .row{display:flex;gap:6px}
+  .pform input,.pform select{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:9px 11px;border-radius:8px;font-size:14px;width:100%}
+  .pform select{width:auto;flex:0 0 auto}
+  .pform .hint{font-size:11px;color:var(--muted);margin-top:4px;min-height:14px}
+  .bindbox{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:8px 0 14px}
+  .shares-big{font-size:38px;font-weight:800}
   .subtabs{display:flex;gap:6px;margin:14px 0}
   .subtabs button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.subtabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 </style>
@@ -963,11 +971,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div id="page-stock">
     <div class="tabs">
       <button id="tab-overview" class="active" onclick="switchTab('overview')">概览</button>
+      <button id="tab-position" onclick="switchTab('position')">仓位计算</button>
       <button id="tab-valuation" onclick="switchTab('valuation')">估值</button>
       <button id="tab-options" onclick="switchTab('options')">期权</button>
       <button id="tab-compare" onclick="switchTab('compare')">多股对比</button>
     </div>
     <div id="tabc-overview"><div class="loading">加载中…</div></div>
+    <div id="tabc-position" class="hidden"></div>
     <div id="tabc-valuation" class="hidden"></div>
     <div id="tabc-options" class="hidden"></div>
     <div id="tabc-compare" class="hidden"></div>
@@ -1017,10 +1027,11 @@ function switchPage(p){
 }
 function switchTab(t){
   curTab=t;
-  ["overview","valuation","options","compare"].forEach(x=>{
+  ["overview","position","valuation","options","compare"].forEach(x=>{
     document.getElementById("tab-"+x).classList.toggle("active",x===t);
     document.getElementById("tabc-"+x).classList.toggle("hidden",x!==t);
   });
+  if(t==="position"&&loadedTabs.position!==curTicker)loadPosition();
   if(t==="valuation"&&loadedTabs.valuation!==curTicker)loadValuation();
   if(t==="options"&&loadedTabs.options!==curTicker)loadOptions();
   if(t==="compare"&&!loadedTabs.compare)loadCompare();
@@ -1063,6 +1074,7 @@ async function loadTicker(t){
   document.getElementById("tabc-overview").innerHTML='<div class="loading">加载 '+curTicker+' …</div>';
   const q=await j("/api/quote?ticker="+encodeURIComponent(curTicker));
   if(q.error){document.getElementById("tabc-overview").innerHTML='<div class="error">'+q.error+'</div>';return;}
+  window._curPrice=q.price;
   renderOverview(q);
   loadChart(curPeriod);loadSepa();loadEarnings();loadLiquidity();loadNews();
 }
@@ -1153,6 +1165,95 @@ async function loadNews(){
   const n=await j("/api/news?ticker="+encodeURIComponent(curTicker));
   if(n.error||!n.news||!n.news.length){el.innerHTML='<div class="muted">暂无新闻</div>';return;}
   el.innerHTML=n.news.map(it=>`<div class="news-item"><div class="t">${it.link?`<a href="${it.link}" target="_blank" rel="noopener">${it.title}</a>`:it.title}</div><div class="m">${it.publisher||""}${it.time?" · "+it.time:""}</div></div>`).join("");
+}
+
+// ---------- 仓位计算 ----------
+function loadPosition(){
+  loadedTabs.position=curTicker;
+  const el=document.getElementById("tabc-position");
+  const acct=localStorage.getItem("accountValue")||"100000";
+  const entry=window._curPrice?window._curPrice.toFixed(2):"";
+  const stop=window._curPrice?(window._curPrice*0.92).toFixed(2):"";  // 默认 -8%
+  const posUnit=localStorage.getItem("posUnit")||"%";
+  const riskUnit=localStorage.getItem("riskUnit")||"%";
+  const posVal=localStorage.getItem("posVal")||"25";
+  const riskVal=localStorage.getItem("riskVal")||"1";
+  const unitSel=(id,u)=>`<select id="${id}" onchange="calcPosition()"><option ${u==="%"?"selected":""}>%</option><option ${u==="$"?"selected":""}>$</option></select>`;
+  el.innerHTML=`
+   <div class="section-title">仓位计算器 <span class="tag">skill: sepa-strategy/position-sizing</span></div>
+   <div class="muted" style="font-size:13px;margin-bottom:14px">输入买入价、止损价、总资产,以及两个上限(总买入仓位 / 总风险),自动算出<b>同时满足全部条件</b>的最大可买股数。已带入 ${curTicker} 现价,可手动改。</div>
+   <div class="pform">
+     <div><label>总资产 ($)</label><div class="row"><input id="posAccount" type="number" value="${acct}" oninput="calcPosition()"></div><div class="hint">会自动记住</div></div>
+     <div><label>买入价 ($)</label><div class="row"><input id="posEntry" type="number" value="${entry}" oninput="calcPosition()"></div><div class="hint" id="hEntry"></div></div>
+     <div><label>止损价 ($)</label><div class="row"><input id="posStop" type="number" value="${stop}" oninput="calcPosition()"></div><div class="hint" id="hStop"></div></div>
+     <div><label>① 总买入仓位上限</label><div class="row"><input id="posMaxPos" type="number" value="${posVal}" oninput="calcPosition()">${unitSel("posMaxPosUnit",posUnit)}</div><div class="hint" id="hPos"></div></div>
+     <div><label>② 总风险上限(最多亏)</label><div class="row"><input id="posMaxRisk" type="number" value="${riskVal}" oninput="calcPosition()">${unitSel("posMaxRiskUnit",riskUnit)}</div><div class="hint" id="hRisk"></div></div>
+   </div>
+   <div id="posResult"></div>`;
+  calcPosition();
+}
+function calcPosition(){
+  const num=id=>parseFloat(document.getElementById(id).value);
+  const account=num("posAccount"),entry=num("posEntry"),stop=num("posStop");
+  const maxPosIn=num("posMaxPos"),maxRiskIn=num("posMaxRisk");
+  const posUnit=document.getElementById("posMaxPosUnit").value,riskUnit=document.getElementById("posMaxRiskUnit").value;
+  // 记忆
+  if(account>0)localStorage.setItem("accountValue",account);
+  localStorage.setItem("posUnit",posUnit);localStorage.setItem("riskUnit",riskUnit);
+  if(maxPosIn>=0)localStorage.setItem("posVal",maxPosIn);if(maxRiskIn>=0)localStorage.setItem("riskVal",maxRiskIn);
+
+  const res=document.getElementById("posResult");
+  const setHint=(id,t)=>{const e=document.getElementById(id);if(e)e.textContent=t;};
+  // 派生金额
+  const maxPosDollar=posUnit==="%"?(account*maxPosIn/100):maxPosIn;
+  const maxRiskDollar=riskUnit==="%"?(account*maxRiskIn/100):maxRiskIn;
+  setHint("hPos",isFinite(maxPosDollar)?"= $"+fmtBig(maxPosDollar)+(posUnit==="$"&&account>0?` · 占 ${(maxPosDollar/account*100).toFixed(1)}%`:""):"");
+  setHint("hRisk",isFinite(maxRiskDollar)?"= $"+fmtBig(maxRiskDollar)+(riskUnit==="$"&&account>0?` · 占 ${(maxRiskDollar/account*100).toFixed(2)}%`:""):"");
+  setHint("hEntry","");setHint("hStop", (entry>0&&stop>0)?`止损距离 ${((entry-stop)/entry*100).toFixed(2)}%`:"");
+
+  if(!(account>0&&entry>0&&stop>0&&maxPosIn>=0&&maxRiskIn>=0)){res.innerHTML='<div class="muted">请完整填写各项(均为正数)。</div>';return;}
+  if(stop>=entry){res.innerHTML='<div class="error">止损价必须低于买入价。</div>';return;}
+
+  const riskPerShare=entry-stop;
+  const sharesByRisk=Math.floor(maxRiskDollar/riskPerShare);
+  const sharesByPos=Math.floor(maxPosDollar/entry);
+  const shares=Math.max(0,Math.min(sharesByRisk,sharesByPos));
+  const binding=sharesByRisk<=sharesByPos?"风险上限":"仓位上限";
+  const bindClass=sharesByRisk<=sharesByPos?"sell":"hold";
+
+  const capital=shares*entry;
+  const riskDollar=shares*riskPerShare;
+  const t1=entry*1.08,t2=entry*1.15;          // SEPA: +8% 卖一半, +15% 再卖25%
+  const R=riskPerShare,rr1=(t1-entry)/R,rr2=(t2-entry)/R;
+
+  if(shares<=0){
+    res.innerHTML=`<div class="error">在当前条件下可买股数为 0 —— 风险上限或仓位上限太小,或止损距离太宽(每股风险 $${fmtNum(riskPerShare)})。</div>`;return;
+  }
+  res.innerHTML=`
+   <div class="bindbox">
+     <div><div class="muted" style="font-size:12px">建议最大买入</div><div class="shares-big">${shares.toLocaleString()} <span style="font-size:18px;font-weight:600">股</span></div></div>
+     <span class="badge ${bindClass}">受「${binding}」约束</span>
+   </div>
+   <div class="grid">
+     ${card("投入资金",`$${fmtBig(capital)}`)}
+     ${card("占总资产",`${(capital/account*100).toFixed(1)}%`)}
+     ${card("实际风险金额",`$${fmtBig(riskDollar)}`)}
+     ${card("占总资产(风险)",`${(riskDollar/account*100).toFixed(2)}%`)}
+     ${card("每股风险",`$${fmtNum(riskPerShare)}`)}
+     ${card("止损距离",`${((entry-stop)/entry*100).toFixed(2)}%`)}
+   </div>
+   <div class="section-title" style="font-size:14px">两个约束的候选股数(取较小值)</div>
+   <table style="max-width:560px"><thead><tr><th>约束</th><th>可买股数</th><th>对应金额</th><th></th></tr></thead><tbody>
+     <tr><td>① 按总仓位上限</td><td>${sharesByPos.toLocaleString()}</td><td class="muted">$${fmtBig(sharesByPos*entry)}</td><td>${binding==="仓位上限"?'<span class="pass">← 生效</span>':''}</td></tr>
+     <tr><td>② 按总风险上限</td><td>${sharesByRisk.toLocaleString()}</td><td class="muted">最多亏 $${fmtBig(sharesByRisk*riskPerShare)}</td><td>${binding==="风险上限"?'<span class="pass">← 生效</span>':''}</td></tr>
+   </tbody></table>
+   <div class="section-title" style="font-size:14px">盈亏目标参考(SEPA)</div>
+   <table style="max-width:620px"><thead><tr><th>价位</th><th>价格</th><th>距现</th><th>盈亏比 R/R</th><th>动作</th></tr></thead><tbody>
+     <tr><td>止损</td><td class="red">$${fmtNum(stop)}</td><td class="red">-${((entry-stop)/entry*100).toFixed(1)}%</td><td>-1R</td><td class="muted">触及立即离场</td></tr>
+     <tr><td>目标1</td><td class="green">$${fmtNum(t1)}</td><td class="green">+8%</td><td>${rr1.toFixed(2)}:1</td><td class="muted">卖一半,止损上移保本</td></tr>
+     <tr><td>目标2</td><td class="green">$${fmtNum(t2)}</td><td class="green">+15%</td><td>${rr2.toFixed(2)}:1</td><td class="muted">再卖25%,余下跟踪20MA</td></tr>
+   </tbody></table>
+   <div class="small">公式:股数 = min( 总风险额÷每股风险 , 总仓位额÷买入价 )。SEPA 建议单笔风险 0.5–2%、盈亏比≥2:1、止损 7–8% 内。本工具仅为计算,不构成投资建议。</div>`;
 }
 
 // ---------- 估值 ----------
@@ -1266,7 +1367,7 @@ const heatCorr=v=>{const x=Math.max(-1,Math.min(1,v));if(x>=0)return`rgba(38,166
 
 // ---------- 市场热力图 ----------
 let curHeat="stocks";
-function switchHeat(h){curHeat=h;document.getElementById("sub-stocks").classList.toggle("active",h==="stocks");document.getElementById("sub-sectors").classList.toggle("active",h==="sectors");document.getElementById("heat-stocks").classList.toggle("hidden",h!=="stocks");document.getElementById("heat-sectors").classList.toggle("hidden",h!=="sectors");if(h==="stocks"&&window._heatData)setTimeout(renderTreemap,50);}
+function switchHeat(h){curHeat=h;document.getElementById("sub-stocks").classList.toggle("active",h==="stocks");document.getElementById("sub-sectors").classList.toggle("active",h==="sectors");document.getElementById("heat-stocks").classList.toggle("hidden",h!=="stocks");document.getElementById("heat-sectors").classList.toggle("hidden",h!=="sectors");if(!window._heatData)return;if(h==="stocks")setTimeout(renderTreemap,50);else setTimeout(renderSectorTreemap,50);}
 async function loadHeatmap(force){
   window._heatLoaded=true;
   if(force)window._heatData=null;
@@ -1282,6 +1383,7 @@ async function loadHeatmap(force){
 function renderTreemap(){
   const d=window._heatData;if(!d)return;const el=document.getElementById("treemap");if(!el)return;
   const data=d.sectors.map(s=>({name:s.sector,value:s.size,children:s.stocks.map(st=>({name:st.ticker,value:st.size,change:st.change,itemStyle:{color:heatColor(st.change)}}))}));
+  echarts.getInstanceByDom(el)?.dispose();
   const ch=echarts.init(el,'dark');
   ch.setOption({backgroundColor:'#161b22',tooltip:{formatter:p=>{const c=p.data.change;return `<b>${p.name}</b>${c!=null?'<br/>涨跌 '+fmtPct(c)+'<br/>市值 ~$'+fmtNum(p.value,1)+'B':''}`;}},
     series:[{type:'treemap',roam:false,nodeClick:false,breadcrumb:{show:false},width:'100%',height:'100%',
@@ -1292,11 +1394,23 @@ function renderTreemap(){
 }
 function renderSectors(){
   const d=window._heatData;if(!d)return;
-  const tiles=d.sectorEtfs.map(s=>`<div class="stile" style="background:${heatColor(s.change)}"><div class="s1">${s.sector}</div><div class="s2">${fmtPct(s.change)}</div><div class="s3">${s.etf}</div></div>`).join("");
-  const secAgg=[...d.sectors].sort((a,b)=>b.change-a.change).map(s=>`<div class="stile" style="background:${heatColor(s.change)}"><div class="s1">${s.sector}</div><div class="s2">${fmtPct(s.change)}</div><div class="s3">市值加权 · ${s.stocks.length}只</div></div>`).join("");
-  document.getElementById("heat-sectors").innerHTML=`
-    <div class="section-title" style="font-size:14px">板块 ETF 当日表现(SPDR XL*)</div><div class="sectorgrid">${tiles}</div>
-    <div class="section-title" style="font-size:14px">板块市值加权涨跌(成分股聚合)</div><div class="sectorgrid">${secAgg}</div>`;
+  document.getElementById("heat-sectors").innerHTML='<div id="sectreemap"></div>';
+  renderSectorTreemap();
+}
+function renderSectorTreemap(){
+  const d=window._heatData;if(!d)return;const el=document.getElementById("sectreemap");if(!el)return;
+  const etfMap={};(d.sectorEtfs||[]).forEach(s=>etfMap[s.sector]={etf:s.etf,change:s.change});
+  const data=d.sectors.map(s=>({name:s.sector,value:s.size,change:s.change,n:s.stocks.length,
+    etf:(etfMap[s.sector]||{}).etf,etfChg:(etfMap[s.sector]||{}).change,itemStyle:{color:heatColor(s.change)}}));
+  echarts.getInstanceByDom(el)?.dispose();
+  const ch=echarts.init(el,'dark');
+  ch.setOption({backgroundColor:'#161b22',
+    tooltip:{formatter:p=>`<b>${p.name}</b><br/>市值加权 ${fmtPct(p.data.change)}<br/>总市值 ~$${fmtNum(p.value,0)}B · ${p.data.n}只`+(p.data.etf?`<br/>ETF ${p.data.etf} ${fmtPct(p.data.etfChg)}`:'')},
+    series:[{type:'treemap',roam:false,nodeClick:false,breadcrumb:{show:false},width:'100%',height:'100%',
+      itemStyle:{borderColor:'#0d1117',borderWidth:2,gapWidth:2},
+      label:{show:true,formatter:p=>p.data.change!=null?`${p.name}\n${(p.data.change>=0?'+':'')+p.data.change.toFixed(2)}%`:p.name,color:'#fff',fontSize:13,fontWeight:600},
+      data:data}]});
+  window.addEventListener("resize",()=>ch.resize());
 }
 
 // ---------- 启动 ----------
