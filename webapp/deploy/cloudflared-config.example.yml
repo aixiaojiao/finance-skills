@@ -1,0 +1,12 @@
+# Cloudflare Tunnel 配置样例。复制到 ~/.cloudflared/config.yml 并改成你的值。
+# TUNNEL_ID 与 credentials 文件由 `cloudflared tunnel create finance-dash` 生成。
+# 域名 dash.example.com 改成你自己的子域名。
+
+tunnel: <TUNNEL_ID>
+credentials-file: /home/ubuntu/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: dash.example.com
+    service: http://localhost:8000
+  # 兜底
+  - service: http_status:404

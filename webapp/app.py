@@ -1993,5 +1993,6 @@ setInterval(loadAlerts,60000);
 
 
 if __name__ == "__main__":
-    print("个股看板启动中 → http://localhost:8000")
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"个股看板启动中(开发服务器) → http://localhost:{port}")
+    app.run(host=os.environ.get("HOST", "0.0.0.0"), port=port, debug=False)

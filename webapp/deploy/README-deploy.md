@@ -1,0 +1,85 @@
+# 部署手册 — ECS + Cloudflare Tunnel + Access
+
+把个股决策仪表盘部署到 ECS(首尔),通过 Cloudflare 域名访问,并用 Cloudflare Access 做零信任登录。应用只监听本机回环,**不开放任何公网入站端口**,由 Cloudflare Tunnel 主动连出。
+
+## 架构
+
+```
+浏览器 → Cloudflare(TLS + Access 登录) → Tunnel → ECS 上 127.0.0.1:8000(gunicorn)
+```
+
+## 0. 前置验证(必做)
+
+ECS 上确认能访问 Yahoo Finance(首尔区域正常):
+```bash
+python3 -c "import yfinance as yf; print(yf.Ticker('AAPL').fast_info['lastPrice'])"
+```
+能在数秒内返回价格即可。
+
+## 1. 跑应用(两选一)
+
+仓库假设克隆在 `~/finance-skills`。
+
+### 方式 A:Docker(推荐)
+```bash
+cd ~/finance-skills/webapp
+docker build -t finance-dash .
+docker run -d --name finance-dash --restart unless-stopped \
+  -p 127.0.0.1:8000:8000 \
+  -v ~/finance-dash-data:/data \
+  finance-dash
+```
+- `-p 127.0.0.1:8000:8000` 只绑回环,公网无法直连。
+- 数据库持久化在 `~/finance-dash-data`。
+- 更新:`git pull && docker build -t finance-dash . && docker rm -f finance-dash && <上面的 run 命令>`。
+
+### 方式 B:systemd + gunicorn
+```bash
+cd ~/finance-skills/webapp
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+# 改 service 里的用户/路径(默认 /home/ubuntu/...)后:
+sudo cp deploy/finance-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now finance-dashboard
+systemctl status finance-dashboard      # 确认 running
+curl -s localhost:8000/api/market | head -c 100   # 自测
+```
+
+## 2. Cloudflare Tunnel
+
+前提:域名已托管在 Cloudflare(NS 已指向 Cloudflare)。
+
+```bash
+cloudflared tunnel login                       # 浏览器授权选择域名
+cloudflared tunnel create finance-dash         # 生成 TUNNEL_ID 和凭证 json
+cp ~/finance-skills/webapp/deploy/cloudflared-config.example.yml ~/.cloudflared/config.yml
+# 编辑 ~/.cloudflared/config.yml:填入 TUNNEL_ID、凭证路径、你的子域名(如 dash.你的域名)
+cloudflared tunnel route dns finance-dash dash.你的域名   # 自动建 CNAME
+sudo cloudflared service install               # 开机自启
+sudo systemctl status cloudflared
+```
+
+## 3. Cloudflare Access(零信任登录)
+
+Cloudflare 控制台 → **Zero Trust** → **Access** → **Applications** → Add an application → **Self-hosted**:
+- Application domain:`dash.你的域名`
+- Policy:Action = **Allow**,Include = **Emails** = 你的邮箱(或 Google 登录)。
+
+保存后,所有访问 `https://dash.你的域名` 都会先跳转 Cloudflare 登录(邮箱 OTP / Google),只有你能进。
+
+## 4. 验证
+
+```bash
+# 公网直连应用端口应失败(确认未裸露)
+curl --max-time 5 http://<ECS公网IP>:8000/    # 期望:超时/拒绝
+
+# 域名访问应先要求 Cloudflare 登录
+```
+浏览器打开 `https://dash.你的域名` → Cloudflare 登录 → 进入仪表盘,各功能正常。
+
+## 备注
+
+- **多 worker 缓存独立**:gunicorn 2 worker 各自有进程内缓存,数据稍有不同步可接受;要强一致可后续上 Redis。
+- **数据库**:SQLite(WAL)。Docker 用 `/data` 卷,systemd 用 `webapp/data/`。定期备份该文件即可保住持仓/自选/预警。
+- **安全**:不在应用层存敏感凭证;鉴权交给 Cloudflare Access;ECS 安全组无需为本应用开 80/443。
+- **ECS 安全组**:Tunnel 只需出站 443,通常默认放行;无需额外入站规则。

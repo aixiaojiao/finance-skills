@@ -1,0 +1,21 @@
+# systemd 单元(非 Docker 路径):用 gunicorn 跑应用,只监听本机回环。
+# 安装:
+#   sudo cp webapp/deploy/finance-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now finance-dashboard
+# 改路径/用户后再启用。假设仓库在 /home/ubuntu/finance-skills。
+
+[Unit]
+Description=Finance Dashboard (gunicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/finance-skills/webapp
+Environment=DASHBOARD_DB=/home/ubuntu/finance-skills/webapp/data/dashboard.db
+ExecStart=/home/ubuntu/finance-skills/webapp/.venv/bin/gunicorn -w 2 -b 127.0.0.1:8000 --timeout 120 wsgi:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
