@@ -1,5 +1,10 @@
 # Finance Skills
 
+> [!NOTE]
+> This is a personal fork maintained by [@aixiaojiao](https://github.com/aixiaojiao).
+> **Upstream / 源项目:** [himself65/finance-skills](https://github.com/himself65/finance-skills) — all original credit goes to the upstream authors.
+> This fork adds a local stock dashboard web app (see [`webapp/`](webapp/)) and is deployed for personal use.
+
 > [!WARNING]
 > This project is for educational and informational purposes only. Nothing here constitutes financial advice. Always do your own research and consult a qualified financial advisor before making investment decisions.
 

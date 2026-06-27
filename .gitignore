@@ -3,3 +3,10 @@
 *.swo
 *~
 node_modules/
+
+# webapp (本地个股看板)
+webapp/.venv/
+webapp/__pycache__/
+webapp/*.log
+__pycache__/
+*.pyc
