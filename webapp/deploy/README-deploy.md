@@ -5,8 +5,55 @@
 ## 架构
 
 ```
-浏览器 → Cloudflare(TLS + Access 登录) → Tunnel → ECS 上 127.0.0.1:8000(gunicorn)
+浏览器 → Cloudflare(TLS + Access 登录) → Tunnel → ECS 上 127.0.0.1:8000(Docker/gunicorn)
 ```
+
+---
+
+## ✅ 当前进度(首尔 ECS 上已为你完成)
+
+- 已 `git clone` fork 到 `~/finance-skills`
+- 已 **Docker 构建并运行**容器 `finance-dash`(`--restart unless-stopped`,开机自启)
+- 端口**只绑 `127.0.0.1:8000`**,公网无法直连(已用 `ss` 验证仅 loopback)
+- yfinance 在服务器实测正常,数据库挂载在 `~/finance-dash-data`
+- `cloudflared` 已安装
+
+所以下面的「第 1 步:跑应用」**已经做完**,你回来后从「第 2 步 Cloudflare Tunnel」开始即可。
+
+## 🚀 你回来后只需做这几步(Cloudflare,约 10 分钟)
+
+你的域名已托管在 Cloudflare、只差一个子域名(Tunnel 会自动建 DNS,无需手动加子域名记录)。SSH 登到服务器后:
+
+```bash
+# 1) 浏览器授权(会打印一个 URL,在你电脑浏览器打开、选择你的域名)
+cloudflared tunnel login
+
+# 2) 建隧道(记下打印出的 TUNNEL_ID)
+cloudflared tunnel create finance-dash
+
+# 3) 写配置:把样例复制过去,填 TUNNEL_ID / 凭证路径 / 你的子域名
+cp ~/finance-skills/webapp/deploy/cloudflared-config.example.yml ~/.cloudflared/config.yml
+nano ~/.cloudflared/config.yml      # 改 hostname 为 dash.你的域名
+
+# 4) 自动建 DNS 路由(这一步会在 Cloudflare 自动创建 dash 子域名的 CNAME)
+cloudflared tunnel route dns finance-dash dash.你的域名
+
+# 5) 装成系统服务、开机自启
+sudo cloudflared service install
+sudo systemctl status cloudflared
+```
+
+然后做 **Cloudflare Access**(见下面第 3 节)限定只有你能登录,完成。
+
+如果服务器上的应用要更新到最新代码:
+```bash
+cd ~/finance-skills && git pull
+cd webapp && docker build -t finance-dash . && docker rm -f finance-dash && \
+docker run -d --name finance-dash --restart unless-stopped -p 127.0.0.1:8000:8000 -v ~/finance-dash-data:/data finance-dash
+```
+备份数据(持仓/自选/预警):直接拷 `~/finance-dash-data/dashboard.db`。
+
+---
 
 ## 0. 前置验证(必做)
 

@@ -1,38 +1,49 @@
 # 个股看板 · Stock Dashboard
 
-一个单文件 Flask + yfinance 的美股看板,双页面 SPA。前端用 [TradingView lightweight-charts](https://github.com/tradingview/lightweight-charts) 画 K 线、[ECharts](https://echarts.apache.org/) 画热力图与期权收益曲线,暗色主题。
+一个 Flask + yfinance 的个人炒股决策仪表盘,三页面 SPA。前端用 [TradingView lightweight-charts](https://github.com/tradingview/lightweight-charts) 画 K 线、[ECharts](https://echarts.apache.org/) 画热力图/期权墙/GEX,暗色主题。持仓/自选/预警/设置存在服务端 **SQLite**。
 
 ## 页面1 · 个股看板
 
-四个子标签 + 顶部自选股条(localStorage 持久化,点 ☆ 加自选):
+五个子标签 + 顶部自选股条(后端持久化,点 ☆ 加自选)+ 触发预警 banner:
 
 **概览**
-- **K线 + MA5/10/20/50/200** 叠加(可勾选开关)+ 成交量
-- **SEPA 趋势模板**评分卡:Minervini 8 条件 + 四阶段判定 + 基本面评级 + 综合结论 — `sepa-strategy`
+- 顶部 **一键决策卡**:聚合 SEPA + 估值 + 期权墙 → 买入/观察/回避 + 建议仓位
+- **K线 + MA5/10/20/50/200** 叠加 + 成交量 +(可选)**期权墙位叠加**(Max Pain / 压力墙 / 支撑墙 / Gamma Flip)
+- **SEPA 趋势模板**评分卡:8 条件 + 四阶段 + 基本面评级 + 结论 — `sepa-strategy`
 - **财报日 / 业绩**:下次财报日、预期 EPS、历史 beat/miss — `earnings-preview`
-- **重要消息 / 新闻流**(yfinance news)
-- **流动性评分**:日均成交量、美元成交额、买卖价差、换手率 — `stock-liquidity`
-- 关键财务指标 + 分析师评级 / 目标价
+- **流动性评分** — `stock-liquidity`、关键财务、分析师评级、新闻流
+- **价格 / 止损预警**:到价、跌破 20MA、触及止损(后端实时评估,触发上 banner)
+
+**仓位计算** — `sepa-strategy/position-sizing`
+- 输入买入价/止损价/总资产 + 总仓位上限 + 总风险上限(% 或 $),算同时满足全部条件的最大股数;一键「记入持仓」
 
 **估值** — `company-valuation` + `estimate-analysis`
-- DCF 内在价值(简化 5 年 FCFF + WACC + 永续)+ 分析师目标 + 远期PE,三角定位出合理价与上下空间,判定低估/合理/高估
-- 分析师预期表(各周期均值/区间/增速)+ EPS 预期修正方向(当前 vs 90天前)
+- DCF + 分析师目标 + 远期PE 三角定位合理价与上下空间;分析师预期表 + EPS 预期修正方向
 
-**期权** — `options-payoff`
-- 期权链(按到期日,ATM 上下各 12 档,含 IV / OI)
-- 点击 Call/Put 加为「腿」,实时绘制**到期收益曲线**(支持多腿组合、买卖翻转),标注最大盈亏/现价
+**期权墙** — Max Pain / OI 墙 / GEX(对股价的影响,非交易期权)
+- Max Pain 最大痛点、Call/Put OI 支撑压力墙、**净 GEX + Gamma Flip 翻转点**、Put/Call 比率
+- OI 分布柱状图 + GEX 剖面图;关键墙位可叠加到概览 K 线
 
 **多股对比** — `stock-correlation`
-- 多股归一化走势叠加(rebase 100)+ 区间涨幅 / 年化波动 / Beta + **相关性矩阵热力**
+- 归一化走势叠加 + 区间涨幅 / 年化波动 / Beta + **相关性矩阵热力**
 
-## 页面2 · 市场热力图(与个股看板平行的独立页签)
+## 页面2 · 持仓(SQLite 持久化)
 
-- **个股热力图**:近百只标普大盘股按板块分组的树状图(treemap),面积≈市值,颜色=当日涨跌幅(finviz 风格)
-- **板块热力图**:11 个 SPDR 板块 ETF(XL*)当日表现 + 板块市值加权聚合
+- 持仓表:实时浮盈亏、距止损、R 倍数;汇总:总市值/浮盈亏、仓位占比、**组合风险敞口(热度)**
+- 手动添加 / 平仓 / 删除;已平仓沉淀为交易记录
 
-顶部常驻**大盘条**:标普500 / 纳指 / VIX + 市场环境(Bull/Choppy/Bear)+ 情绪指标 — `sepa-strategy/market-environment`
+## 页面3 · 市场热力图(独立页签)
 
-> 说明:SEPA 的 RS 用「12个月相对 S&P500 涨幅」做代理;大盘情绪为 VIX/指数趋势/RSI 合成代理(非 CNN 官方指数);热力图面积优先取市值、缺失时回退成交额;DCF 为简化模型,金融/REIT/亏损公司自动回退到分析师目标+远期PE。
+- **个股热力图**:近百只标普大盘股按板块分组 treemap,面积≈市值,颜色=当日涨跌
+- **板块热力图**:11 板块 treemap(同风格,面积=板块市值,色=市值加权涨跌),ETF 数据在悬浮提示
+
+顶部常驻**大盘条**:标普500 / 纳指 / VIX + 市场环境(Bull/Choppy/Bear)+ 情绪 — `sepa-strategy/market-environment`
+
+> 说明:SEPA 的 RS、大盘情绪、GEX/Gamma Flip、热力图面积均为代理/估算;DCF 为简化模型,金融/REIT/亏损公司自动回退到分析师目标+远期PE。
+
+## 部署
+
+生产部署到服务器 + Cloudflare 域名(Tunnel + Access 零信任):见 **[`deploy/README-deploy.md`](deploy/README-deploy.md)**。本地用浏览器 localStorage 之外的数据均存服务端 SQLite(`DASHBOARD_DB`,默认 `webapp/data/dashboard.db`)。
 
 ## 来源 / Attribution
 
