@@ -13,7 +13,7 @@ Wants=network-online.target
 User=ubuntu
 WorkingDirectory=/home/ubuntu/finance-skills/webapp
 Environment=DASHBOARD_DB=/home/ubuntu/finance-skills/webapp/data/dashboard.db
-ExecStart=/home/ubuntu/finance-skills/webapp/.venv/bin/gunicorn -w 2 -b 127.0.0.1:8000 --timeout 120 wsgi:app
+ExecStart=/home/ubuntu/finance-skills/webapp/.venv/bin/gunicorn -w 1 --threads 8 -k gthread -b 127.0.0.1:8000 --timeout 120 wsgi:app
 Restart=always
 RestartSec=5
 

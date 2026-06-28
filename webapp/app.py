@@ -121,7 +121,18 @@ def _num(v):
 
 _CACHE = {}
 
-def cached(ttl):
+def _is_empty(v):
+    if v is None:
+        return True
+    if isinstance(v, (pd.DataFrame, pd.Series)):
+        return v.empty
+    if isinstance(v, (list, tuple, dict, str)):
+        return len(v) == 0
+    return False
+
+def cached(ttl, keep_empty=True):
+    """内存 TTL 缓存。keep_empty=False 时不缓存空/失败结果(避免把限流返回的空值缓存住),
+    且本次取到空时回退到上一次的有效缓存(过期也好过空)。"""
     def deco(fn):
         def wrap(*args):
             key = (fn.__name__, args)
@@ -130,8 +141,10 @@ def cached(ttl):
             if hit and now - hit[0] < ttl:
                 return hit[1]
             val = fn(*args)
-            _CACHE[key] = (now, val)
-            return val
+            if keep_empty or not _is_empty(val):
+                _CACHE[key] = (now, val)
+                return val
+            return hit[1] if hit else val
         return wrap
     return deco
 
@@ -143,15 +156,85 @@ def rsi(series, period=14):
     return 100 - 100 / (1 + gain / loss)
 
 
-@cached(90)
+@cached(90, keep_empty=False)
 def get_info(ticker):
     return yf.Ticker(ticker).info or {}
 
 
-@cached(120)
+@cached(120, keep_empty=False)
 def get_history_df(ticker, period, interval="1d"):
-    df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
-    return df if df is not None else pd.DataFrame()
+    # 只缓存非空结果(见 cached keep_empty=False);限流/失败时退避重试一次
+    for attempt in range(2):
+        try:
+            df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+        except Exception:
+            df = None
+        if df is not None and not df.empty:
+            return df
+        if attempt == 0:
+            time.sleep(0.5)  # 多数 429 是瞬时的
+    return pd.DataFrame()  # 仍为空:decorator 不缓存、自动回退上次有效缓存
+
+
+# ---- 以下接口此前每次请求都现拉 yfinance,统一加缓存(keep_empty=False:不缓存失败值) ----
+@cached(900, keep_empty=False)
+def get_earnings_dates(ticker):
+    try:
+        ed = yf.Ticker(ticker).get_earnings_dates(limit=16)
+    except Exception:
+        return None
+    return ed if (ed is not None and not ed.empty) else None
+
+@cached(900, keep_empty=False)
+def get_calendar(ticker):
+    try:
+        return yf.Ticker(ticker).calendar or {}
+    except Exception:
+        return {}
+
+@cached(600, keep_empty=False)
+def get_news_raw(ticker):
+    try:
+        return yf.Ticker(ticker).news or []
+    except Exception:
+        return []
+
+@cached(900, keep_empty=False)
+def get_option_expiries(ticker):
+    try:
+        return list(yf.Ticker(ticker).options or [])
+    except Exception:
+        return []
+
+@cached(300, keep_empty=False)
+def get_option_chain(ticker, expiry):
+    # 返回 yfinance 的 Options(namedtuple,含 calls/puts DataFrame);失败抛出由调用方兜底
+    return yf.Ticker(ticker).option_chain(expiry)
+
+@cached(60, keep_empty=False)
+def get_quotes_download(tickers_key):
+    # tickers_key:逗号拼接的有序代码串,保证缓存键稳定
+    tickers = tickers_key.split(",")
+    return yf.download(tickers, period="5d", auto_adjust=False, progress=False, group_by="ticker")
+
+@cached(1800, keep_empty=False)
+def get_financials(ticker):
+    # 财报报表(利润表/现金流/营收预期),用于 DCF;最重的调用,缓存 30 分钟
+    tk = yf.Ticker(ticker)
+    try:
+        inc = tk.income_stmt
+    except Exception:
+        inc = None
+    if inc is None or inc.empty:
+        return {}  # 空不缓存,下次重试
+    out = {"inc": inc}
+    for k, getter in (("cf", lambda: tk.cashflow), ("rev_est", lambda: tk.revenue_estimate),
+                      ("earn_est", lambda: tk.earnings_estimate), ("eps_trend", lambda: tk.eps_trend)):
+        try:
+            out[k] = getter()
+        except Exception:
+            out[k] = None
+    return out
 
 
 # ============================ API: 报价 + 基本面 ============================
@@ -246,15 +329,16 @@ def api_history():
 # ============================ API: SEPA ============================
 
 @cached(300)
-def _spy_return_252():
-    try:
-        df = get_history_df("^GSPC", "2y")
-        if df is None or df.empty or len(df) < 252:
-            return None
-        c = df["Close"].dropna()
-        return c.iloc[-1] / c.iloc[-252] - 1
-    except Exception:
-        return None
+def _benchmark_close():
+    # 标普500 收盘序列,^GSPC 取不到时回退到 SPY ETF(更不易被限流)
+    for sym in ("^GSPC", "SPY"):
+        try:
+            df = get_history_df(sym, "2y")
+            if df is not None and not df.empty and len(df) >= 60:
+                return df["Close"].dropna()
+        except Exception:
+            continue
+    return None
 
 
 @app.route("/api/sepa")
@@ -280,13 +364,27 @@ def api_sepa():
     hi52 = _num(df["High"].tail(win).max())
     lo52 = _num(df["Low"].tail(win).min())
 
+    # 相对强度:基准与个股取同一回看窗口(优先 252 日,不足则用可用最长窗口,≥60 日才有意义)
     rs_pass = rs_val = None
-    if len(df) >= 252:
-        stock_ret = price / _num(close.iloc[-252]) - 1
-        spy_ret = _spy_return_252()
-        if spy_ret is not None:
-            rs_val = (stock_ret - spy_ret) * 100
-            rs_pass = stock_ret > spy_ret
+    rs_lookback = None
+    bench = _benchmark_close()
+    if bench is None:
+        rs_value_str = "基准(标普500)暂不可用,稍后重试"
+    else:
+        lookback = min(len(close), len(bench), 252)
+        if lookback < 60:
+            rs_value_str = f"历史仅 {len(close)} 日(上市未满3个月),暂不算 RS"
+        else:
+            rs_lookback = lookback
+            stock_ret = price / _num(close.iloc[-lookback]) - 1
+            bench_ret = _num(bench.iloc[-1]) / _num(bench.iloc[-lookback]) - 1
+            if stock_ret is not None and bench_ret is not None:
+                rs_val = (stock_ret - bench_ret) * 100
+                rs_pass = stock_ret > bench_ret
+                wlabel = "1年" if lookback >= 252 else f"{lookback}日"
+                rs_value_str = f"相对标普 {rs_val:+.1f}pp({wlabel})"
+            else:
+                rs_value_str = "数据不足"
 
     def pct(a, b):
         return None if (a is None or b is None or b == 0) else (a / b - 1) * 100
@@ -311,8 +409,7 @@ def api_sepa():
          f"+{pct_above_low:.1f}%" if pct_above_low is not None else "—")
     cond(7, "距 52周高点 ≤ 25%", (pct_from_high is not None and pct_from_high >= -25),
          f"{pct_from_high:.1f}%" if pct_from_high is not None else "—")
-    cond(8, "相对强度 RS 跑赢大盘(代理)", rs_pass,
-         f"相对 S&P500 {rs_val:+.1f}pp" if rs_val is not None else "数据不足")
+    cond(8, "相对强度 RS 跑赢大盘(代理)", rs_pass, rs_value_str)
 
     passed = sum(1 for c in conds if c["pass"] is True)
 
@@ -344,7 +441,7 @@ def api_sepa():
                     "passed": passed, "total": 8, "fundamentalGrade": fgrade,
                     "epsGrowth": eps_growth, "revGrowth": _num(info.get("revenueGrowth")),
                     "verdict": verdict, "verdictClass": vclass,
-                    "rsNote": "RS 为相对 S&P500 涨幅代理,非全市场百分位排名"})
+                    "rsNote": f"RS 为相对标普500 涨幅代理({('回看'+str(rs_lookback)+'日') if rs_lookback else '窗口自适应'}),非全市场百分位排名"})
 
 
 # ============================ API: 财报 ============================
@@ -354,12 +451,8 @@ def api_earnings():
     ticker = (request.args.get("ticker") or "").strip().upper()
     if not ticker:
         return jsonify({"error": "缺少 ticker 参数"}), 400
-    t = yf.Ticker(ticker)
     upcoming, history = None, []
-    try:
-        ed = t.get_earnings_dates(limit=16)
-    except Exception:
-        ed = None
+    ed = get_earnings_dates(ticker)
     if ed is not None and not ed.empty:
         cols = {c.lower(): c for c in ed.columns}
         est_col = next((cols[k] for k in cols if "estimate" in k), None)
@@ -378,7 +471,7 @@ def api_earnings():
         history = history[:6]
     if upcoming is None:
         try:
-            cal = t.calendar
+            cal = get_calendar(ticker)
             if isinstance(cal, dict) and cal.get("Earnings Date"):
                 ds = cal["Earnings Date"]
                 d0 = ds[0] if isinstance(ds, (list, tuple)) else ds
@@ -401,10 +494,7 @@ def api_news():
     ticker = (request.args.get("ticker") or "").strip().upper()
     if not ticker:
         return jsonify({"error": "缺少 ticker 参数"}), 400
-    try:
-        raw = yf.Ticker(ticker).news or []
-    except Exception:
-        raw = []
+    raw = get_news_raw(ticker)
     items = []
     for it in raw[:12]:
         c = it.get("content") if isinstance(it, dict) and "content" in it else it
@@ -528,7 +618,7 @@ def api_quotes():
         return jsonify({"quotes": []})
     out = []
     try:
-        data = yf.download(tickers, period="5d", auto_adjust=False, progress=False, group_by="ticker")
+        data = get_quotes_download(",".join(sorted(set(tickers))))
     except Exception:
         data = None
     for t in tickers:
@@ -599,10 +689,11 @@ def api_compare():
 
 # ============================ API: 估值(company-valuation + estimate-analysis) ============================
 
-def _compute_dcf(t, info):
+def _compute_dcf(ticker, info):
     try:
-        inc = t.income_stmt
-        cf = t.cashflow
+        fin = get_financials(ticker)
+        inc = fin.get("inc")
+        cf = fin.get("cf")
         if inc is None or inc.empty or "Total Revenue" not in inc.index:
             return None
         rev_row = inc.loc["Total Revenue"].dropna().astype(float)
@@ -612,7 +703,7 @@ def _compute_dcf(t, info):
         hist_cagr = (rev.iloc[-1] / rev.iloc[0]) ** (1 / (len(rev) - 1)) - 1
         y1 = hist_cagr
         try:
-            re = t.revenue_estimate
+            re = fin.get("rev_est")
             if re is not None and "+1y" in re.index:
                 g = _num(re.loc["+1y", "growth"])
                 if g is not None:
@@ -685,14 +776,13 @@ def api_valuation():
     ticker = (request.args.get("ticker") or "").strip().upper()
     if not ticker:
         return jsonify({"error": "缺少 ticker 参数"}), 400
-    t = yf.Ticker(ticker)
     try:
         info = get_info(ticker)
     except Exception as e:
         return jsonify({"error": f"获取失败: {e}"}), 502
     price = _num(info.get("currentPrice") or info.get("regularMarketPrice"))
 
-    dcf = _compute_dcf(t, info)
+    dcf = _compute_dcf(ticker, info)
 
     # 相对估值锚:forwardPE × forwardEPS(若有)
     rel = None
@@ -726,7 +816,7 @@ def api_valuation():
     estimates = []
     revisions = []
     try:
-        ee = t.earnings_estimate
+        ee = get_financials(ticker).get("earn_est")
         if ee is not None and not ee.empty:
             label = {"0q": "本季", "+1q": "下季", "0y": "本年", "+1y": "明年"}
             for p in ee.index:
@@ -737,7 +827,7 @@ def api_valuation():
     except Exception:
         pass
     try:
-        et = t.eps_trend
+        et = get_financials(ticker).get("eps_trend")
         if et is not None and not et.empty:
             label = {"0q": "本季", "+1q": "下季", "0y": "本年", "+1y": "明年"}
             for p in et.index:
@@ -771,10 +861,9 @@ def api_option_expiries():
     ticker = (request.args.get("ticker") or "").strip().upper()
     if not ticker:
         return jsonify({"error": "缺少 ticker 参数"}), 400
-    try:
-        exps = list(yf.Ticker(ticker).options or [])
-    except Exception as e:
-        return jsonify({"error": f"获取失败: {e}"}), 502
+    exps = get_option_expiries(ticker)
+    if not exps:
+        return jsonify({"ticker": ticker, "expiries": [], "spot": _num(get_info(ticker).get("currentPrice"))})
     price = _num(get_info(ticker).get("currentPrice") or get_info(ticker).get("regularMarketPrice"))
     return jsonify({"ticker": ticker, "expiries": exps, "spot": price})
 
@@ -786,7 +875,7 @@ def api_option_chain():
     if not ticker or not expiry:
         return jsonify({"error": "缺少 ticker 或 expiry"}), 400
     try:
-        oc = yf.Ticker(ticker).option_chain(expiry)
+        oc = get_option_chain(ticker, expiry)
     except Exception as e:
         return jsonify({"error": f"获取期权链失败: {e}"}), 502
     spot = _num(get_info(ticker).get("currentPrice") or get_info(ticker).get("regularMarketPrice"))
@@ -841,7 +930,7 @@ def api_option_walls():
     if not ticker or not expiry:
         return jsonify({"error": "缺少 ticker 或 expiry"}), 400
     try:
-        oc = yf.Ticker(ticker).option_chain(expiry)
+        oc = get_option_chain(ticker, expiry)
     except Exception as e:
         return jsonify({"error": f"获取期权链失败: {e}"}), 502
     spot = _num(get_info(ticker).get("currentPrice") or get_info(ticker).get("regularMarketPrice"))
@@ -1263,7 +1352,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .watchstrip .lbl{color:var(--muted);font-size:12px;white-space:nowrap}
   .wchip{display:flex;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--border);padding:5px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px}
   .wchip .x{color:var(--muted);font-size:11px;padding-left:2px}.wchip .x:hover{color:var(--red)}
-  main{padding:20px 24px;max-width:1340px;margin:0 auto}
+  main{padding:20px 24px;max-width:1520px;margin:0 auto}
   .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:18px;flex-wrap:wrap}
   .tabs button{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--muted);padding:10px 16px;cursor:pointer;font-size:14px}
   .tabs button.active{color:var(--text);border-bottom-color:var(--accent)}
@@ -1315,6 +1404,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .pform .hint{font-size:11px;color:var(--muted);margin-top:4px;min-height:14px}
   .bindbox{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:8px 0 14px}
   .shares-big{font-size:38px;font-weight:800}
+  .ov-grid{display:flex;gap:22px;align-items:flex-start}
+  .ov-main{flex:1 1 auto;min-width:0}
+  .ov-side{flex:0 0 360px}
+  .sizer-panel{position:sticky;top:16px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px}
+  .sizer-panel .pform{grid-template-columns:1fr 1fr;max-width:none;gap:10px;margin-bottom:12px}
+  .sizer-panel .pform>div:first-child{grid-column:1/-1}
+  .sizer-panel .grid{grid-template-columns:1fr 1fr;gap:8px}
+  .sizer-panel table{font-size:11px;max-width:100%!important}
+  .sizer-panel .shares-big{font-size:30px}
+  @media(max-width:1080px){.ov-grid{flex-direction:column}.ov-side{flex-basis:auto;width:100%}.sizer-panel{position:static}.sizer-panel .pform{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}}
+  .ma-stops{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:6px}
+  .ma-pill{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:6px;cursor:pointer;font-size:11px}
+  .ma-pill:hover{border-color:var(--accent);color:var(--accent)}
   .subtabs{display:flex;gap:6px;margin:14px 0}
   .subtabs button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.subtabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 </style>
@@ -1344,13 +1446,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div id="page-stock">
     <div class="tabs">
       <button id="tab-overview" class="active" onclick="switchTab('overview')">概览</button>
-      <button id="tab-position" onclick="switchTab('position')">仓位计算</button>
       <button id="tab-valuation" onclick="switchTab('valuation')">估值</button>
       <button id="tab-options" onclick="switchTab('options')">期权墙</button>
       <button id="tab-compare" onclick="switchTab('compare')">多股对比</button>
     </div>
     <div id="tabc-overview"><div class="loading">加载中…</div></div>
-    <div id="tabc-position" class="hidden"></div>
     <div id="tabc-valuation" class="hidden"></div>
     <div id="tabc-options" class="hidden"></div>
     <div id="tabc-compare" class="hidden"></div>
@@ -1404,11 +1504,10 @@ function switchPage(p){
 }
 function switchTab(t){
   curTab=t;
-  ["overview","position","valuation","options","compare"].forEach(x=>{
+  ["overview","valuation","options","compare"].forEach(x=>{
     document.getElementById("tab-"+x).classList.toggle("active",x===t);
     document.getElementById("tabc-"+x).classList.toggle("hidden",x!==t);
   });
-  if(t==="position"&&loadedTabs.position!==curTicker)loadPosition();
   if(t==="valuation"&&loadedTabs.valuation!==curTicker)loadValuation();
   if(t==="options"&&loadedTabs.options!==curTicker)loadOptions();
   if(t==="compare"&&!loadedTabs.compare)loadCompare();
@@ -1474,24 +1573,49 @@ function renderOverview(q){
    <div class="price-row"><span class="price">${fmtNum(q.price)}</span><span class="chg ${cls}">${up?"▲":"▼"} ${fmtNum(q.change)} (${fmtPct(q.changePct)})</span></div>
    <div class="meta">${q.sector||""}${q.industry?" · "+q.industry:""} &nbsp;|&nbsp; 开 ${fmtNum(q.open)} · 高 ${fmtNum(q.dayHigh)} · 低 ${fmtNum(q.dayLow)} · 量 ${fmtBig(q.volume)}</div>
    <div id="decisionCard" style="margin-bottom:16px"></div>
-   <div class="controls">${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}<label style="margin-left:6px"><input type="checkbox" id="wallOverlay" onchange="toggleOptionWall(this.checked)"><span style="color:#f6c343">期权墙</span></label></span></div>
-   <div id="chart"></div>
-   <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy</span></div>
-   <div id="sepa"><div class="loading">分析中…</div></div>
-   <div class="two-col">
-     <div><div class="section-title">关键财务指标</div><div class="grid">
-       ${card("市值",fmtBig(f.marketCap))}${card("市盈率 TTM",fmtNum(f.trailingPE))}${card("预期PE",fmtNum(f.forwardPE))}${card("市净率",fmtNum(f.priceToBook))}
-       ${card("EPS",fmtNum(f.eps))}${card("营收TTM",fmtBig(f.revenue))}${card("净利率",f.profitMargin!=null?fmtNum(f.profitMargin*100)+"%":"—")}${card("毛利率",f.grossMargin!=null?fmtNum(f.grossMargin*100)+"%":"—")}
-       ${card("Beta",fmtNum(f.beta))}${card("股息率",f.dividendYield!=null?fmtNum(f.dividendYield)+"%":"—")}${card("52周高",fmtNum(f.fiftyTwoWeekHigh))}${card("52周低",fmtNum(f.fiftyTwoWeekLow))}</div></div>
-     <div><div class="section-title">分析师评级</div><div class="grid">
-       <div class="card"><div class="k">综合评级</div><div class="v"><span class="badge ${recClass}">${a.recommendation||"无"}</span></div></div>
-       ${card("平均目标价",fmtNum(a.targetMean))}${card("最高/最低",fmtNum(a.targetHigh)+" / "+fmtNum(a.targetLow))}${card("分析师数",a.numAnalysts!=null?a.numAnalysts:"—")}${card("目标空间",(a.targetMean&&q.price)?fmtPct((a.targetMean/q.price-1)*100):"—")}</div>
-       <div class="section-title" style="margin-top:24px">流动性 <span class="tag">skill: stock-liquidity</span></div><div id="liquidity"><div class="loading">分析中…</div></div></div>
-   </div>
-   <div class="section-title">财报日 / 业绩 <span class="tag">skill: earnings-preview</span></div><div id="earnings"><div class="loading">加载中…</div></div>
-   <div class="section-title">价格 / 止损预警 <span class="tag">到价 · 跌破20MA · 止损</span></div><div id="alertsPanel"></div>
-   <div class="section-title">重要消息 / 新闻</div><div id="news"><div class="loading">加载中…</div></div>`;
+   <div class="ov-grid">
+    <div class="ov-main">
+     <div class="controls">${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}<label style="margin-left:6px"><input type="checkbox" id="wallOverlay" onchange="toggleOptionWall(this.checked)"><span style="color:#f6c343">期权墙</span></label></span></div>
+     <div id="chart"></div>
+     <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy</span></div>
+     <div id="sepa"><div class="loading">分析中…</div></div>
+     <div class="two-col">
+       <div><div class="section-title">关键财务指标</div><div class="grid">
+         ${card("市值",fmtBig(f.marketCap))}${card("市盈率 TTM",fmtNum(f.trailingPE))}${card("预期PE",fmtNum(f.forwardPE))}${card("市净率",fmtNum(f.priceToBook))}
+         ${card("EPS",fmtNum(f.eps))}${card("营收TTM",fmtBig(f.revenue))}${card("净利率",f.profitMargin!=null?fmtNum(f.profitMargin*100)+"%":"—")}${card("毛利率",f.grossMargin!=null?fmtNum(f.grossMargin*100)+"%":"—")}
+         ${card("Beta",fmtNum(f.beta))}${card("股息率",f.dividendYield!=null?fmtNum(f.dividendYield)+"%":"—")}${card("52周高",fmtNum(f.fiftyTwoWeekHigh))}${card("52周低",fmtNum(f.fiftyTwoWeekLow))}</div></div>
+       <div><div class="section-title">分析师评级</div><div class="grid">
+         <div class="card"><div class="k">综合评级</div><div class="v"><span class="badge ${recClass}">${a.recommendation||"无"}</span></div></div>
+         ${card("平均目标价",fmtNum(a.targetMean))}${card("最高/最低",fmtNum(a.targetHigh)+" / "+fmtNum(a.targetLow))}${card("分析师数",a.numAnalysts!=null?a.numAnalysts:"—")}${card("目标空间",(a.targetMean&&q.price)?fmtPct((a.targetMean/q.price-1)*100):"—")}</div>
+         <div class="section-title" style="margin-top:24px">流动性 <span class="tag">skill: stock-liquidity</span></div><div id="liquidity"><div class="loading">分析中…</div></div></div>
+     </div>
+     <div class="section-title">财报日 / 业绩 <span class="tag">skill: earnings-preview</span></div><div id="earnings"><div class="loading">加载中…</div></div>
+     <div class="section-title">价格 / 止损预警 <span class="tag">到价 · 跌破20MA · 止损</span></div><div id="alertsPanel"></div>
+     <div class="section-title">重要消息 / 新闻</div><div id="news"><div class="loading">加载中…</div></div>
+    </div>
+    <aside class="ov-side"><div id="sizerPanel" class="sizer-panel"></div></aside>
+   </div>`;
   initChart();
+  renderSizerPanel();
+}
+// 概览页右侧仓位计算面板
+function renderSizerPanel(){
+  const el=document.getElementById("sizerPanel");if(!el)return;
+  const entry=window._curPrice?window._curPrice.toFixed(2):"";
+  const stop=window._curPrice?(window._curPrice*0.92).toFixed(2):"";
+  el.innerHTML=`<div class="section-title" style="margin-top:0;font-size:15px">仓位计算 · 能买多少股 <span class="tag">position-sizing</span></div>
+   <div class="muted" style="font-size:12px;margin-bottom:10px">买入价默认现价;止损可点下方 MA 快捷设。算<b>同时满足仓位上限与风险上限</b>的最大可买股数。</div>
+   ${sizerForm("ov",{entry,stop,maStops:true})}`;
+  calcSize("ov");
+  renderMaStopBtns("ov");
+}
+function setStop(p,val){const e=document.getElementById(p+"Stop");if(e&&isFinite(val)){e.value=Number(val).toFixed(2);calcSize(p);renderMaStopBtns(p);}}
+function renderMaStopBtns(p){
+  const el=document.getElementById(p+"MaBtns");if(!el)return;
+  const m=window._maLast||{};
+  const entryEl=document.getElementById(p+"Entry"),entry=entryEl?parseFloat(entryEl.value):NaN;
+  const pill=(label,val)=>(val&&isFinite(val))?`<button class="ma-pill" onclick="setStop('${p}',${val})">${label} ${fmtNum(val)}</button>`:"";
+  el.innerHTML=`<span class="muted" style="font-size:11px">快捷止损:</span>${pill("MA5",m["5"])}${pill("MA10",m["10"])}${pill("MA20",m["20"])}${entry>0?`<button class="ma-pill" onclick="setStop('${p}',${entry*0.92})">-8%</button>`:""}`;
 }
 
 function initChart(){
@@ -1529,6 +1653,10 @@ async function loadChart(period){
   if(d.error||!d.candles)return;
   candleSeries.setData(d.candles);volSeries.setData(d.volumes);
   Object.keys(MA_COLORS).forEach(w=>{if(maSeries[w]&&d.ma&&d.ma[w])maSeries[w].setData(d.ma[w]);});
+  // 记录各 MA 最新值,供仓位计算的快捷止损用
+  window._maLast={};
+  Object.keys(MA_COLORS).forEach(w=>{const arr=d.ma&&d.ma[w];if(arr&&arr.length)window._maLast[w]=arr[arr.length-1].value;});
+  renderMaStopBtns("ov");
   chart.timeScale().fitContent();
 }
 
@@ -1584,7 +1712,7 @@ async function loadDecision(){
       <span class="badge ${vclass}" style="font-size:15px">${verdict}</span>
       <span class="muted" style="font-size:12px">综合分 ${score>0?'+':''}${score}</span></div>
     <div style="display:flex;gap:18px;flex-wrap:wrap">${reasons.map(r=>`<div style="font-size:13px"><span class="badge ${r.c}" style="font-size:11px">${r.k}</span> <span class="muted">${r.v}</span></div>`).join("")}</div>
-    ${sizeNote?`<div class="small" style="margin-top:8px">${sizeNote} · <a onclick="switchTab('position')">去仓位计算</a></div>`:""}
+    ${sizeNote?`<div class="small" style="margin-top:8px">${sizeNote} · <a onclick="document.getElementById('sizerPanel')&&document.getElementById('sizerPanel').scrollIntoView({behavior:'smooth',block:'center'})">看右侧仓位计算 →</a></div>`:""}
     <div class="small">综合 SEPA/估值/期权墙的启发式打分,仅供参考,不构成投资建议。</div></div>`;
 }
 async function loadEarnings(){
@@ -1643,50 +1771,60 @@ async function addAlert(){
 }
 async function delAlert(id){await fetch("/api/alerts?id="+id,{method:"DELETE"});loadAlerts();}
 
-// ---------- 仓位计算 ----------
-function loadPosition(){
-  loadedTabs.position=curTicker;
-  const el=document.getElementById("tabc-position");
+// ---------- 仓位计算器(能买多少股,前缀化复用) ----------
+function sizerForm(p,opts){
+  opts=opts||{};
   const acct=getSetting("accountValue","100000");
-  const entry=window._curPrice?window._curPrice.toFixed(2):"";
-  const stop=window._curPrice?(window._curPrice*0.92).toFixed(2):"";  // 默认 -8%
-  const posUnit=getSetting("posUnit","%");
-  const riskUnit=getSetting("riskUnit","%");
-  const posVal=getSetting("posVal","25");
-  const riskVal=getSetting("riskVal","1");
-  const unitSel=(id,u)=>`<select id="${id}" onchange="calcPosition()"><option ${u==="%"?"selected":""}>%</option><option ${u==="$"?"selected":""}>$</option></select>`;
-  el.innerHTML=`
-   <div class="section-title">仓位计算器 <span class="tag">skill: sepa-strategy/position-sizing</span></div>
-   <div class="muted" style="font-size:13px;margin-bottom:14px">输入买入价、止损价、总资产,以及两个上限(总买入仓位 / 总风险),自动算出<b>同时满足全部条件</b>的最大可买股数。已带入 ${curTicker} 现价,可手动改。</div>
+  const posUnit=getSetting("posUnit","%"),riskUnit=getSetting("riskUnit","%");
+  const posVal=getSetting("posVal","25"),riskVal=getSetting("riskVal","1");
+  const unitSel=(suf,u)=>`<select id="${p}${suf}" onchange="calcSize('${p}')"><option ${u==="%"?"selected":""}>%</option><option ${u==="$"?"selected":""}>$</option></select>`;
+  const tickerRow=opts.withTicker?`<div><label>股票代码(可选)</label><div class="row"><input id="${p}Ticker" placeholder="如 AAPL" value="${opts.ticker||''}" style="text-transform:uppercase" onkeydown="if(event.key==='Enter')sizerFetchPrice('${p}')"><button class="search" style="margin:0" onclick="sizerFetchPrice('${p}')">取现价</button></div><div class="hint" id="${p}hTk">填代码点「取现价」自动带入买入价</div></div>`:"";
+  return `
    <div class="pform">
-     <div><label>总资产 ($)</label><div class="row"><input id="posAccount" type="number" value="${acct}" oninput="calcPosition()"></div><div class="hint">会自动记住</div></div>
-     <div><label>买入价 ($)</label><div class="row"><input id="posEntry" type="number" value="${entry}" oninput="calcPosition()"></div><div class="hint" id="hEntry"></div></div>
-     <div><label>止损价 ($)</label><div class="row"><input id="posStop" type="number" value="${stop}" oninput="calcPosition()"></div><div class="hint" id="hStop"></div></div>
-     <div><label>① 总买入仓位上限</label><div class="row"><input id="posMaxPos" type="number" value="${posVal}" oninput="calcPosition()">${unitSel("posMaxPosUnit",posUnit)}</div><div class="hint" id="hPos"></div></div>
-     <div><label>② 总风险上限(最多亏)</label><div class="row"><input id="posMaxRisk" type="number" value="${riskVal}" oninput="calcPosition()">${unitSel("posMaxRiskUnit",riskUnit)}</div><div class="hint" id="hRisk"></div></div>
+     ${tickerRow}
+     <div><label>总资产 ($)</label><div class="row"><input id="${p}Account" type="number" value="${acct}" oninput="calcSize('${p}')"></div><div class="hint">会自动记住</div></div>
+     <div><label>买入价 ($)</label><div class="row"><input id="${p}Entry" type="number" value="${opts.entry||''}" oninput="calcSize('${p}')"></div><div class="hint" id="${p}hEntry"></div></div>
+     <div><label>止损价 ($)</label><div class="row"><input id="${p}Stop" type="number" value="${opts.stop||''}" oninput="calcSize('${p}')"></div>${opts.maStops?`<div class="ma-stops" id="${p}MaBtns"></div>`:""}<div class="hint" id="${p}hStop"></div></div>
+     <div><label>① 总买入仓位上限</label><div class="row"><input id="${p}MaxPos" type="number" value="${posVal}" oninput="calcSize('${p}')">${unitSel("MaxPosUnit",posUnit)}</div><div class="hint" id="${p}hPos"></div></div>
+     <div><label>② 总风险上限(最多亏)</label><div class="row"><input id="${p}MaxRisk" type="number" value="${riskVal}" oninput="calcSize('${p}')">${unitSel("MaxRiskUnit",riskUnit)}</div><div class="hint" id="${p}hRisk"></div></div>
    </div>
-   <div id="posResult"></div>`;
-  calcPosition();
+   <div id="${p}Result"></div>`;
 }
-function calcPosition(){
-  const num=id=>parseFloat(document.getElementById(id).value);
-  const account=num("posAccount"),entry=num("posEntry"),stop=num("posStop");
-  const maxPosIn=num("posMaxPos"),maxRiskIn=num("posMaxRisk");
-  const posUnit=document.getElementById("posMaxPosUnit").value,riskUnit=document.getElementById("posMaxRiskUnit").value;
+async function sizerFetchPrice(p){
+  const el=document.getElementById(p+"Ticker");if(!el)return;
+  const tk=el.value.trim().toUpperCase();if(!tk)return;
+  const h=document.getElementById(p+"hTk");if(h)h.textContent="读取现价…";
+  try{
+    const q=await j("/api/quote?ticker="+encodeURIComponent(tk));
+    if(q&&q.price){
+      document.getElementById(p+"Entry").value=q.price.toFixed(2);
+      document.getElementById(p+"Stop").value=(q.price*0.92).toFixed(2);
+      if(h)h.innerHTML=`${tk} 现价 <b>$${fmtNum(q.price)}</b> 已带入(止损默认 -8%,可改)`;
+      calcSize(p);
+    }else if(h)h.textContent="未取到现价,请手动填买入价";
+  }catch(e){if(h)h.textContent="取价失败,请手动填买入价";}
+}
+function calcSize(p){
+  const num=suf=>parseFloat(document.getElementById(p+suf).value);
+  const account=num("Account"),entry=num("Entry"),stop=num("Stop");
+  const maxPosIn=num("MaxPos"),maxRiskIn=num("MaxRisk");
+  const posUnit=document.getElementById(p+"MaxPosUnit").value,riskUnit=document.getElementById(p+"MaxRiskUnit").value;
   // 记忆
   if(account>0)setSetting("accountValue",account);
   setSetting("posUnit",posUnit);setSetting("riskUnit",riskUnit);
   if(maxPosIn>=0)setSetting("posVal",maxPosIn);if(maxRiskIn>=0)setSetting("riskVal",maxRiskIn);
-  window._lastCalc={entry,stop,shares:0};
+  const tkEl=document.getElementById(p+"Ticker");
+  const ticker=tkEl?tkEl.value.trim().toUpperCase():(curTicker||"");
+  window["_lastCalc_"+p]={entry,stop,shares:0,ticker};
 
-  const res=document.getElementById("posResult");
-  const setHint=(id,t)=>{const e=document.getElementById(id);if(e)e.textContent=t;};
+  const res=document.getElementById(p+"Result");
+  const setHint=(suf,t)=>{const e=document.getElementById(p+suf);if(e)e.textContent=t;};
   // 派生金额
   const maxPosDollar=posUnit==="%"?(account*maxPosIn/100):maxPosIn;
   const maxRiskDollar=riskUnit==="%"?(account*maxRiskIn/100):maxRiskIn;
   setHint("hPos",isFinite(maxPosDollar)?"= $"+fmtBig(maxPosDollar)+(posUnit==="$"&&account>0?` · 占 ${(maxPosDollar/account*100).toFixed(1)}%`:""):"");
   setHint("hRisk",isFinite(maxRiskDollar)?"= $"+fmtBig(maxRiskDollar)+(riskUnit==="$"&&account>0?` · 占 ${(maxRiskDollar/account*100).toFixed(2)}%`:""):"");
-  setHint("hEntry","");setHint("hStop", (entry>0&&stop>0)?`止损距离 ${((entry-stop)/entry*100).toFixed(2)}%`:"");
+  setHint("hStop", (entry>0&&stop>0)?`止损距离 ${((entry-stop)/entry*100).toFixed(2)}%`:"");
 
   if(!(account>0&&entry>0&&stop>0&&maxPosIn>=0&&maxRiskIn>=0)){res.innerHTML='<div class="muted">请完整填写各项(均为正数)。</div>';return;}
   if(stop>=entry){res.innerHTML='<div class="error">止损价必须低于买入价。</div>';return;}
@@ -1697,7 +1835,7 @@ function calcPosition(){
   const shares=Math.max(0,Math.min(sharesByRisk,sharesByPos));
   const binding=sharesByRisk<=sharesByPos?"风险上限":"仓位上限";
   const bindClass=sharesByRisk<=sharesByPos?"sell":"hold";
-  window._lastCalc={entry,stop,shares};
+  window["_lastCalc_"+p]={entry,stop,shares,ticker};
 
   const capital=shares*entry;
   const riskDollar=shares*riskPerShare;
@@ -1711,7 +1849,7 @@ function calcPosition(){
    <div class="bindbox">
      <div><div class="muted" style="font-size:12px">建议最大买入</div><div class="shares-big">${shares.toLocaleString()} <span style="font-size:18px;font-weight:600">股</span></div></div>
      <span class="badge ${bindClass}">受「${binding}」约束</span>
-     <button class="search" style="margin:0" onclick="addPositionFromCalc()">＋ 记入持仓</button>
+     <button class="search" style="margin:0" onclick="addSizerRecord('${p}')">＋ 记入持仓</button>
    </div>
    <div class="grid">
      ${card("投入资金",`$${fmtBig(capital)}`)}
@@ -1734,18 +1872,28 @@ function calcPosition(){
    </tbody></table>
    <div class="small">公式:股数 = min( 总风险额÷每股风险 , 总仓位额÷买入价 )。SEPA 建议单笔风险 0.5–2%、盈亏比≥2:1、止损 7–8% 内。本工具仅为计算,不构成投资建议。</div>`;
 }
-async function addPositionFromCalc(){
-  const c=window._lastCalc;
+async function addSizerRecord(p){
+  const c=window["_lastCalc_"+p];
   if(!c||!c.shares){alert("请先得到有效的可买股数");return;}
+  const tk=(c.ticker||"").trim().toUpperCase();
+  if(!tk){alert("请先填写股票代码,再记入持仓");return;}
   await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({ticker:curTicker,shares:c.shares,entry:c.entry,stop:c.stop,target:(c.entry*1.15).toFixed(2)})});
-  alert(`已记入持仓:${curTicker} ${c.shares} 股 @ ${fmtNum(c.entry)}`);
+    body:JSON.stringify({ticker:tk,shares:c.shares,entry:c.entry,stop:c.stop,target:(c.entry*1.15).toFixed(2)})});
+  alert(`已记入持仓:${tk} ${c.shares} 股 @ ${fmtNum(c.entry)}`);
+  if(document.getElementById("posTrack"))loadTrack();
 }
 
 // ---------- 持仓页 ----------
-async function loadPositions(){
+function loadPositions(){
   const el=document.getElementById("page-positions");
-  el.innerHTML='<div class="loading">加载持仓…</div>';
+  el.innerHTML=`
+    <div class="section-title" style="margin-top:6px">我的持仓 · 跟踪 <span class="tag">SQLite 持久化</span></div>
+    <div class="muted" style="font-size:13px;margin-bottom:14px">「能买多少股」计算器在<b>个股看板 → 概览页 K 线右侧</b>,算好可一键记入这里。</div>
+    <div id="posTrack"><div class="loading">加载持仓…</div></div>`;
+  loadTrack();
+}
+async function loadTrack(){
+  const el=document.getElementById("posTrack");
   const d=await j("/api/positions");
   const s=d.summary||{};
   const open=d.positions.filter(p=>p.status==="open"),closed=d.positions.filter(p=>p.status==="closed");
@@ -1775,7 +1923,6 @@ async function loadPositions(){
       <td class="${(pl||0)>=0?'green':'red'}">${pl!=null?(pl>=0?"+":"")+fmtBig(pl):"—"}</td><td>${p.opened_at||""}→${p.closed_at||""}</td>
       <td><a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td></tr>`;}).join("");
   el.innerHTML=`
-    <div class="section-title" style="margin-top:6px">我的持仓 <span class="tag">SQLite 持久化</span></div>
     ${sumCards}
     <div class="cmpbar"><b>手动添加:</b>
       <input id="npTicker" placeholder="代码" style="width:90px;text-transform:uppercase;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
@@ -1783,7 +1930,7 @@ async function loadPositions(){
       <input id="npEntry" placeholder="买入价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
-    ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>R</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可在「仓位计算」算好后一键记入,或上方手动添加。</div>'}
+    ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>R</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
     ${closed.length?`<div class="section-title" style="font-size:14px">已平仓 / 交易记录</div><table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>平仓价</th><th>盈亏</th><th>持有</th><th></th></tr></thead><tbody>${closedRows}</tbody></table>`:""}
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
 }
@@ -1792,17 +1939,17 @@ async function addPositionManual(){
   const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value);
   if(!tk||!shares||!entry){alert("代码/股数/买入价必填");return;}
   await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null})});
-  loadPositions();
+  loadTrack();
 }
 async function closePosition(id,price){
   const px=prompt("平仓价格",price?price.toFixed(2):"");
   if(px===null)return;
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"close",exit_price:parseFloat(px)})});
-  loadPositions();
+  loadTrack();
 }
 async function delPosition(id){
   if(!confirm("确认删除该记录?"))return;
-  await fetch("/api/positions/"+id,{method:"DELETE"});loadPositions();
+  await fetch("/api/positions/"+id,{method:"DELETE"});loadTrack();
 }
 
 // ---------- 估值 ----------
