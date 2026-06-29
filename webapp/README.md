@@ -45,6 +45,17 @@
 
 生产部署到服务器 + Cloudflare 域名(Tunnel + Access 零信任):见 **[`deploy/README-deploy.md`](deploy/README-deploy.md)**。本地用浏览器 localStorage 之外的数据均存服务端 SQLite(`DASHBOARD_DB`,默认 `webapp/data/dashboard.db`)。
 
+## 数据缓存(K线持久化)
+
+日线 K 线落库到同一个 SQLite(`bars` / `bars_meta` 表),**重启不丢、跨请求共享、大幅降 yfinance 压力**:
+
+- **触发式**:任何被访问的标的,其日线自动落库;后续请求直接读库(实测二次命中 ~8ms vs 首拉 ~2s)。距上次拉取 `FAST_TTL`(90s)内不碰网络;过期或盘中只增量拉 `1mo` 而非重拉整段。
+- **收盘后自动刷新**:应用内后台线程每天 **22:10 UTC**(美股 EDT/EST 收盘后)增量刷新「**自选股 ∪ 持仓**」当日 K 线;其他标的触发式更新。
+- **手动触发**:`POST /api/cache/refresh`;或容器内 `docker exec finance-dash python cache_update.py`。
+- **持仓/自选/预警/设置** 一直就在同一个 SQLite,本来就持久化;备份照旧只需拷 `dashboard.db` 一个文件。
+
+> 调度线程假设**单 worker**(生产 Dockerfile 已是 `-w 1`)。多 worker 部署时,其余 worker 请设 `ENABLE_SCHEDULER=0`,避免重复刷新。
+
 ## 来源 / Attribution
 
 本看板是个人 fork [`aixiaojiao/finance-skills`](https://github.com/aixiaojiao/finance-skills) 新增的部分。
@@ -80,6 +91,8 @@ webapp/.venv/bin/python webapp/app.py
 | `/api/options/expiries?ticker=AAPL` | 期权到期日列表 |
 | `/api/options/chain?ticker=AAPL&expiry=YYYY-MM-DD` | 期权链 |
 | `/api/heatmap` | 全市场个股 + 板块热力图 |
+| `/api/cache/refresh` (POST) | 手动触发 K线缓存增量更新(`?ticker=AAPL` 单只;无参刷新自选股∪持仓) |
+| `/api/cache/status` | 缓存概览(每个标的已存日线区间、行数、上次拉取时间) |
 
 ## 部署到个人网站
 

@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 应用代码
-COPY app.py wsgi.py ./
+COPY app.py wsgi.py cache_update.py ./
 
 # 数据库放在挂载卷,持久化
 ENV DASHBOARD_DB=/data/dashboard.db

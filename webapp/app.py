@@ -27,6 +27,9 @@ import os
 import time
 import json
 import sqlite3
+import threading
+from datetime import datetime, timedelta, date, timezone
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request, Response, g
 import yfinance as yf
@@ -79,6 +82,16 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS settings(
         key TEXT PRIMARY KEY, value TEXT
+    );
+    -- 日线 K 线持久化缓存:重启不丢、跨 worker 共享、降 yfinance 压力
+    CREATE TABLE IF NOT EXISTS bars(
+        ticker TEXT NOT NULL, date TEXT NOT NULL,
+        open REAL, high REAL, low REAL, close REAL, adj_close REAL, volume REAL,
+        PRIMARY KEY(ticker, date)
+    );
+    -- 每个标的的缓存元信息:上次拉取时间(epoch)、已存最早/最晚日期
+    CREATE TABLE IF NOT EXISTS bars_meta(
+        ticker TEXT PRIMARY KEY, last_fetch TEXT, first_date TEXT, last_date TEXT
     );
     """)
     # 自选股默认值(仅首次为空时)
@@ -162,8 +175,8 @@ def get_info(ticker):
 
 
 @cached(120, keep_empty=False)
-def get_history_df(ticker, period, interval="1d"):
-    # 只缓存非空结果(见 cached keep_empty=False);限流/失败时退避重试一次
+def _yf_history(ticker, period, interval="1d"):
+    # 直接拉 yfinance(只缓存非空结果);限流/失败时退避重试一次。
     for attempt in range(2):
         try:
             df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
@@ -174,6 +187,219 @@ def get_history_df(ticker, period, interval="1d"):
         if attempt == 0:
             time.sleep(0.5)  # 多数 429 是瞬时的
     return pd.DataFrame()  # 仍为空:decorator 不缓存、自动回退上次有效缓存
+
+
+# ============================ 日线 K 线持久化缓存 ============================
+# 设计:日线(interval=1d)走 SQLite——先查库,缺/过期才拉 yfinance 并增量 upsert。
+#   · 触发式:任何被访问的标的,其日线自动落库,后续从库读(带新鲜度判断)。
+#   · 日内只增量拉 "1mo"(而非每次重拉 max),重启不丢、跨进程共享、大幅降 yfinance 压力。
+#   · 收盘后由后台线程刷新「自选股 ∪ 持仓」当日 K 线;其他标的触发式更新。
+# 非日线(intraday)不落库,仍走 _yf_history 内存缓存。
+
+_BARS_LOCK = threading.Lock()
+FAST_TTL = 90            # 距上次拉取 90s 内直接读库,不碰网络
+# period 字符串 → 回看天数(None=全部);留足余量供 MA200 在左缘计算
+_PERIOD_DAYS = {"5d": 8, "1mo": 35, "3mo": 100, "6mo": 190, "1y": 370,
+                "2y": 740, "5y": 1830, "10y": 3660, "ytd": 370, "max": None}
+
+
+def _cache_db():
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
+def _period_start(period):
+    days = _PERIOD_DAYS.get(period, 740)
+    if days is None:
+        return None
+    return (date.today() - timedelta(days=days)).isoformat()
+
+
+def last_expected_session():
+    """最近一个『已收盘完成』的美股交易日(YYYY-MM-DD)。仅按周末/收盘时间判断,不含节假日历
+    (单用户研究工具可接受;配合拉取冷却避免节假日空拉硬磕)。"""
+    et = datetime.now(ZoneInfo("America/New_York"))
+    d = et.date()
+    if et.hour < 16 or (et.hour == 16 and et.minute < 10):
+        d = d - timedelta(days=1)            # 今日尚未收盘定稿 → 用前一交易日
+    while d.weekday() >= 5:                   # 跨过周六/周日
+        d = d - timedelta(days=1)
+    return d.isoformat()
+
+
+def _market_open():
+    et = datetime.now(ZoneInfo("America/New_York"))
+    if et.weekday() >= 5:
+        return False
+    m = et.hour * 60 + et.minute
+    return 9 * 60 + 30 <= m <= 16 * 60
+
+
+def _read_bars_meta(ticker):
+    con = _cache_db()
+    try:
+        r = con.execute("SELECT last_fetch, first_date, last_date FROM bars_meta WHERE ticker=?",
+                        (ticker,)).fetchone()
+    finally:
+        con.close()
+    if not r:
+        return None
+    try:
+        lf = float(r[0] or 0)
+    except (TypeError, ValueError):
+        lf = 0.0
+    return {"last_fetch": lf, "first_date": r[1], "last_date": r[2]}
+
+
+def _touch_bars_fetch(ticker):
+    # 即使本次拉取为空(限流/失败)也更新 last_fetch,以 FAST_TTL 作冷却,避免反复硬磕。
+    with _BARS_LOCK:
+        con = _cache_db()
+        try:
+            con.execute("""INSERT INTO bars_meta(ticker, last_fetch, first_date, last_date)
+                VALUES(?, ?, NULL, NULL)
+                ON CONFLICT(ticker) DO UPDATE SET last_fetch=excluded.last_fetch""",
+                        (ticker, str(time.time())))
+            con.commit()
+        finally:
+            con.close()
+
+
+def _store_bars(ticker, df):
+    """把 yfinance 日线 df upsert 进库,并刷新 meta。返回写入行数。"""
+    rows = []
+    for idx, r in df.iterrows():
+        rows.append((ticker, idx.strftime("%Y-%m-%d"),
+                     _num(r.get("Open")), _num(r.get("High")), _num(r.get("Low")),
+                     _num(r.get("Close")), _num(r.get("Adj Close")), _num(r.get("Volume"))))
+    if not rows:
+        return 0
+    with _BARS_LOCK:
+        con = _cache_db()
+        try:
+            con.executemany("""INSERT INTO bars(ticker, date, open, high, low, close, adj_close, volume)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(ticker, date) DO UPDATE SET
+                  open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close,
+                  adj_close=excluded.adj_close, volume=excluded.volume""", rows)
+            mm = con.execute("SELECT MIN(date), MAX(date) FROM bars WHERE ticker=?", (ticker,)).fetchone()
+            con.execute("""INSERT INTO bars_meta(ticker, last_fetch, first_date, last_date)
+                VALUES(?,?,?,?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                  last_fetch=excluded.last_fetch, first_date=excluded.first_date, last_date=excluded.last_date""",
+                        (ticker, str(time.time()), mm[0], mm[1]))
+            con.commit()
+        finally:
+            con.close()
+    return len(rows)
+
+
+def _load_bars_df(ticker, start_date):
+    con = _cache_db()
+    try:
+        if start_date:
+            cur = con.execute("""SELECT date, open, high, low, close, adj_close, volume
+                FROM bars WHERE ticker=? AND date>=? ORDER BY date""", (ticker, start_date))
+        else:
+            cur = con.execute("""SELECT date, open, high, low, close, adj_close, volume
+                FROM bars WHERE ticker=? ORDER BY date""", (ticker,))
+        rows = cur.fetchall()
+    finally:
+        con.close()
+    if not rows:
+        return pd.DataFrame()
+    idx = pd.to_datetime([r[0] for r in rows])
+    return pd.DataFrame({
+        "Open": [r[1] for r in rows], "High": [r[2] for r in rows], "Low": [r[3] for r in rows],
+        "Close": [r[4] for r in rows], "Adj Close": [r[5] for r in rows], "Volume": [r[6] for r in rows],
+    }, index=idx)
+
+
+def _history_daily(ticker, period):
+    need_start = _period_start(period)
+    meta = _read_bars_meta(ticker)
+    now = time.time()
+    refetch = None
+    if meta is None or not meta["last_date"]:
+        refetch = period                                  # 首次:拉整段
+    else:
+        need_older = need_start is not None and meta["first_date"] and meta["first_date"] > need_start
+        if need_older:
+            refetch = period                              # 需要更早历史 → 重拉整段补齐
+        elif now - meta["last_fetch"] > FAST_TTL:
+            if meta["last_date"] < last_expected_session() or _market_open():
+                refetch = "1mo"                           # 缺最新交易日 / 盘中 → 增量拉
+    if refetch:
+        df = _yf_history(ticker, refetch, "1d")
+        if df is not None and not df.empty:
+            _store_bars(ticker, df)
+        else:
+            _touch_bars_fetch(ticker)                     # 失败也置冷却,避免硬磕
+    out = _load_bars_df(ticker, need_start)
+    if out is None or out.empty:
+        out = _yf_history(ticker, period, "1d")           # 库里仍空(首拉失败)→ 兜底直拉
+    return out
+
+
+def get_history_df(ticker, period, interval="1d"):
+    """日线走持久化缓存;intraday 直接拉。任何缓存异常都回退直拉,绝不让缓存层拖垮接口。"""
+    if interval != "1d":
+        return _yf_history(ticker, period, interval)
+    try:
+        return _history_daily(ticker, period)
+    except Exception:
+        return _yf_history(ticker, period, interval)
+
+
+# ---- 收盘后批量刷新:自选股 ∪ 持仓(重点标的);其他标的触发式更新 ----
+
+def tracked_tickers():
+    con = _cache_db()
+    try:
+        wl = [r[0] for r in con.execute("SELECT ticker FROM watchlist")]
+        pos = [r[0] for r in con.execute("SELECT DISTINCT ticker FROM positions WHERE status='open'")]
+    finally:
+        con.close()
+    return sorted({t.strip().upper() for t in (wl + pos) if t and t.strip()})
+
+
+def refresh_tracked_bars():
+    """增量刷新所有重点标的当日 K 线。返回 {ticker: 写入行数}。"""
+    res = {}
+    for t in tracked_tickers():
+        try:
+            df = _yf_history(t, "1mo", "1d")
+            res[t] = _store_bars(t, df) if (df is not None and not df.empty) else 0
+        except Exception:
+            res[t] = -1
+        time.sleep(0.3)   # 对 yfinance 温柔些,避免限流
+    return res
+
+
+def _scheduler_loop():
+    # 每天 22:10 UTC(美股 EDT 收盘 20:00 / EST 21:00 UTC 之后)刷新重点标的当日 K 线。
+    while True:
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=22, minute=10, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        time.sleep(max(60, (target - now).total_seconds()))
+        try:
+            if datetime.now(timezone.utc).weekday() < 5:   # 仅工作日(美股交易日近似)
+                refresh_tracked_bars()
+        except Exception:
+            pass
+
+
+def start_scheduler():
+    if os.environ.get("ENABLE_SCHEDULER", "1") != "1":
+        return
+    if getattr(start_scheduler, "_started", False):
+        return
+    start_scheduler._started = True
+    threading.Thread(target=_scheduler_loop, name="kline-scheduler", daemon=True).start()
 
 
 # ---- 以下接口此前每次请求都现拉 yfinance,统一加缓存(keep_empty=False:不缓存失败值) ----
@@ -1313,6 +1539,41 @@ def api_alerts():
     return jsonify({"alerts": rows})
 
 
+@app.route("/api/cache/refresh", methods=["POST"])
+def api_cache_refresh():
+    """手动触发 K 线缓存增量更新。?ticker=AAPL 更新单只;无参则刷新自选股∪持仓。"""
+    t = (request.args.get("ticker") or "").strip().upper()
+    if t:
+        try:
+            df = _yf_history(t, "1mo", "1d")
+            n = _store_bars(t, df) if (df is not None and not df.empty) else 0
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        return jsonify({"ticker": t, "updated": n})
+    return jsonify({"refreshed": refresh_tracked_bars()})
+
+
+@app.route("/api/cache/status")
+def api_cache_status():
+    """缓存概览:每个标的已存的日线区间与上次拉取时间。"""
+    con = _cache_db()
+    try:
+        rows = con.execute("""SELECT m.ticker, m.first_date, m.last_date, m.last_fetch,
+            (SELECT COUNT(*) FROM bars b WHERE b.ticker=m.ticker) AS bars
+            FROM bars_meta m ORDER BY m.ticker""").fetchall()
+    finally:
+        con.close()
+    out = []
+    for r in rows:
+        try:
+            lf = datetime.fromtimestamp(float(r[3] or 0)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError):
+            lf = None
+        out.append({"ticker": r[0], "first_date": r[1], "last_date": r[2],
+                    "bars": r[4], "last_fetch": lf})
+    return jsonify({"tracked": tracked_tickers(), "cached": out})
+
+
 # ============================ 前端 ============================
 
 @app.route("/")
@@ -2137,6 +2398,10 @@ setInterval(loadAlerts,60000);
 </script>
 </body>
 </html>"""
+
+
+# 启动收盘后 K 线刷新的后台线程(gunicorn 导入模块时即生效;ENABLE_SCHEDULER=0 可禁用)。
+start_scheduler()
 
 
 if __name__ == "__main__":
