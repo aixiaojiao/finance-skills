@@ -1979,7 +1979,10 @@ def api_positions():
             r["toStopPct"] = ((price / r["stop"] - 1) * 100) if r["stop"] else None
             if r["stop"] and r["status"] == "open":
                 rps = r["entry"] - r["stop"]
-                r["rMultiple"] = (price - r["entry"]) / rps if rps else None
+                if rps > 0:                                   # 止损低于成本:正常 R 倍数
+                    r["rMultiple"] = (price - r["entry"]) / rps
+                else:                                         # 止损≥成本:已锁定利润,R 无意义
+                    r["lockedPct"] = (r["stop"] / r["entry"] - 1) * 100
             if r["status"] == "open":
                 total_mv += mv
                 total_cost += cost
@@ -2904,7 +2907,7 @@ async function loadTrack(){
       <td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}</td>
       <td class="${plc}">${p.pl!=null?(p.pl>=0?"+":"")+fmtBig(p.pl):"—"} ${p.plPct!=null?`(${fmtPct(p.plPct)})`:""}</td>
       <td>${fmtNum(p.stop)}</td><td class="${stopc}">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
-      <td>${p.rMultiple!=null?p.rMultiple.toFixed(2)+"R":"—"}</td>
+      <td>${p.rMultiple!=null?p.rMultiple.toFixed(2)+"R":(p.lockedPct!=null?`<span class="green" title="止损在成本之上,已锁定利润;R 不适用">🔒锁利 +${p.lockedPct.toFixed(1)}%</span>`:'<span class="muted" title="未设止损,R 不适用">NA</span>')}</td>
       <td class="muted">${p.note||""}</td>
       <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
@@ -2938,7 +2941,6 @@ async function addPositionManual(){
   const tk=document.getElementById("npTicker").value.trim().toUpperCase();
   const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value);
   if(!tk||!shares||!entry){alert("代码/股数/买入价必填");return;}
-  if(stop&&stop>=entry){alert("止损价必须低于买入价(否则每股风险为负,R 会算错)");return;}
   await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null})});
   loadTrack();
 }
@@ -2973,9 +2975,8 @@ async function savePosition(id){
   const numOrNull=x=>x===""?null:parseFloat(x);
   const shares=parseFloat(v("shares")),entry=parseFloat(v("entry"));
   if(!(shares>0)||!(entry>0)){alert("股数/买入价必须为正数");return;}
-  const stopv=numOrNull(v("stop"));
-  if(stopv!=null&&stopv>=entry){alert("止损价必须低于买入价(否则每股风险为负,R 会算错)");return;}
-  const body={shares,entry,stop:stopv,target:numOrNull(v("target")),note:v("note")};
+  // 止损可高于成本(移动止损锁利),不做 stop<entry 限制
+  const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note")};
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   loadTrack();
 }
