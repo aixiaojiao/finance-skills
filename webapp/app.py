@@ -2474,47 +2474,38 @@ async function loadSepa(){
     <table><thead><tr><th>#</th><th>条件</th><th>结果</th><th>实际值</th></tr></thead><tbody>${rows}</tbody></table><div class="small">${s.rsNote}</div>`;
 }
 
-// ---------- 一键决策卡 ----------
+// ---------- 一键决策卡(纯 SEPA 驱动)----------
 async function loadDecision(){
   const el=document.getElementById("decisionCard");if(!el)return;
   const tk=curTicker;
-  el.innerHTML='<div class="card"><div class="muted">综合决策分析中…</div></div>';
-  // 并行拉三块;期权墙需先取到期日
-  const wallsP=(async()=>{try{const e=await j("/api/options/expiries?ticker="+tk);if(e.error||!e.expiries||!e.expiries.length)return null;const exp=pickMonthlyExpiry(e.expiries.slice(0,16));return await j(`/api/options/walls?ticker=${tk}&expiry=${exp}`);}catch(_){return null;}})();
-  const [sepa,val,walls]=await Promise.all([j("/api/sepa?ticker="+tk).catch(()=>null),j("/api/valuation?ticker="+tk).catch(()=>null),wallsP]);
+  el.innerHTML='<div class="card"><div class="muted">SEPA 决策分析中…</div></div>';
+  const sepa=await j("/api/sepa?ticker="+tk).catch(()=>null);
   if(tk!==curTicker)return; // 期间切换了
-  let score=0;const reasons=[];
-  // SEPA
-  if(sepa&&!sepa.error){let sc=0;if(/Stage 2/.test(sepa.stage)&&sepa.passed>=7)sc=1;else if(/Stage 4/.test(sepa.stage)||sepa.passed<=3)sc=-1;score+=sc;
-    reasons.push({k:"SEPA 趋势",v:`${sepa.stage} · 模板 ${sepa.passed}/${sepa.total} · 基本面 ${sepa.fundamentalGrade}`,c:sc>0?"buy":(sc<0?"sell":"hold")});}
-  // 估值
-  if(val&&!val.error&&val.upside!=null){let vc=0;if(val.upside>=15)vc=1;else if(val.upside<=-15)vc=-1;score+=vc;
-    reasons.push({k:"估值",v:`${val.verdict} · 现价${fmtNum(val.price)}→合理${fmtNum(val.blended)} (${fmtPct(val.upside)})`,c:vc>0?"buy":(vc<0?"sell":"hold")});}
-  // 期权墙(轻权重:P/C 持仓偏向 + GEX 体制)
-  if(walls&&!walls.error){let oc=0;if(walls.pcRatioOI!=null){if(walls.pcRatioOI<0.7)oc=1;else if(walls.pcRatioOI>1.1)oc=-1;}score+=oc;
-    const mp=walls.maxPainVsSpot;const gex=walls.netGex>=0?"正GEX(抑波)":"负GEX(放大波动)";
-    reasons.push({k:"期权墙",v:`MaxPain ${fmtNum(walls.maxPain)}(${fmtPct(mp)}) · P/C ${walls.pcRatioOI??"—"} · ${gex}`,c:oc>0?"buy":(oc<0?"sell":"hold")});}
-  // 建议仓位(用已存设置)
+  if(!sepa||sepa.error){el.innerHTML=`<div class="card"><div class="muted">${(sepa&&sepa.error)||'SEPA 数据不足,暂无决策'}</div></div>`;return;}
+  const vclass=sepa.verdictClass||"hold";
+  // 结论直接取 SEPA 自身评分;下方理由展开阶段 / 模板分 / 基本面
+  const reasons=[
+    {k:"阶段",v:sepa.stage,c:/Stage 2/.test(sepa.stage)?"buy":(/Stage 4/.test(sepa.stage)?"sell":"hold")},
+    {k:"趋势模板",v:`${sepa.passed}/${sepa.total} 条件通过`,c:sepa.passed>=7?"buy":(sepa.passed<=3?"sell":"hold")},
+    {k:"基本面",v:`季度EPS评级 ${sepa.fundamentalGrade}`+(sepa.epsGrowth!=null?` · 同比 ${fmtPct(sepa.epsGrowth*100)}`:""),c:/[AB]/.test(sepa.fundamentalGrade)?"buy":(sepa.fundamentalGrade==="D"?"sell":"hold")},
+  ];
+  // 建议仓位(用已存设置;止损沿用 SEPA 经典 -8%)
   const acct=parseFloat(getSetting("accountValue","100000"))||0;
   const riskUnit=getSetting("riskUnit","%"),riskVal=parseFloat(getSetting("riskVal","1"))||1;
   const posUnit=getSetting("posUnit","%"),posVal=parseFloat(getSetting("posVal","25"))||25;
   let sizeNote="";
-  if(sepa&&sepa.price){const entry=sepa.price,stop=entry*0.92;const rps=entry-stop;
+  if(sepa.price){const entry=sepa.price,stop=entry*0.92;const rps=entry-stop;
     const riskD=riskUnit==="%"?acct*riskVal/100:riskVal,posD=posUnit==="%"?acct*posVal/100:posVal;
     const shares=Math.max(0,Math.min(Math.floor(riskD/rps),Math.floor(posD/entry)));
     sizeNote=`按你的设置(账户$${fmtBig(acct)}、风险${riskVal}${riskUnit}、仓位${posVal}${posUnit}、止损-8%)建议约 <b>${shares.toLocaleString()}</b> 股(投入$${fmtBig(shares*entry)})`;}
-  let verdict,vclass;
-  if(score>=2){verdict="倾向买入 · 多个信号共振";vclass="buy";}
-  else if(score<=-2){verdict="倾向回避 · 信号偏空";vclass="sell";}
-  else{verdict="观察 · 信号不一致或不足";vclass="hold";}
   el.innerHTML=`<div class="card" style="border-left:4px solid ${vclass==='buy'?'var(--green)':vclass==='sell'?'var(--red)':'var(--yellow)'}">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px">
-      <span style="font-size:13px;color:var(--muted)">一键决策</span>
-      <span class="badge ${vclass}" style="font-size:15px">${verdict}</span>
-      <span class="muted" style="font-size:12px">综合分 ${score>0?'+':''}${score}</span></div>
+      <span style="font-size:13px;color:var(--muted)">一键决策 · SEPA</span>
+      <span class="badge ${vclass}" style="font-size:15px">${sepa.verdict}</span>
+      <span class="muted" style="font-size:12px">模板 ${sepa.passed}/${sepa.total}</span></div>
     <div style="display:flex;gap:18px;flex-wrap:wrap">${reasons.map(r=>`<div style="font-size:13px"><span class="badge ${r.c}" style="font-size:11px">${r.k}</span> <span class="muted">${r.v}</span></div>`).join("")}</div>
     ${sizeNote?`<div class="small" style="margin-top:8px">${sizeNote} · <a onclick="document.getElementById('sizerPanel')&&document.getElementById('sizerPanel').scrollIntoView({behavior:'smooth',block:'center'})">看右侧仓位计算 →</a></div>`:""}
-    <div class="small">综合 SEPA/估值/期权墙的启发式打分,仅供参考,不构成投资建议。</div></div>`;
+    <div class="small">基于 SEPA 趋势模板评分,仅供参考,不构成投资建议。</div></div>`;
 }
 async function loadEarnings(){
   const el=document.getElementById("earnings");if(!el)return;
