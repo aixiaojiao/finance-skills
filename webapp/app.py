@@ -2286,6 +2286,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .sizer-panel table{font-size:11px;max-width:100%!important}
   .sizer-panel .shares-big{font-size:30px}
   @media(max-width:1080px){.ov-grid{flex-direction:column}.ov-side{flex-basis:auto;width:100%}.sizer-panel{position:static}.sizer-panel .pform{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}}
+  .chart-wrap{position:relative}
+  .ohlc-legend{position:absolute;top:8px;left:10px;z-index:3;pointer-events:none;font-size:12px;color:var(--muted);background:rgba(22,27,34,.55);padding:2px 8px;border-radius:6px;white-space:nowrap}
+  .ohlc-legend b{font-weight:600}
   .ma-stops-row{grid-column:1/-1;margin-top:-4px}
   .ma-stops{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:6px}
   .ma-pill{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:6px;cursor:pointer;font-size:11px}
@@ -2512,7 +2515,7 @@ function renderOverview(q){
    <div class="ov-grid">
     <div class="ov-main">
      <div class="controls">${["4h","1d","1w"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}<label style="margin-left:6px"><input type="checkbox" id="wallOverlay" onchange="toggleOptionWall(this.checked)"><span style="color:#f6c343">期权墙</span></label></span></div>
-     <div id="chart"></div>
+     <div class="chart-wrap"><div id="chart"></div><div id="ohlcLegend" class="ohlc-legend"></div></div>
      <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy</span></div>
      <div id="sepa"><div class="loading">分析中…</div></div>
      <div class="two-col">
@@ -2575,7 +2578,20 @@ function initChart(){
   candleSeries=chart.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",borderVisible:false,wickUpColor:"#26a69a",wickDownColor:"#ef5350"});
   maSeries={};Object.keys(MA_COLORS).forEach(w=>{maSeries[w]=chart.addLineSeries({color:MA_COLORS[w],lineWidth:w==="200"?2:1,priceLineVisible:false,lastValueVisible:false,visible:MA_DEFAULT_ON[w]});});
   volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:""});volSeries.priceScale().applyOptions({scaleMargins:{top:0.85,bottom:0}});
+  // 左上角 OHLC 图例:悬停某根 K 显示其开/高/低/收;未悬停时回落到最新一根
+  chart.subscribeCrosshairMove(param=>{
+    let bar=null;
+    if(param&&param.time&&param.seriesData){const b=param.seriesData.get(candleSeries);if(b)bar=b;}
+    if(!bar&&window._ohlcData&&window._ohlcData.length)bar=window._ohlcData[window._ohlcData.length-1];
+    renderOhlc(bar);
+  });
   window.addEventListener("resize",()=>{if(chart)chart.applyOptions({width:el.clientWidth});});
+}
+function renderOhlc(bar){
+  const el=document.getElementById("ohlcLegend");if(!el)return;
+  if(!bar){el.innerHTML="";return;}
+  const col=bar.close>=bar.open?"#26a69a":"#ef5350";
+  el.innerHTML=`开<b style="color:${col}">${fmtNum(bar.open)}</b>　高<b style="color:${col}">${fmtNum(bar.high)}</b>　低<b style="color:${col}">${fmtNum(bar.low)}</b>　收<b style="color:${col}">${fmtNum(bar.close)}</b>`;
 }
 function toggleMA(w,on){if(maSeries[w])maSeries[w].applyOptions({visible:on});}
 let wallLines=[];
@@ -2603,6 +2619,7 @@ async function loadChart(period){
   const d=await j(`/api/history?ticker=${encodeURIComponent(curTicker)}&period=${period}`);
   if(d.error||!d.candles)return;
   candleSeries.setData(d.candles);volSeries.setData(d.volumes);
+  window._ohlcData=d.candles;renderOhlc(d.candles[d.candles.length-1]);   // 默认显示最新一根 OHLC
   Object.keys(MA_COLORS).forEach(w=>{if(maSeries[w]&&d.ma&&d.ma[w])maSeries[w].setData(d.ma[w]);});
   // 记录各 MA 最新值,供仓位计算的快捷止损用
   window._maLast={};
