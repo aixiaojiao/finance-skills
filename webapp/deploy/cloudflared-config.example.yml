@@ -7,6 +7,6 @@ credentials-file: /home/ubuntu/.cloudflared/<TUNNEL_ID>.json
 
 ingress:
   - hostname: dash.example.com
-    service: http://localhost:8000
+    service: http://localhost:8799
   # 兜底
   - service: http_status:404
