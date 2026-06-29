@@ -1825,7 +1825,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .wchip{display:flex;gap:6px;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--border);padding:7px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px}
   .wchip:hover{border-color:var(--accent)}
   .wchip .wtk{font-weight:600}
-  .wchip .x{color:var(--muted);font-size:11px;padding-left:6px}.wchip .x:hover{color:var(--red)}
+  .wchip .wq{display:flex;align-items:center;gap:5px;font-size:12px}
+  .wchip .wprice{color:var(--text)}
+  .wchip .x{color:var(--muted);font-size:11px;padding-left:4px}.wchip .x:hover{color:var(--red)}
   .content{flex:1 1 auto;min-width:0;padding:20px 24px;max-width:1520px}
   @media(max-width:880px){
     .app{flex-direction:column}
@@ -2042,7 +2044,7 @@ async function renderWatch(){
   if(!watchlist.length){el.innerHTML='<span class="lbl" style="font-size:12px;padding:4px">空 · 搜索后点 ☆ 加入</span>';return;}
   el.innerHTML=watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="loadTicker('${t}')"><span class="wtk">${t}</span><span class="muted">…</span></span>`).join("");
   const q=await j("/api/quotes?tickers="+watchlist.join(","));
-  q.quotes.forEach(x=>{const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`<span class="wtk">${x.ticker}</span><span><span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span></span>`;});
+  q.quotes.forEach(x=>{const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`<span class="wtk">${x.ticker}</span><span class="wq"><span class="wprice">${fmtNum(x.price)}</span><span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span></span>`;});
 }
 
 // ---------- 主入口 ----------
