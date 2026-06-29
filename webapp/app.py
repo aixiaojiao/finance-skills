@@ -78,7 +78,7 @@ def init_db():
         level REAL, note TEXT, active INTEGER DEFAULT 1, created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS watchlist(
-        ticker TEXT PRIMARY KEY, added_at TEXT
+        ticker TEXT PRIMARY KEY, added_at TEXT, sort INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS settings(
         key TEXT PRIMARY KEY, value TEXT
@@ -108,11 +108,17 @@ def init_db():
         key TEXT PRIMARY KEY, fired_at TEXT
     );
     """)
+    # 迁移:为旧库 watchlist 补 sort 列,并按 added_at 回填初始顺序
+    wl_cols = [r[1] for r in con.execute("PRAGMA table_info(watchlist)").fetchall()]
+    if "sort" not in wl_cols:
+        con.execute("ALTER TABLE watchlist ADD COLUMN sort INTEGER DEFAULT 0")
+        for i, r in enumerate(con.execute("SELECT ticker FROM watchlist ORDER BY added_at, ticker").fetchall()):
+            con.execute("UPDATE watchlist SET sort=? WHERE ticker=?", (i, r[0]))
     # 自选股默认值(仅首次为空时)
     cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
     if cur[0] == 0:
-        con.executemany("INSERT INTO watchlist(ticker, added_at) VALUES(?, ?)",
-                        [("AAPL", ""), ("NVDA", ""), ("TSLA", "")])
+        con.executemany("INSERT INTO watchlist(ticker, added_at, sort) VALUES(?, ?, ?)",
+                        [("AAPL", "", 0), ("NVDA", "", 1), ("TSLA", "", 2)])
     con.commit()
     con.close()
 
@@ -1877,17 +1883,31 @@ def api_position_one(pid):
 def api_watchlist():
     db = get_db()
     if request.method == "GET":
-        rows = db.execute("SELECT ticker FROM watchlist ORDER BY added_at, ticker").fetchall()
+        rows = db.execute("SELECT ticker FROM watchlist ORDER BY sort, added_at, ticker").fetchall()
         return jsonify({"watchlist": [r["ticker"] for r in rows]})
     tk = ((request.get_json(force=True, silent=True) or {}).get("ticker") or request.args.get("ticker") or "").strip().upper()
     if not tk:
         return jsonify({"error": "缺少 ticker"}), 400
     if request.method == "POST":
-        db.execute("INSERT OR IGNORE INTO watchlist(ticker, added_at) VALUES(?, ?)", (tk, time.strftime("%Y-%m-%d %H:%M:%S")))
+        # 新加入的排到末尾
+        db.execute("INSERT OR IGNORE INTO watchlist(ticker, added_at, sort) VALUES(?, ?, COALESCE((SELECT MAX(sort)+1 FROM watchlist), 0))",
+                   (tk, time.strftime("%Y-%m-%d %H:%M:%S")))
     else:
         db.execute("DELETE FROM watchlist WHERE ticker=?", (tk,))
     db.commit()
-    rows = db.execute("SELECT ticker FROM watchlist ORDER BY added_at, ticker").fetchall()
+    rows = db.execute("SELECT ticker FROM watchlist ORDER BY sort, added_at, ticker").fetchall()
+    return jsonify({"watchlist": [r["ticker"] for r in rows]})
+
+
+@app.route("/api/watchlist/reorder", methods=["POST"])
+def api_watchlist_reorder():
+    """按传入的 ticker 顺序重排自选股(拖拽排序)。body: {order: [TICKER, ...]}"""
+    db = get_db()
+    order = (request.get_json(force=True, silent=True) or {}).get("order") or []
+    for i, tk in enumerate(order):
+        db.execute("UPDATE watchlist SET sort=? WHERE ticker=?", (i, (tk or "").strip().upper()))
+    db.commit()
+    rows = db.execute("SELECT ticker FROM watchlist ORDER BY sort, added_at, ticker").fetchall()
     return jsonify({"watchlist": [r["ticker"] for r in rows]})
 
 
@@ -2039,8 +2059,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .side-watch-hd{display:flex;align-items:center;justify-content:space-between}
   .side-watch-hd .lbl{color:var(--muted);font-size:12px;font-weight:600}
   .watchlist{display:flex;flex-direction:column;gap:5px;overflow-y:auto}
-  .wchip{display:flex;gap:6px;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--border);padding:7px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px}
+  .wchip{display:flex;gap:6px;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--border);padding:7px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;touch-action:none;user-select:none}
   .wchip:hover{border-color:var(--accent)}
+  .wchip.dragging{opacity:.7;border-color:var(--accent);box-shadow:0 4px 14px rgba(0,0,0,.45)}
   .wchip .wtk{font-weight:600}
   .wchip .wq{display:flex;align-items:center;gap:5px;font-size:12px}
   .wchip .wprice{color:var(--text)}
@@ -2260,10 +2281,50 @@ async function toggleWatch(t){t=t.toUpperCase();const method=inWatch(t)?"DELETE"
 async function renderWatch(){
   const el=document.getElementById("watchlist");if(!el)return;
   if(!watchlist.length){el.innerHTML='<span class="lbl" style="font-size:12px;padding:4px">空 · 搜索后点 ☆ 加入</span>';return;}
-  el.innerHTML=watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="loadTicker('${t}')"><span class="wtk">${t}</span><span class="muted">…</span></span>`).join("");
+  el.innerHTML=watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="wchipClick('${t}')"><span class="wtk">${t}</span><span class="muted">…</span></span>`).join("");
+  attachWatchDnD();
   const q=await j("/api/quotes?tickers="+watchlist.join(","));
   q.quotes.forEach(x=>{const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`<span class="wtk">${x.ticker}</span><span class="wq"><span class="wprice">${fmtNum(x.price)}</span><span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span></span>`;});
 }
+// 点击自选股加载;若刚结束一次拖拽则吞掉这次点击
+function wchipClick(t){if(window._wSuppressClick){window._wSuppressClick=false;return;}loadTicker(t);}
+// 长按自选股方块进入拖拽,上下移动改变顺序,松手持久化
+let _wdrag=null;
+function attachWatchDnD(){
+  const cont=document.getElementById("watchlist");if(!cont)return;
+  cont.querySelectorAll(".wchip").forEach(el=>{
+    el.addEventListener("pointerdown",e=>{
+      if(e.target.classList&&e.target.classList.contains("x"))return;   // 删除按钮不拖
+      window._wSuppressClick=false;
+      _wdrag={el,active:false,startY:e.clientY,startX:e.clientX,pid:e.pointerId,
+        timer:setTimeout(()=>{if(!_wdrag)return;_wdrag.active=true;el.classList.add("dragging");try{el.setPointerCapture(_wdrag.pid);}catch(_){}},350)};
+    });
+    el.addEventListener("pointermove",e=>{
+      if(!_wdrag)return;
+      if(!_wdrag.active){ // 长按未触发前移动过大 → 视作滚动/点击,取消
+        if(Math.abs(e.clientY-_wdrag.startY)>8||Math.abs(e.clientX-_wdrag.startX)>8){clearTimeout(_wdrag.timer);_wdrag=null;}
+        return;}
+      e.preventDefault();
+      const chips=[...cont.querySelectorAll(".wchip")];
+      const after=chips.find(c=>c!==_wdrag.el&&e.clientY<c.getBoundingClientRect().top+c.getBoundingClientRect().height/2);
+      if(after){if(after!==_wdrag.el.nextSibling)cont.insertBefore(_wdrag.el,after);}
+      else if(cont.lastElementChild!==_wdrag.el)cont.appendChild(_wdrag.el);
+    });
+    const end=()=>{
+      if(!_wdrag)return;clearTimeout(_wdrag.timer);
+      if(_wdrag.active){
+        _wdrag.el.classList.remove("dragging");
+        const order=[...cont.querySelectorAll(".wchip")].map(c=>c.id.slice(2));
+        if(order.join()!==watchlist.join()){watchlist=order;persistWatchOrder(order);}
+        window._wSuppressClick=true;   // 阻止松手后紧跟的 click 触发加载
+      }
+      _wdrag=null;
+    };
+    el.addEventListener("pointerup",end);
+    el.addEventListener("pointercancel",end);
+  });
+}
+async function persistWatchOrder(order){try{await fetch("/api/watchlist/reorder",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({order})});}catch(e){}}
 
 // ---------- 主入口 ----------
 async function loadTicker(t){
@@ -2987,7 +3048,7 @@ function renderSectorTreemap(){
 
 // ---------- 启动 ----------
 document.getElementById("tickerInput").addEventListener("keydown",e=>{if(e.key==="Enter")loadTicker();});
-loadMarket();loadSettings();loadWatch();loadTicker("AAPL");
+loadMarket();loadSettings();loadWatch().then(()=>loadTicker(watchlist[0]||"AAPL"));
 setInterval(loadAlerts,60000);
 </script>
 </body>
