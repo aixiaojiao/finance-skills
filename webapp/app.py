@@ -1200,13 +1200,15 @@ def api_option_walls():
         return jsonify({"error": "无有效行权价"}), 404
 
     # Max Pain:使期权买方总收益(=卖方赔付)最小的结算价
+    # 候选结算价限定在现价 ±40% 区间:避免远端稀疏 OI 把痛点拉到离谱位置(如 spot=1132 却报 70)
+    band = [k for k in strikes if 0.6 * spot <= k <= 1.4 * spot] or strikes
     def payout(S):
         tot = 0.0
         for k in strikes:
             tot += (cmap.get(k, {}).get("oi", 0)) * max(S - k, 0)
             tot += (pmap.get(k, {}).get("oi", 0)) * max(k - S, 0)
         return tot
-    max_pain = min(strikes, key=payout)
+    max_pain = min(band, key=payout)
 
     # OI 墙
     call_walls = sorted([{"strike": k, "oi": cmap[k]["oi"]} for k in cmap if cmap[k]["oi"] > 0],
@@ -1258,11 +1260,16 @@ def api_option_walls():
     vol_call = sum(v["vol"] for v in cmap.values())
     vol_put = sum(v["vol"] for v in pmap.values())
 
-    # 给前端画图用的 OI 分布(限制档数,ATM 附近)
-    near = sorted(strikes, key=lambda k: abs(k - spot))[:40]
-    near = sorted(near)
-    oi_dist = [{"strike": k, "call": cmap.get(k, {}).get("oi", 0), "put": pmap.get(k, {}).get("oi", 0)} for k in near]
-    gex_dist = [x for x in gex_by_strike if x["strike"] in set(near)]
+    # 画图档位:取「OI 最大的若干档(即墙)」∪「现价附近若干档」,确保墙一定出现在图里
+    # (此前只取 ATM±40 档,当 OI 集中在远离现价的行权价时,图会全空 → 误以为没获取到数据)
+    def oi_of(k):
+        return (cmap.get(k, {}).get("oi", 0)) + (pmap.get(k, {}).get("oi", 0))
+    top_oi = sorted(strikes, key=lambda k: -oi_of(k))[:28]
+    near_spot = sorted(strikes, key=lambda k: abs(k - spot))[:18]
+    sel = sorted(set(top_oi) | set(near_spot))
+    oi_dist = [{"strike": k, "call": cmap.get(k, {}).get("oi", 0), "put": pmap.get(k, {}).get("oi", 0)} for k in sel]
+    sel_set = set(sel)
+    gex_dist = [x for x in gex_by_strike if x["strike"] in sel_set]
 
     return jsonify({
         "ticker": ticker, "expiry": expiry, "spot": spot, "daysToExpiry": round(days, 1),
@@ -1271,6 +1278,7 @@ def api_option_walls():
         "netGex": net_gex, "gammaFlip": gamma_flip,
         "pcRatioOI": round(oi_put / oi_call, 2) if oi_call else None,
         "pcRatioVol": round(vol_put / vol_call, 2) if vol_call else None,
+        "totalOI": oi_call + oi_put, "totalVol": vol_call + vol_put,
         "oiDist": oi_dist, "gexDist": gex_dist,
         "note": "GEX 用 BS gamma(IV/剩余到期/无风险利率)估算,Gamma Flip 为累计净GEX过零点近似",
     })
@@ -2503,6 +2511,12 @@ async function loadWalls(){
   document.getElementById("wallSummary").innerHTML='<div class="loading">计算期权墙…</div>';
   const d=await j(`/api/options/walls?ticker=${encodeURIComponent(curTicker)}&expiry=${exp}`);
   if(d.error){document.getElementById("wallSummary").innerHTML='<div class="muted">'+d.error+'</div>';return;}
+  if(!d.totalOI){
+    document.getElementById("wallSummary").innerHTML='<div class="muted">该到期日暂无有效未平仓量(OI)数据 — 可能是新上市/流动性低,或 Yahoo 该到期数据缺失。换个到期日(优先月度第三个周五)再试。</div>';
+    ['oiChart','gexChart'].forEach(id=>{const el=document.getElementById(id);if(el)echarts.getInstanceByDom(el)?.clear();});
+    document.getElementById("wallNote").textContent=d.note||"";
+    return;
+  }
   window._walls=d;
   const gexPos=d.netGex>=0;
   const gexLabel=gexPos?"正 GEX · 倾向钉价/抑制波动":"负 GEX · 放大波动/助涨助跌";
