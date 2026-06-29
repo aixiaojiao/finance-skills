@@ -4,7 +4,7 @@
 
 ## 页面1 · 个股看板
 
-五个子标签 + 顶部自选股条(后端持久化,点 ☆ 加自选)+ 触发预警 banner:
+五个子标签 + **左侧栏自选股**(后端持久化,点 ☆ 加自选,所有页面常驻;窄屏自动横排)+ 触发预警 banner:
 
 **概览**
 - 顶部 **一键决策卡**:聚合 SEPA + 估值 + 期权墙 → 买入/观察/回避 + 建议仓位
@@ -29,13 +29,16 @@
 
 ## 页面2 · 持仓(SQLite 持久化)
 
+- 顶部 **总资金量**:可编辑、持久化,作为唯一真相;显示已投入/可用现金/浮盈亏;仓位计算默认从此取值
 - 持仓表:实时浮盈亏、距止损、R 倍数;汇总:总市值/浮盈亏、仓位占比、**组合风险敞口(热度)**
 - 手动添加 / 平仓 / 删除;已平仓沉淀为交易记录
 
 ## 页面3 · 市场热力图(独立页签)
 
-- **个股热力图**:近百只标普大盘股按板块分组 treemap,面积≈市值,颜色=当日涨跌
-- **板块热力图**:11 板块 treemap(同风格,面积=板块市值,色=市值加权涨跌),ETF 数据在悬浮提示
+- **个股热力图**:按板块分组 treemap,面积≈市值,颜色=当日涨跌
+- **板块热力图**:板块 treemap(同风格,面积=板块市值,色=市值加权涨跌),ETF 数据在悬浮提示
+- **⚙ 自定义板块**:可增删板块、编辑成分股与对标 ETF,**同股可归多板块**;内置 11 板块为默认可恢复
+- **缓存策略**:盘后一律用缓存(零网络);盘中点 ↻ 或每 5 分钟自动增量刷新,温柔对待 Yahoo 限流
 
 顶部常驻**大盘条**:标普500 / 纳指 / VIX + 市场环境(Bull/Choppy/Bear)+ 情绪 — `sepa-strategy/market-environment`
 
@@ -90,7 +93,8 @@ webapp/.venv/bin/python webapp/app.py
 | `/api/valuation?ticker=AAPL` | DCF + 相对估值 + 预期趋势 |
 | `/api/options/expiries?ticker=AAPL` | 期权到期日列表 |
 | `/api/options/chain?ticker=AAPL&expiry=YYYY-MM-DD` | 期权链 |
-| `/api/heatmap` | 全市场个股 + 板块热力图 |
+| `/api/heatmap` | 全市场个股 + 板块热力图(`?force=1` 盘中强制刷新;盘后恒用缓存) |
+| `/api/heatmap/sectors` (GET/POST) | 读取/覆盖自定义板块配置(GET 含内置默认) |
 | `/api/cache/refresh` (POST) | 手动触发 K线缓存增量更新(`?ticker=AAPL` 单只;无参刷新自选股∪持仓) |
 | `/api/cache/status` | 缓存概览(每个标的已存日线区间、行数、上次拉取时间) |
 
@@ -104,5 +108,10 @@ gunicorn -w 2 -b 0.0.0.0:8000 'app:app'
 ```
 
 再用 Nginx/Caddy 反代到你的域名即可。也可容器化部署(Dockerfile 可按需补充)。
+
+## 文档
+
+- [`ROADMAP.md`](ROADMAP.md) — 已完成改动 + 未来功能(机器人进出场/回测、交易日志/画线、Telegram、TradingView、净值曲线)+ 版面重设计建议
+- [`docs/options-walls.md`](docs/options-walls.md) — 期权墙(Max Pain / OI 墙 / GEX / Gamma Flip)算法与准确性说明
 
 > ⚠️ 数据来自 Yahoo Finance(yfinance),非实时、有延迟,仅供研究学习,不构成投资建议。

@@ -93,6 +93,15 @@ def init_db():
     CREATE TABLE IF NOT EXISTS bars_meta(
         ticker TEXT PRIMARY KEY, last_fetch TEXT, first_date TEXT, last_date TEXT
     );
+    -- 用户自定义板块(任务4):热力图按此分组;首次为空时由内置默认种子填充
+    CREATE TABLE IF NOT EXISTS user_sectors(
+        name TEXT PRIMARY KEY, etf TEXT, sort INTEGER DEFAULT 0
+    );
+    -- 板块成分股:同一股票可归属多个板块(联合主键)
+    CREATE TABLE IF NOT EXISTS user_sector_members(
+        sector TEXT NOT NULL, ticker TEXT NOT NULL,
+        PRIMARY KEY(sector, ticker)
+    );
     """)
     # 自选股默认值(仅首次为空时)
     cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
@@ -1291,6 +1300,135 @@ HEATMAP_UNIVERSE = {
 }
 
 
+# ---- 板块配置(任务4):用户可自定义板块与成分股,同股可归多板块。----
+# 首次为空时用内置默认作种子;之后完全由 DB 驱动。compute_heatmap 据此分组。
+
+def _seed_sectors_if_empty(con):
+    n = con.execute("SELECT COUNT(*) FROM user_sectors").fetchone()[0]
+    if n:
+        return
+    for i, (sector, tickers) in enumerate(HEATMAP_UNIVERSE.items()):
+        con.execute("INSERT OR IGNORE INTO user_sectors(name, etf, sort) VALUES(?,?,?)",
+                    (sector, SECTOR_ETFS.get(sector), i))
+        for t in tickers:
+            con.execute("INSERT OR IGNORE INTO user_sector_members(sector, ticker) VALUES(?,?)",
+                        (sector, t.strip().upper()))
+    con.commit()
+
+
+def get_sector_config():
+    """返回 [{name, etf, tickers:[...]}, ...],按 sort 排序。空则用内置默认种子初始化。"""
+    con = _cache_db()
+    try:
+        _seed_sectors_if_empty(con)
+        secs = con.execute("SELECT name, etf FROM user_sectors ORDER BY sort, name").fetchall()
+        out = []
+        for name, etf in secs:
+            members = [r[0] for r in con.execute(
+                "SELECT ticker FROM user_sector_members WHERE sector=? ORDER BY ticker", (name,))]
+            out.append({"name": name, "etf": (etf or None), "tickers": members})
+    finally:
+        con.close()
+    return out
+
+
+def save_sector_config(sectors):
+    """整体覆盖保存。sectors=[{name, etf, tickers:[...]}]。保存后失效热力图缓存。"""
+    con = _cache_db()
+    try:
+        con.execute("DELETE FROM user_sectors")
+        con.execute("DELETE FROM user_sector_members")
+        for i, s in enumerate(sectors):
+            name = (s.get("name") or "").strip()
+            if not name:
+                continue
+            etf = (s.get("etf") or "").strip().upper() or None
+            con.execute("INSERT OR REPLACE INTO user_sectors(name, etf, sort) VALUES(?,?,?)", (name, etf, i))
+            seen = set()
+            for t in (s.get("tickers") or []):
+                t = (t or "").strip().upper()
+                if t and t not in seen:
+                    seen.add(t)
+                    con.execute("INSERT OR IGNORE INTO user_sector_members(sector, ticker) VALUES(?,?)", (name, t))
+        con.commit()
+    finally:
+        con.close()
+    _invalidate_heatmap_cache()
+
+
+# ---- 热力图持久化缓存(任务1):盘后用缓存不重拉,盘中按需/定时刷新 ----
+HEATMAP_OPEN_TTL = 300        # 盘中:>5 分钟才允许自动重拉(force 例外)
+_HEATMAP_MEM = {"data": None, "epoch": 0.0}
+
+
+def _read_heatmap_cache():
+    """读持久化热力图(settings 里存 JSON)。返回 (data|None, epoch)。"""
+    if _HEATMAP_MEM["data"] is not None:
+        return _HEATMAP_MEM["data"], _HEATMAP_MEM["epoch"]
+    con = _cache_db()
+    try:
+        rows = dict(con.execute(
+            "SELECT key, value FROM settings WHERE key IN('heatmap_json','heatmap_epoch')").fetchall())
+    finally:
+        con.close()
+    raw = rows.get("heatmap_json")
+    if not raw:
+        return None, 0.0
+    try:
+        data = json.loads(raw)
+        epoch = float(rows.get("heatmap_epoch") or 0)
+    except (ValueError, TypeError):
+        return None, 0.0
+    _HEATMAP_MEM["data"], _HEATMAP_MEM["epoch"] = data, epoch
+    return data, epoch
+
+
+def _write_heatmap_cache(data, epoch):
+    _HEATMAP_MEM["data"], _HEATMAP_MEM["epoch"] = data, epoch
+    con = _cache_db()
+    try:
+        con.execute("INSERT INTO settings(key,value) VALUES('heatmap_json',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(data),))
+        con.execute("INSERT INTO settings(key,value) VALUES('heatmap_epoch',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(epoch),))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _invalidate_heatmap_cache():
+    _HEATMAP_MEM["data"], _HEATMAP_MEM["epoch"] = None, 0.0
+    con = _cache_db()
+    try:
+        con.execute("DELETE FROM settings WHERE key IN('heatmap_json','heatmap_epoch')")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _heatmap_needs_refetch(epoch, force):
+    """盘后:有缓存且已是收盘后数据 → 永不重拉(force 也不);无缓存 → 必拉一次。
+    盘中:force 立即拉;否则距上次>TTL 才拉。"""
+    if epoch <= 0:
+        return True                                   # 从未缓存:必须拉一次
+    if _market_open():
+        return force or (time.time() - epoch > HEATMAP_OPEN_TTL)
+    # 盘后:若缓存是在『最近一次收盘』之后抓的,即为最终收盘数据,直接复用,不受 force 影响
+    et = datetime.now(ZoneInfo("America/New_York"))
+    close_dt = datetime.combine(date.fromisoformat(last_expected_session()),
+                                datetime.min.time(), tzinfo=ZoneInfo("America/New_York")) \
+        .replace(hour=16, minute=10)
+    return epoch < close_dt.timestamp()               # 缓存早于上次收盘 → 补拉一次最终数据
+
+
+@cached(21600, keep_empty=False)
+def _mcaps_cached(tickers_key):
+    """市值变化慢,整体缓存 6 小时,避免每次热力图都打 ~100 次 fast_info(降 yahoo 压力)。"""
+    tickers = tickers_key.split(",")
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        return dict(zip(tickers, ex.map(_mcap, tickers)))
+
+
 def _mcap(tk):
     try:
         fi = yf.Ticker(tk).fast_info
@@ -1305,9 +1443,13 @@ def _mcap(tk):
     return None
 
 
-@cached(600)
-def compute_heatmap():
-    all_t = [t for lst in HEATMAP_UNIVERSE.values() for t in lst]
+def _compute_heatmap_fresh():
+    """实际抓取并计算热力图(用用户板块配置)。仅在需要刷新时调用。"""
+    config = get_sector_config()
+    all_t = sorted({t for s in config for t in s["tickers"]})
+    if not all_t:
+        return {"sectors": [], "sectorEtfs": [], "asof": time.strftime("%Y-%m-%d %H:%M"),
+                "note": "未配置任何板块/成分股"}
     try:
         data = yf.download(all_t, period="5d", auto_adjust=False, progress=False, group_by="ticker")
     except Exception:
@@ -1325,51 +1467,92 @@ def compute_heatmap():
             pass
         return None, None, None
 
-    # 并行取市值
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        mcaps = dict(zip(all_t, ex.map(_mcap, all_t)))
+    # 全市场只算一次每只股票的涨跌/价格/市值,再按板块复用(同股可归多板块)
+    mcaps = _mcaps_cached(",".join(all_t)) or {}
+    stock_info = {}
+    for t in all_t:
+        chg, last, dvol = change_of(t)
+        if chg is None:
+            continue
+        size = mcaps.get(t) or dvol or 1e9
+        stock_info[t] = {"ticker": t, "change": round(chg, 2), "price": last, "size": round(size / 1e9, 2)}
 
     sectors = []
-    for sector, tickers in HEATMAP_UNIVERSE.items():
-        children = []
-        for t in tickers:
-            chg, last, dvol = change_of(t)
-            if chg is None:
-                continue
-            size = mcaps.get(t) or dvol or 1e9
-            children.append({"ticker": t, "change": round(chg, 2), "price": last,
-                             "size": round(size / 1e9, 2)})  # 单位:十亿
-        if children:
-            tot = sum(c["size"] for c in children)
-            wavg = sum(c["change"] * c["size"] for c in children) / tot if tot else 0
-            children.sort(key=lambda c: -c["size"])
-            sectors.append({"sector": sector, "etf": SECTOR_ETFS.get(sector),
-                            "change": round(wavg, 2), "size": round(tot, 1), "stocks": children})
+    for s in config:
+        children = [dict(stock_info[t]) for t in s["tickers"] if t in stock_info]
+        if not children:
+            continue
+        tot = sum(c["size"] for c in children)
+        wavg = sum(c["change"] * c["size"] for c in children) / tot if tot else 0
+        children.sort(key=lambda c: -c["size"])
+        sectors.append({"sector": s["name"], "etf": s["etf"],
+                        "change": round(wavg, 2), "size": round(tot, 1), "stocks": children})
 
-    # 板块 ETF 行情
-    etf_list = list(SECTOR_ETFS.values())
+    # 板块 ETF 行情(仅对配置里指定了 ETF 的板块)
+    etf_list = sorted({s["etf"] for s in config if s["etf"]})
     etf_perf = {}
-    try:
-        edata = yf.download(etf_list, period="5d", auto_adjust=False, progress=False, group_by="ticker")
-        for e in etf_list:
-            try:
-                c = edata[e]["Close"].dropna()
-                if len(c) >= 2:
-                    etf_perf[e] = round((c.iloc[-1] / c.iloc[-2] - 1) * 100, 2)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    sector_etfs = [{"sector": s, "etf": e, "change": etf_perf.get(e)} for s, e in SECTOR_ETFS.items()]
+    if etf_list:
+        try:
+            edata = yf.download(etf_list, period="5d", auto_adjust=False, progress=False, group_by="ticker")
+            for e in etf_list:
+                try:
+                    c = edata[e]["Close"].dropna()
+                    if len(c) >= 2:
+                        etf_perf[e] = round((c.iloc[-1] / c.iloc[-2] - 1) * 100, 2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    sector_etfs = [{"sector": s["name"], "etf": s["etf"], "change": etf_perf.get(s["etf"])}
+                   for s in config if s["etf"]]
     sector_etfs.sort(key=lambda x: (x["change"] is None, -(x["change"] or 0)))
 
     return {"sectors": sectors, "sectorEtfs": sector_etfs,
             "asof": time.strftime("%Y-%m-%d %H:%M"), "note": "面积≈市值(十亿美元),颜色=当日涨跌幅"}
 
 
+def compute_heatmap(force=False):
+    """市场时段感知缓存:盘后用持久化缓存不重拉;盘中按需(force)/超 TTL 才重算。"""
+    data, epoch = _read_heatmap_cache()
+    if not _heatmap_needs_refetch(epoch, force) and data is not None:
+        out = dict(data)
+        out["cached"] = True
+        out["marketOpen"] = _market_open()
+        return out
+    fresh = _compute_heatmap_fresh()
+    # 仅当抓到有效板块数据才落库(避免把限流空结果缓存住);否则回退旧缓存
+    if fresh.get("sectors"):
+        _write_heatmap_cache(fresh, time.time())
+    elif data is not None:
+        out = dict(data)
+        out["cached"] = True
+        out["stale"] = True
+        out["marketOpen"] = _market_open()
+        return out
+    fresh["cached"] = False
+    fresh["marketOpen"] = _market_open()
+    return fresh
+
+
 @app.route("/api/heatmap")
 def api_heatmap():
-    return jsonify(compute_heatmap())
+    force = request.args.get("force") in ("1", "true", "yes")
+    return jsonify(compute_heatmap(force=force))
+
+
+@app.route("/api/heatmap/sectors", methods=["GET", "POST"])
+def api_heatmap_sectors():
+    """GET: 返回当前板块配置 + 内置默认(供前端「恢复默认」)。POST: 整体覆盖保存。"""
+    if request.method == "GET":
+        defaults = [{"name": s, "etf": SECTOR_ETFS.get(s), "tickers": list(ts)}
+                    for s, ts in HEATMAP_UNIVERSE.items()]
+        return jsonify({"sectors": get_sector_config(), "defaults": defaults})
+    d = request.get_json(force=True, silent=True) or {}
+    sectors = d.get("sectors")
+    if not isinstance(sectors, list):
+        return jsonify({"error": "需要 sectors 数组"}), 400
+    save_sector_config(sectors)
+    return jsonify({"ok": True, "sectors": get_sector_config()})
 
 
 # ============================ API: 持仓 / 交易记录 ============================
@@ -1601,19 +1784,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .gauge{display:flex;align-items:center;gap:8px}
   .gauge .bar{width:120px;height:8px;border-radius:4px;background:linear-gradient(90deg,#ef5350,#f6c343,#26a69a);position:relative}
   .gauge .dot{position:absolute;top:-3px;width:14px;height:14px;border-radius:50%;background:#fff;border:2px solid #0a0d12;transform:translateX(-50%)}
-  header{padding:12px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
   h1{font-size:18px;margin:0;font-weight:600}
-  .topnav{display:flex;gap:6px}
-  .topnav button{background:transparent;border:1px solid var(--border);color:var(--muted);padding:7px 16px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500}
-  .topnav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-  .search{display:flex;gap:8px;margin-left:auto}
-  .search input{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-size:14px;width:140px;text-transform:uppercase}
-  .search button{background:var(--accent);border:none;color:#fff;padding:8px 16px;border-radius:8px;cursor:pointer;font-size:14px}
-  .watchstrip{display:flex;gap:8px;padding:8px 24px;background:#0a0d12;border-bottom:1px solid var(--border);overflow-x:auto;align-items:center}
-  .watchstrip .lbl{color:var(--muted);font-size:12px;white-space:nowrap}
-  .wchip{display:flex;gap:6px;align-items:center;background:var(--panel);border:1px solid var(--border);padding:5px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px}
-  .wchip .x{color:var(--muted);font-size:11px;padding-left:2px}.wchip .x:hover{color:var(--red)}
-  main{padding:20px 24px;max-width:1520px;margin:0 auto}
+  /* ---- 全局左侧栏布局 ---- */
+  .app{display:flex;align-items:flex-start}
+  .sidebar{flex:0 0 212px;position:sticky;top:0;align-self:stretch;min-height:calc(100vh - 41px);max-height:calc(100vh - 41px);overflow-y:auto;background:#0a0d12;border-right:1px solid var(--border);padding:14px 12px;display:flex;flex-direction:column;gap:14px}
+  .sidebar .brand{font-size:18px;font-weight:700;padding:2px 4px 6px}
+  .sidenav{display:flex;flex-direction:column;gap:6px}
+  .sidenav button{background:transparent;border:1px solid var(--border);color:var(--muted);padding:10px 14px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500;text-align:left}
+  .sidenav button:hover{color:var(--text);border-color:var(--accent)}
+  .sidenav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .search{display:flex;gap:6px}
+  .search input{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-size:14px;width:100%;min-width:0;text-transform:uppercase}
+  .search button{background:var(--accent);border:none;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer;font-size:14px;white-space:nowrap}
+  .side-watch{display:flex;flex-direction:column;gap:6px;min-height:0}
+  .side-watch-hd{display:flex;align-items:center;justify-content:space-between}
+  .side-watch-hd .lbl{color:var(--muted);font-size:12px;font-weight:600}
+  .watchlist{display:flex;flex-direction:column;gap:5px;overflow-y:auto}
+  .wchip{display:flex;gap:6px;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--border);padding:7px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px}
+  .wchip:hover{border-color:var(--accent)}
+  .wchip .wtk{font-weight:600}
+  .wchip .x{color:var(--muted);font-size:11px;padding-left:6px}.wchip .x:hover{color:var(--red)}
+  .content{flex:1 1 auto;min-width:0;padding:20px 24px;max-width:1520px}
+  @media(max-width:880px){
+    .app{flex-direction:column}
+    .sidebar{flex-basis:auto;width:100%;position:static;min-height:0;max-height:none;border-right:none;border-bottom:1px solid var(--border)}
+    .sidenav{flex-direction:row;flex-wrap:wrap}
+    .watchlist{flex-direction:row;flex-wrap:wrap}
+    .wchip{justify-content:flex-start}
+  }
   .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:18px;flex-wrap:wrap}
   .tabs button{background:transparent;border:none;border-bottom:2px solid transparent;color:var(--muted);padding:10px 16px;cursor:pointer;font-size:14px}
   .tabs button.active{color:var(--text);border-bottom-color:var(--accent)}
@@ -1678,6 +1876,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .ma-stops{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:6px}
   .ma-pill{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:6px;cursor:pointer;font-size:11px}
   .ma-pill:hover{border-color:var(--accent);color:var(--accent)}
+  #sub-edit{background:var(--panel);border:1px solid var(--border);color:var(--muted)}#sub-edit:hover{border-color:var(--accent);color:var(--text)}
+  #sector-editor{border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:14px;background:var(--panel2)}
+  .sec-edit-row{display:grid;grid-template-columns:1fr 150px auto;gap:8px;align-items:center;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:8px}
+  .sec-edit-row .se-tk{grid-column:1/-1}
+  .sec-edit-row input,.sec-edit-row textarea{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:7px 9px;border-radius:6px;font-size:13px;width:100%}
+  .sec-edit-row textarea{min-height:46px;resize:vertical;text-transform:uppercase;font-family:inherit}
+  .capbar{background:linear-gradient(135deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:18px;display:flex;flex-direction:column;gap:10px;max-width:640px}
+  .capbar .caprow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .capbar .caplabel{color:var(--muted);font-size:14px;font-weight:600;margin-right:4px}
+  .capbar .capcur{font-size:24px;font-weight:700;color:var(--muted)}
+  .capbar input{background:var(--bg);border:1px solid var(--border);color:var(--text);font-size:26px;font-weight:800;padding:5px 12px;border-radius:8px;width:200px}
+  .capbar .capmeta{display:flex;gap:20px;flex-wrap:wrap;font-size:13px;color:var(--muted)}
   .subtabs{display:flex;gap:6px;margin:14px 0}
   .subtabs button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.subtabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 </style>
@@ -1685,24 +1895,28 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <body>
 
 <div class="marketbar" id="marketbar"><span class="muted">大盘加载中…</span></div>
-
-<header>
-  <h1>📈 看板</h1>
-  <div class="topnav">
-    <button id="nav-stock" class="active" onclick="switchPage('stock')">个股看板</button>
-    <button id="nav-positions" onclick="switchPage('positions')">持仓</button>
-    <button id="nav-heatmap" onclick="switchPage('heatmap')">市场热力图</button>
-  </div>
-  <div class="search" id="stockSearch">
-    <input id="tickerInput" placeholder="代码 如 AAPL" value="AAPL" />
-    <button onclick="loadTicker()">查询</button>
-  </div>
-</header>
-
-<div class="watchstrip" id="watchstrip"><span class="lbl">自选股</span></div>
 <div id="alertBanner"></div>
 
-<main>
+<div class="app">
+ <!-- 全局左侧栏:品牌 + 导航 + 搜索 + 自选股 -->
+ <aside class="sidebar">
+   <div class="brand">📈 看板</div>
+   <nav class="sidenav">
+     <button id="nav-stock" class="active" onclick="switchPage('stock')">📊 个股看板</button>
+     <button id="nav-positions" onclick="switchPage('positions')">💼 持仓</button>
+     <button id="nav-heatmap" onclick="switchPage('heatmap')">🔥 市场热力图</button>
+   </nav>
+   <div class="search" id="stockSearch">
+     <input id="tickerInput" placeholder="代码 如 AAPL" value="AAPL" />
+     <button onclick="loadTicker()">查询</button>
+   </div>
+   <div class="side-watch">
+     <div class="side-watch-hd"><span class="lbl">自选股</span></div>
+     <div class="watchlist" id="watchlist"></div>
+   </div>
+ </aside>
+
+ <main class="content">
   <!-- 个股看板页 -->
   <div id="page-stock">
     <div class="tabs">
@@ -1725,8 +1939,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="subtabs">
       <button id="sub-stocks" class="active" onclick="switchHeat('stocks')">个股热力图</button>
       <button id="sub-sectors" onclick="switchHeat('sectors')">板块热力图</button>
-      <button class="muted" style="margin-left:auto;cursor:pointer" onclick="loadHeatmap(true)">↻ 刷新</button>
+      <button id="sub-edit" onclick="toggleSectorEditor()">⚙ 编辑板块</button>
+      <span id="heat-status" class="muted" style="margin-left:auto;font-size:12px;align-self:center"></span>
+      <button class="muted" style="cursor:pointer" onclick="loadHeatmap(true)">↻ 刷新</button>
     </div>
+    <div id="sector-editor" class="hidden"></div>
     <div id="heat-stocks"><div class="loading">热力图加载中(首次约 10-20 秒)…</div></div>
     <div id="heat-sectors" class="hidden"></div>
     <div class="small" id="heat-note"></div>
@@ -1736,7 +1953,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
     数据来源 Yahoo Finance(yfinance),非实时、有延迟,仅供研究与学习,不构成投资建议。<br>
     SEPA 基于 Minervini 趋势模板;估值为简化 DCF;RS/情绪/热力图面积为代理算法。
   </div>
-</main>
+ </main>
+</div>
 
 <script>
 const POPULAR=["AAPL","TSLA","NVDA","MSFT","GOOGL","AMZN","META","AMD"];
@@ -1759,7 +1977,6 @@ function switchPage(p){
     document.getElementById("page-"+x).classList.toggle("hidden",p!==x);
     document.getElementById("nav-"+x).classList.toggle("active",p===x);
   });
-  document.getElementById("stockSearch").style.display=p==="stock"?"flex":"none";
   if(p==="heatmap" && !window._heatLoaded) loadHeatmap();
   if(p==="positions") loadPositions();
 }
@@ -1799,11 +2016,11 @@ function inWatch(t){return watchlist.includes(t.toUpperCase());}
 async function loadWatch(){try{const d=await j("/api/watchlist");watchlist=d.watchlist||[];}catch(e){}renderWatch();}
 async function toggleWatch(t){t=t.toUpperCase();const method=inWatch(t)?"DELETE":"POST";try{const d=await(await fetch("/api/watchlist?ticker="+t,{method})).json();watchlist=d.watchlist||watchlist;}catch(e){}renderWatch();const s=document.getElementById("starBtn");if(s)s.textContent=inWatch(curTicker)?"★":"☆";}
 async function renderWatch(){
-  const el=document.getElementById("watchstrip");
-  el.innerHTML='<span class="lbl">自选股</span>'+watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="loadTicker('${t}')">${t} <span class="muted">…</span><span class="x" onclick="event.stopPropagation();toggleWatch('${t}')">✕</span></span>`).join("")||'<span class="lbl">自选股(空)</span>';
-  if(!watchlist.length)return;
+  const el=document.getElementById("watchlist");if(!el)return;
+  if(!watchlist.length){el.innerHTML='<span class="lbl" style="font-size:12px;padding:4px">空 · 搜索后点 ☆ 加入</span>';return;}
+  el.innerHTML=watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="loadTicker('${t}')"><span class="wtk">${t}</span><span class="muted">…</span></span>`).join("");
   const q=await j("/api/quotes?tickers="+watchlist.join(","));
-  q.quotes.forEach(x=>{const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`${x.ticker} <span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span>`;});
+  q.quotes.forEach(x=>{const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`<span class="wtk">${x.ticker}</span><span><span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span></span>`;});
 }
 
 // ---------- 主入口 ----------
@@ -2043,7 +2260,7 @@ function sizerForm(p,opts){
   return `
    <div class="pform">
      ${tickerRow}
-     <div><label>总资产 ($)</label><div class="row"><input id="${p}Account" type="number" value="${acct}" oninput="calcSize('${p}')"></div><div class="hint">会自动记住</div></div>
+     <div><label>总资产 ($)</label><div class="row"><input id="${p}Account" type="number" value="${acct}" oninput="calcSize('${p}')"></div><div class="hint">默认取自持仓页总资金,可临时改(不回写)</div></div>
      <div><label>买入价 ($)</label><div class="row"><input id="${p}Entry" type="number" value="${opts.entry||''}" oninput="calcSize('${p}')"></div><div class="hint" id="${p}hEntry"></div></div>
      <div><label>止损价 ($)</label><div class="row"><input id="${p}Stop" type="number" value="${opts.stop||''}" oninput="calcSize('${p}')"></div>${opts.maStops?`<div class="ma-stops" id="${p}MaBtns"></div>`:""}<div class="hint" id="${p}hStop"></div></div>
      <div><label>① 总买入仓位上限</label><div class="row"><input id="${p}MaxPos" type="number" value="${posVal}" oninput="calcSize('${p}')">${unitSel("MaxPosUnit",posUnit)}</div><div class="hint" id="${p}hPos"></div></div>
@@ -2070,8 +2287,7 @@ function calcSize(p){
   const account=num("Account"),entry=num("Entry"),stop=num("Stop");
   const maxPosIn=num("MaxPos"),maxRiskIn=num("MaxRisk");
   const posUnit=document.getElementById(p+"MaxPosUnit").value,riskUnit=document.getElementById(p+"MaxRiskUnit").value;
-  // 记忆
-  if(account>0)setSetting("accountValue",account);
+  // 记忆(总资金以「持仓页顶部」为唯一真相,这里仅取默认值,不回写;其余为仓位计算偏好)
   setSetting("posUnit",posUnit);setSetting("riskUnit",riskUnit);
   if(maxPosIn>=0)setSetting("posVal",maxPosIn);if(maxRiskIn>=0)setSetting("riskVal",maxRiskIn);
   const tkEl=document.getElementById(p+"Ticker");
@@ -2158,6 +2374,19 @@ async function loadTrack(){
   const d=await j("/api/positions");
   const s=d.summary||{};
   const open=d.positions.filter(p=>p.status==="open"),closed=d.positions.filter(p=>p.status==="closed");
+  const acct=getSetting("accountValue","100000");
+  const freeCash=(s.totalCost!=null&&acct)?(parseFloat(acct)-s.totalCost):null;
+  const capBar=`<div class="capbar">
+    <div class="caprow"><span class="caplabel">总资金量</span><span class="capcur">$</span>
+      <input id="acctInput" type="number" value="${acct}" onkeydown="if(event.key==='Enter')saveAccount()">
+      <button class="search" style="margin:0" onclick="saveAccount()">更新</button></div>
+    <div class="capmeta">
+      <span>已投入 <b>$${fmtBig(s.totalCost||0)}</b> (${s.investedPct!=null?s.investedPct.toFixed(1):'0'}%)</span>
+      <span>可用现金 <b>${freeCash!=null?'$'+fmtBig(freeCash):'—'}</b></span>
+      <span>浮盈亏 <b class="${(s.totalPL||0)>=0?'green':'red'}">${s.totalPL!=null?(s.totalPL>=0?'+':'')+'$'+fmtBig(Math.abs(s.totalPL)):'—'}</b></span>
+    </div>
+    <div class="muted" style="font-size:11px">仓位计算默认从这里取值;修改后下方比例与「概览页仓位计算」同步。盈亏按 yfinance 延迟现价对开仓价实时计算。</div>
+  </div>`;
   const sumCards=`<div class="grid" style="margin-bottom:18px">
     ${card("持仓数",s.openCount||0)}
     ${card("总市值",s.totalMarketValue!=null?"$"+fmtBig(s.totalMarketValue):"—")}
@@ -2184,6 +2413,7 @@ async function loadTrack(){
       <td class="${(pl||0)>=0?'green':'red'}">${pl!=null?(pl>=0?"+":"")+fmtBig(pl):"—"}</td><td>${p.opened_at||""}→${p.closed_at||""}</td>
       <td><a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td></tr>`;}).join("");
   el.innerHTML=`
+    ${capBar}
     ${sumCards}
     <div class="cmpbar"><b>手动添加:</b>
       <input id="npTicker" placeholder="代码" style="width:90px;text-transform:uppercase;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
@@ -2194,6 +2424,14 @@ async function loadTrack(){
     ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>R</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
     ${closed.length?`<div class="section-title" style="font-size:14px">已平仓 / 交易记录</div><table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>平仓价</th><th>盈亏</th><th>持有</th><th></th></tr></thead><tbody>${closedRows}</tbody></table>`:""}
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
+}
+async function saveAccount(){
+  const v=parseFloat(document.getElementById("acctInput").value);
+  if(!(v>0)){alert("请输入正数总资金量");return;}
+  settings.accountValue=String(v);localStorage.setItem("accountValue",v);
+  // 先确保后端写入,再重算(investedPct/riskPct 后端依赖该值)
+  try{await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accountValue:String(v)})});}catch(e){}
+  loadTrack();
 }
 async function addPositionManual(){
   const tk=document.getElementById("npTicker").value.trim().toUpperCase();
@@ -2349,14 +2587,80 @@ function switchHeat(h){curHeat=h;document.getElementById("sub-stocks").classList
 async function loadHeatmap(force){
   window._heatLoaded=true;
   if(force)window._heatData=null;
-  if(window._heatData){renderTreemap();renderSectors();return;}
-  document.getElementById("heat-stocks").innerHTML='<div class="loading">热力图加载中(首次约 10-20 秒,抓取近百只个股)…</div>';
-  const d=await j("/api/heatmap");
+  if(window._heatData&&!force){renderTreemap();renderSectors();return;}
+  if(!window._heatData)document.getElementById("heat-stocks").innerHTML='<div class="loading">热力图加载中(首次约 10-20 秒,抓取近百只个股)…</div>';
+  const d=await j("/api/heatmap"+(force?"?force=1":""));
   if(d.error){document.getElementById("heat-stocks").innerHTML='<div class="error">'+d.error+'</div>';return;}
   window._heatData=d;
   document.getElementById("heat-stocks").innerHTML='<div id="treemap"></div>';
   document.getElementById("heat-note").textContent=`更新于 ${d.asof} · ${d.note}`;
+  updateHeatStatus(d);
   renderTreemap();renderSectors();
+  setupHeatAutoRefresh(d);
+}
+function updateHeatStatus(d){
+  const el=document.getElementById("heat-status");if(!el)return;
+  const open=d.marketOpen?'<span class="green">● 开盘中</span>':'<span class="muted">○ 已收盘</span>';
+  const src=d.cached?(d.stale?'缓存(数据源暂不可用)':'缓存'):'实时抓取';
+  el.innerHTML=`${open} · ${d.asof} · ${src}`;
+}
+let _heatTimer=null;
+function setupHeatAutoRefresh(d){
+  if(_heatTimer)clearInterval(_heatTimer);
+  if(!d.marketOpen)return;                              // 盘后用缓存,不自动刷新
+  _heatTimer=setInterval(()=>{
+    if(curPage!=="heatmap"||document.hidden)return;     // 仅在热力图页且标签可见时刷新
+    loadHeatmap(true);
+  },300000);                                            // 盘中每 5 分钟(与后端 TTL 对齐,温柔对待 yahoo)
+}
+// ---------- 板块编辑器(任务4) ----------
+function toggleSectorEditor(){
+  const el=document.getElementById("sector-editor");if(!el)return;
+  if(!el.classList.contains("hidden")){el.classList.add("hidden");return;}
+  el.classList.remove("hidden");loadSectorEditor();
+}
+async function loadSectorEditor(){
+  const el=document.getElementById("sector-editor");el.innerHTML='<div class="loading">加载板块配置…</div>';
+  const d=await j("/api/heatmap/sectors");
+  window._sectorCfg=(d.sectors||[]).map(s=>({name:s.name,etf:s.etf||"",tickers:(s.tickers||[]).join(", ")}));
+  window._sectorDefaults=d.defaults||[];
+  renderSectorEditor();
+}
+const escAttr=s=>String(s||"").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
+function renderSectorEditor(){
+  const el=document.getElementById("sector-editor");if(!el)return;
+  const rows=window._sectorCfg.map((s,i)=>`
+    <div class="sec-edit-row">
+      <input class="se-name" placeholder="板块名" value="${escAttr(s.name)}" oninput="window._sectorCfg[${i}].name=this.value">
+      <input class="se-etf" placeholder="ETF(可选)" value="${escAttr(s.etf)}" oninput="window._sectorCfg[${i}].etf=this.value">
+      <button class="ma-pill" style="color:var(--red)" onclick="delSector(${i})">删除板块</button>
+      <textarea class="se-tk" placeholder="成分股,逗号或空格分隔 如 AAPL, MSFT, NVDA" oninput="window._sectorCfg[${i}].tickers=this.value">${escAttr(s.tickers)}</textarea>
+    </div>`).join("");
+  el.innerHTML=`
+    <div class="muted" style="font-size:13px;margin-bottom:10px">自定义板块:可增删板块、编辑成分股与对标 ETF。<b>同一只股票可填进多个板块</b>。保存后热力图按你的配置重算。</div>
+    ${rows||'<div class="muted">暂无板块,点下方「添加板块」。</div>'}
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="search" style="margin:0" onclick="addSector()">＋ 添加板块</button>
+      <button class="search" style="margin:0;background:var(--green)" onclick="saveSectors()">✓ 保存并刷新热力图</button>
+      <button class="ma-pill" onclick="restoreDefaultSectors()">恢复内置默认</button>
+    </div>`;
+}
+function addSector(){window._sectorCfg.push({name:"新板块",etf:"",tickers:""});renderSectorEditor();}
+function delSector(i){window._sectorCfg.splice(i,1);renderSectorEditor();}
+function restoreDefaultSectors(){
+  if(!confirm("用内置默认覆盖当前配置?(保存后才会生效)"))return;
+  window._sectorCfg=(window._sectorDefaults||[]).map(s=>({name:s.name,etf:s.etf||"",tickers:(s.tickers||[]).join(", ")}));
+  renderSectorEditor();
+}
+async function saveSectors(){
+  const payload={sectors:window._sectorCfg.map(s=>({name:(s.name||"").trim(),etf:(s.etf||"").trim(),
+    tickers:(s.tickers||"").split(/[\s,]+/).map(t=>t.trim().toUpperCase()).filter(Boolean)})).filter(s=>s.name&&s.tickers.length)};
+  if(!payload.sectors.length){alert("至少配置一个含成分股的板块");return;}
+  const el=document.getElementById("sector-editor");el.innerHTML='<div class="loading">保存并重算热力图(约 10-20 秒)…</div>';
+  try{await fetch("/api/heatmap/sectors",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});}
+  catch(e){alert("保存失败");}
+  await loadHeatmap(true);
+  loadSectorEditor();
 }
 function renderTreemap(){
   const d=window._heatData;if(!d)return;const el=document.getElementById("treemap");if(!el)return;
