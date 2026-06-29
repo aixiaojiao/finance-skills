@@ -414,7 +414,11 @@ def _tg_send(text):
         return False, "TG_RELAY_WEBHOOK 未配置"
     try:
         data = json.dumps({"text": text, "parse_mode": "HTML"}).encode("utf-8")
-        req = _urlreq.Request(url, data=data, headers={"Content-Type": "application/json"})
+        # 带 UA:Cloudflare 默认拦 Python-urllib 的 UA(403),需浏览器前缀 UA 才放行
+        req = _urlreq.Request(url, data=data, headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; finance-dashboard/1.0)",
+        })
         with _urlreq.urlopen(req, timeout=10) as resp:
             return True, resp.status
     except Exception as e:
