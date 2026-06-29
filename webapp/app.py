@@ -2114,6 +2114,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .sizer-panel table{font-size:11px;max-width:100%!important}
   .sizer-panel .shares-big{font-size:30px}
   @media(max-width:1080px){.ov-grid{flex-direction:column}.ov-side{flex-basis:auto;width:100%}.sizer-panel{position:static}.sizer-panel .pform{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}}
+  .ma-stops-row{grid-column:1/-1;margin-top:-4px}
   .ma-stops{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:6px}
   .ma-pill{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:6px;cursor:pointer;font-size:11px}
   .ma-pill:hover{border-color:var(--accent);color:var(--accent)}
@@ -2321,20 +2322,35 @@ function renderOverview(q){
 function renderSizerPanel(){
   const el=document.getElementById("sizerPanel");if(!el)return;
   const entry=window._curPrice?window._curPrice.toFixed(2):"";
-  const stop=window._curPrice?(window._curPrice*0.92).toFixed(2):"";
+  window._ovStopAuto=true;                  // 新标的:止损回到「自动取最近均线」
   el.innerHTML=`<div class="section-title" style="margin-top:0;font-size:15px">仓位计算 · 能买多少股 <span class="tag">position-sizing</span></div>
-   <div class="muted" style="font-size:12px;margin-bottom:10px">买入价默认现价;止损可点下方 MA 快捷设。算<b>同时满足仓位上限与风险上限</b>的最大可买股数。</div>
-   ${sizerForm("ov",{entry,stop,maStops:true})}`;
-  calcSize("ov");
-  renderMaStopBtns("ov");
+   <div class="muted" style="font-size:12px;margin-bottom:10px">买入价默认现价;止损默认取<b>最靠近且低于现价的均线</b>,也可点下方 MA 快捷设。算<b>同时满足仓位上限与风险上限</b>的最大可买股数。</div>
+   ${sizerForm("ov",{entry,maStops:true})}`;
+  applyOvDefaultStop();                      // _maLast 还没好时先用 -8% 兜底,loadChart 完成后会再校正
 }
-function setStop(p,val){const e=document.getElementById(p+"Stop");if(e&&isFinite(val)){e.value=Number(val).toFixed(2);calcSize(p);renderMaStopBtns(p);}}
+// 现有均线中「低于现价且最靠近现价」的那条(默认止损)。无则返回 null。
+function nearestMaBelow(price){
+  const m=window._maLast||{};let best=null;
+  ["10","20","50","200"].forEach(w=>{const v=m[w];if(isFinite(v)&&v<price&&(best===null||v>best))best=v;});
+  return best;
+}
+// 仅当用户未手动改过止损时,把概览仓位计算的默认止损设为最近均线(兜底 -8%)。
+function applyOvDefaultStop(){
+  if(!window._ovStopAuto)return;
+  const price=window._curPrice;if(!price)return;
+  const e=document.getElementById("ovStop");if(!e)return;
+  const s=nearestMaBelow(price);
+  e.value=(s!=null?s:price*0.92).toFixed(2);
+  calcSize("ov");renderMaStopBtns("ov");
+}
+function onStopInput(p){if(p==="ov")window._ovStopAuto=false;calcSize(p);}
+function setStop(p,val){const e=document.getElementById(p+"Stop");if(e&&isFinite(val)){if(p==="ov")window._ovStopAuto=false;e.value=Number(val).toFixed(2);calcSize(p);renderMaStopBtns(p);}}
 function renderMaStopBtns(p){
   const el=document.getElementById(p+"MaBtns");if(!el)return;
   const m=window._maLast||{};
   const entryEl=document.getElementById(p+"Entry"),entry=entryEl?parseFloat(entryEl.value):NaN;
   const pill=(label,val)=>(val&&isFinite(val))?`<button class="ma-pill" onclick="setStop('${p}',${val})">${label} ${fmtNum(val)}</button>`:"";
-  el.innerHTML=`<span class="muted" style="font-size:11px">快捷止损:</span>${pill("MA5",m["5"])}${pill("MA10",m["10"])}${pill("MA20",m["20"])}${entry>0?`<button class="ma-pill" onclick="setStop('${p}',${entry*0.92})">-8%</button>`:""}`;
+  el.innerHTML=`<span class="muted" style="font-size:11px">快捷止损:</span>${pill("MA10",m["10"])}${pill("MA20",m["20"])}${pill("MA50",m["50"])}${pill("MA200",m["200"])}${entry>0?`<button class="ma-pill" onclick="setStop('${p}',${entry*0.92})">-8%</button>`:""}`;
 }
 
 function initChart(){
@@ -2376,6 +2392,7 @@ async function loadChart(period){
   window._maLast={};
   Object.keys(MA_COLORS).forEach(w=>{const arr=d.ma&&d.ma[w];if(arr&&arr.length)window._maLast[w]=arr[arr.length-1].value;});
   renderMaStopBtns("ov");
+  applyOvDefaultStop();   // 均线就绪/切周期后,若用户未改过止损则取最近均线为默认
   chart.timeScale().fitContent();
 }
 
@@ -2520,7 +2537,8 @@ function sizerForm(p,opts){
      ${tickerRow}
      <div><label>总资产 ($)</label><div class="row"><input id="${p}Account" type="number" value="${acct}" oninput="calcSize('${p}')"></div><div class="hint">默认取自持仓页总资金,可临时改(不回写)</div></div>
      <div><label>买入价 ($)</label><div class="row"><input id="${p}Entry" type="number" value="${opts.entry||''}" oninput="calcSize('${p}')"></div><div class="hint" id="${p}hEntry"></div></div>
-     <div><label>止损价 ($)</label><div class="row"><input id="${p}Stop" type="number" value="${opts.stop||''}" oninput="calcSize('${p}')"></div>${opts.maStops?`<div class="ma-stops" id="${p}MaBtns"></div>`:""}<div class="hint" id="${p}hStop"></div></div>
+     <div><label>止损价 ($)</label><div class="row"><input id="${p}Stop" type="number" value="${opts.stop||''}" oninput="onStopInput('${p}')"></div><div class="hint" id="${p}hStop"></div></div>
+     ${opts.maStops?`<div class="ma-stops-row"><div class="ma-stops" id="${p}MaBtns"></div></div>`:""}
      <div><label>① 总买入仓位上限</label><div class="row"><input id="${p}MaxPos" type="number" value="${posVal}" oninput="calcSize('${p}')">${unitSel("MaxPosUnit",posUnit)}</div><div class="hint" id="${p}hPos"></div></div>
      <div><label>② 总风险上限(最多亏)</label><div class="row"><input id="${p}MaxRisk" type="number" value="${riskVal}" oninput="calcSize('${p}')">${unitSel("MaxRiskUnit",riskUnit)}</div><div class="hint" id="${p}hRisk"></div></div>
    </div>
