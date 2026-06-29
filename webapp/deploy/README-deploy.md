@@ -5,7 +5,7 @@
 ## 架构
 
 ```
-浏览器 → Cloudflare(TLS + Access 登录) → Tunnel → ECS 上 127.0.0.1:8000(Docker/gunicorn)
+浏览器 → Cloudflare(TLS + Access 登录) → Tunnel → ECS 上 127.0.0.1:8799(Docker/gunicorn)
 ```
 
 ---
@@ -14,11 +14,15 @@
 
 - 已 `git clone` fork 到 `~/finance-skills`
 - 已 **Docker 构建并运行**容器 `finance-dash`(`--restart unless-stopped`,开机自启)
-- 端口**只绑 `127.0.0.1:8000`**,公网无法直连(已用 `ss` 验证仅 loopback)
+- 端口**只绑 `127.0.0.1:8799`**,公网无法直连(已用 `ss` 验证仅 loopback)
 - yfinance 在服务器实测正常,数据库挂载在 `~/finance-dash-data`
 - `cloudflared` 已安装
 
 所以下面的「第 1 步:跑应用」**已经做完**,你回来后从「第 2 步 Cloudflare Tunnel」开始即可。
+
+> **实际线上状态(2026-06-29 更新)**:本应用对外域名为 `stock.traderjiao.com`,走 **token 托管(远程管理)隧道 `stock-seoul`**,在 ECS 上以**独立** systemd 服务 `cloudflared-stock.service` 运行(回源 `127.0.0.1:8799`),与服务器上已有的 `cloudflared.service`(tv-relay)并存、互不覆盖。Access 策略限 `xnch6384@gmail.com`。
+> 下面「第 2 步」描述的是 `cloudflared tunnel login/create` **本地管理隧道**的手动备选流程;实际部署用的是 token 托管方式。**多隧道并存时严禁** `sudo cloudflared service install <token>`(会覆盖默认 `cloudflared.service`),应改建独立服务。
+> 端口分配见服务器上的 `~/SERVER-PORTS.md`。
 
 ## 🚀 你回来后只需做这几步(Cloudflare,约 10 分钟)
 
@@ -49,7 +53,7 @@ sudo systemctl status cloudflared
 ```bash
 cd ~/finance-skills && git pull
 cd webapp && docker build -t finance-dash . && docker rm -f finance-dash && \
-docker run -d --name finance-dash --restart unless-stopped -p 127.0.0.1:8000:8000 -v ~/finance-dash-data:/data finance-dash
+docker run -d --name finance-dash --restart unless-stopped -p 127.0.0.1:8799:8000 -v ~/finance-dash-data:/data finance-dash
 ```
 备份数据(持仓/自选/预警):直接拷 `~/finance-dash-data/dashboard.db`。
 
@@ -72,11 +76,11 @@ python3 -c "import yfinance as yf; print(yf.Ticker('AAPL').fast_info['lastPrice'
 cd ~/finance-skills/webapp
 docker build -t finance-dash .
 docker run -d --name finance-dash --restart unless-stopped \
-  -p 127.0.0.1:8000:8000 \
+  -p 127.0.0.1:8799:8000 \
   -v ~/finance-dash-data:/data \
   finance-dash
 ```
-- `-p 127.0.0.1:8000:8000` 只绑回环,公网无法直连。
+- `-p 127.0.0.1:8799:8000` 只绑回环,公网无法直连。
 - 数据库持久化在 `~/finance-dash-data`。
 - 更新:`git pull && docker build -t finance-dash . && docker rm -f finance-dash && <上面的 run 命令>`。
 
@@ -89,7 +93,7 @@ python3 -m venv .venv
 sudo cp deploy/finance-dashboard.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now finance-dashboard
 systemctl status finance-dashboard      # 确认 running
-curl -s localhost:8000/api/market | head -c 100   # 自测
+curl -s localhost:8799/api/market | head -c 100   # 自测
 ```
 
 ## 2. Cloudflare Tunnel
@@ -118,7 +122,7 @@ Cloudflare 控制台 → **Zero Trust** → **Access** → **Applications** → 
 
 ```bash
 # 公网直连应用端口应失败(确认未裸露)
-curl --max-time 5 http://<ECS公网IP>:8000/    # 期望:超时/拒绝
+curl --max-time 5 http://<ECS公网IP>:8799/    # 期望:超时/拒绝
 
 # 域名访问应先要求 Cloudflare 登录
 ```
