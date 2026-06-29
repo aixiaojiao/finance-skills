@@ -53,8 +53,11 @@ sudo systemctl status cloudflared
 ```bash
 cd ~/finance-skills && git pull
 cd webapp && docker build -t finance-dash . && docker rm -f finance-dash && \
-docker run -d --name finance-dash --restart unless-stopped -p 127.0.0.1:8799:8000 -v ~/finance-dash-data:/data finance-dash
+docker run -d --name finance-dash --restart unless-stopped \
+  --env-file ~/finance-dash.env \
+  -p 127.0.0.1:8799:8000 -v ~/finance-dash-data:/data finance-dash
 ```
+> **`--env-file ~/finance-dash.env` 必带**:内含 `TG_RELAY_WEBHOOK`(每日盘后总结 / 告警推送经 tv-relay 转 Telegram 用)。该文件由 tv-relay 的 `TV_RELAY_SECRET` 派生而来(`https://tv-relay.traderjiao.com/tv/<SECRET>/webapp`),权限 600,**不入库**。漏带这个参数会导致推送通道未配置(`configured:false`),日报与告警都发不出去。
 备份数据(持仓/自选/预警):直接拷 `~/finance-dash-data/dashboard.db`。
 
 ---
@@ -76,10 +79,12 @@ python3 -c "import yfinance as yf; print(yf.Ticker('AAPL').fast_info['lastPrice'
 cd ~/finance-skills/webapp
 docker build -t finance-dash .
 docker run -d --name finance-dash --restart unless-stopped \
+  --env-file ~/finance-dash.env \
   -p 127.0.0.1:8799:8000 \
   -v ~/finance-dash-data:/data \
   finance-dash
 ```
+- `--env-file ~/finance-dash.env` 提供 `TG_RELAY_WEBHOOK`(经 tv-relay 转 Telegram;见上文说明)。
 - `-p 127.0.0.1:8799:8000` 只绑回环,公网无法直连。
 - 数据库持久化在 `~/finance-dash-data`。
 - 更新:`git pull && docker build -t finance-dash . && docker rm -f finance-dash && <上面的 run 命令>`。
