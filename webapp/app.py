@@ -544,6 +544,123 @@ def _alert_check_and_push():
     return sent
 
 
+# ============================ 每日盘后总结(Telegram 日报) ============================
+# 收盘后约 1 小时(美东 17:00)推一份:大盘 + 板块 + 自选股 SEPA 概览。
+# 复用 tv-relay → Telegram 的同一通道(_tg_send)。开关:settings.dailyReportEnabled(默认开)。
+
+def _daily_report_enabled():
+    con = _cache_db()
+    try:
+        r = con.execute("SELECT value FROM settings WHERE key='dailyReportEnabled'").fetchone()
+    finally:
+        con.close()
+    return (r is None) or str(r[0]) != "0"     # 用户已明确要日报:默认开,显式设 '0' 才关
+
+
+def _money(v):
+    return "—" if v is None else f"{v:,.2f}"
+
+
+def _signed_pct(v):
+    return "—" if v is None else f"{v:+.2f}%"
+
+
+def _chg_mark(v):
+    return "⬜" if v is None else ("🟢" if v > 0 else ("🔴" if v < 0 else "⬜"))
+
+
+def build_daily_report():
+    """组装盘后总结的 HTML 文本(Telegram parse_mode=HTML)。"""
+    sess = last_expected_session()
+    L = [f"📊 <b>盘后总结 · {sess}</b>(美东收盘)"]
+
+    # —— 大盘 ——
+    try:
+        m = _market_overview()
+    except Exception:
+        m = None
+    if m:
+        L += ["", "<b>🌎 大盘</b>"]
+
+        def idx_line(name, x):
+            if not x:
+                return f"{name} —"
+            vs200 = "↑200日线" if x.get("above200") else ("↓200日线" if x.get("above200") is False else "")
+            s = f"{name} {_money(x.get('price'))} {_signed_pct(x.get('changePct'))}"
+            if vs200:
+                s += f" · {vs200}"
+            if x.get("rsi") is not None:
+                s += f" · RSI {x['rsi']:.0f}"
+            return s
+        L.append(idx_line("标普500", m.get("spx")))
+        L.append(idx_line("纳指", m.get("ndx")))
+        tail = f"环境 {m.get('environment', '—')} · 情绪 {m.get('sentimentLabel', '—')}"
+        if m.get("sentiment") is not None:
+            tail += f"({m['sentiment']})"
+        if m.get("vix") is not None:
+            tail = f"VIX {m['vix']:.1f} · " + tail
+        L.append(tail)
+
+    # —— 板块 ——
+    try:
+        hm = compute_heatmap()
+    except Exception:
+        hm = None
+    etfs = [e for e in (hm or {}).get("sectorEtfs", []) if e.get("change") is not None] if hm else []
+    if etfs:
+        etfs.sort(key=lambda e: -e["change"])
+
+        def sec_str(e):
+            return f"{e['sector'].split(' ')[0]}{e['etf']} {_signed_pct(e['change'])}"
+        L += ["", "<b>🧩 板块(当日 ETF)</b>"]
+        L.append("强 " + " · ".join(sec_str(e) for e in etfs[:3]))
+        L.append("弱 " + " · ".join(sec_str(e) for e in list(reversed(etfs[-3:]))))
+
+    # —— 自选股(逐只 SEPA 概览)——
+    con = _cache_db()
+    try:
+        wl = [r[0] for r in con.execute("SELECT ticker FROM watchlist ORDER BY sort, added_at, ticker")]
+    finally:
+        con.close()
+    if wl:
+        L += ["", "<b>⭐ 自选股</b>"]
+        for tk in wl:
+            s = _compute_sepa(tk)
+            if "error" in s:
+                L.append(f"{_chg_mark(None)} <b>{tk}</b> — {s['error']}")
+                continue
+            verdict = (s.get("verdict") or "").split(" · ")[-1]
+            L.append(f"{_chg_mark(s.get('changePct'))} <b>{tk}</b> {_money(s.get('price'))} "
+                     f"{_signed_pct(s.get('changePct'))} · {s.get('stage', '')} · "
+                     f"模板{s.get('passed')}/{s.get('total')} · {verdict}")
+
+    L += ["", "<i>数据 yfinance(延迟);SEPA 趋势模板评分,仅供参考,非投资建议。</i>"]
+    return "\n".join(L)
+
+
+def send_daily_report():
+    """组装并经 tv-relay 推送盘后总结。返回 (ok, info, text)。"""
+    text = build_daily_report()
+    ok, info = _tg_send(text)
+    return ok, info, text
+
+
+def _daily_report_loop():
+    # 每个交易日美东 17:00(收盘后 1 小时)推送一次盘后总结。
+    while True:
+        et = datetime.now(ZoneInfo("America/New_York"))
+        target = et.replace(hour=17, minute=0, second=0, microsecond=0)
+        if target <= et:
+            target += timedelta(days=1)
+        time.sleep(max(60, (target - et).total_seconds()))
+        try:
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            if now_et.weekday() < 5 and _tg_relay_webhook() and _daily_report_enabled():
+                send_daily_report()
+        except Exception:
+            pass
+
+
 def _alert_push_loop():
     # 盘中每 ALERT_PUSH_INTERVAL 秒检查一次(开关关闭/盘后则空转)。
     while True:
@@ -578,6 +695,7 @@ def start_scheduler():
     start_scheduler._started = True
     threading.Thread(target=_scheduler_loop, name="kline-scheduler", daemon=True).start()
     threading.Thread(target=_alert_push_loop, name="alert-push", daemon=True).start()
+    threading.Thread(target=_daily_report_loop, name="daily-report", daemon=True).start()
 
 
 # ---- 以下接口此前每次请求都现拉 yfinance,统一加缓存(keep_empty=False:不缓存失败值) ----
@@ -784,21 +902,20 @@ def _benchmark_close():
     return None
 
 
-@app.route("/api/sepa")
-def api_sepa():
-    ticker = (request.args.get("ticker") or "").strip().upper()
-    if not ticker:
-        return jsonify({"error": "缺少 ticker 参数"}), 400
+def _compute_sepa(ticker):
+    """SEPA 趋势模板分析,返回结果 dict;失败返回带 error/_status 的 dict。供 API 与日报复用。"""
     try:
         df = get_history_df(ticker, "2y").copy()
         info = get_info(ticker)
     except Exception as e:
-        return jsonify({"error": f"获取失败: {e}"}), 502
+        return {"error": f"获取失败: {e}", "_status": 502}
     if df is None or df.empty or len(df) < 60:
-        return jsonify({"error": "历史数据不足,无法做 SEPA 分析"}), 404
+        return {"error": "历史数据不足,无法做 SEPA 分析", "_status": 404}
 
     close = df["Close"]
     price = _num(close.iloc[-1])
+    prev = _num(close.iloc[-2]) if len(close) >= 2 else None
+    change_pct = ((price / prev - 1) * 100) if (price and prev) else None
     ma50 = _num(close.rolling(50).mean().iloc[-1])
     ma150 = _num(close.rolling(150).mean().iloc[-1]) if len(df) >= 150 else None
     ma200 = _num(close.rolling(200).mean().iloc[-1]) if len(df) >= 200 else None
@@ -880,11 +997,22 @@ def api_sepa():
     else:
         verdict, vclass = "Pass · 暂不符合", "sell"
 
-    return jsonify({"ticker": ticker, "price": price, "stage": stage, "conditions": conds,
-                    "passed": passed, "total": 8, "fundamentalGrade": fgrade,
-                    "epsGrowth": eps_growth, "revGrowth": _num(info.get("revenueGrowth")),
-                    "verdict": verdict, "verdictClass": vclass,
-                    "rsNote": f"RS 为相对标普500 涨幅代理({('回看'+str(rs_lookback)+'日') if rs_lookback else '窗口自适应'}),非全市场百分位排名"})
+    return {"ticker": ticker, "price": price, "changePct": change_pct, "stage": stage, "conditions": conds,
+            "passed": passed, "total": 8, "fundamentalGrade": fgrade,
+            "epsGrowth": eps_growth, "revGrowth": _num(info.get("revenueGrowth")),
+            "verdict": verdict, "verdictClass": vclass,
+            "rsNote": f"RS 为相对标普500 涨幅代理({('回看'+str(rs_lookback)+'日') if rs_lookback else '窗口自适应'}),非全市场百分位排名"}
+
+
+@app.route("/api/sepa")
+def api_sepa():
+    ticker = (request.args.get("ticker") or "").strip().upper()
+    if not ticker:
+        return jsonify({"error": "缺少 ticker 参数"}), 400
+    res = _compute_sepa(ticker)
+    if "error" in res:
+        return jsonify({"error": res["error"]}), res.get("_status", 502)
+    return jsonify(res)
 
 
 # ============================ API: 财报 ============================
@@ -1019,8 +1147,7 @@ def _index_snapshot(symbol):
             "rsi": _num(rsi(c).iloc[-1]) if len(c) >= 15 else None}
 
 
-@app.route("/api/market")
-def api_market():
+def _market_overview():
     spx = _index_snapshot("^GSPC")
     ndx = _index_snapshot("^IXIC")
     vix = None
@@ -1046,9 +1173,14 @@ def api_market():
         parts.append(max(0, min(100, spx["rsi"])))
     sentiment = round(sum(parts) / len(parts)) if parts else None
     slabel = "—" if sentiment is None else ("极度恐慌" if sentiment < 25 else "恐慌" if sentiment < 45 else "中性" if sentiment <= 55 else "贪婪" if sentiment <= 75 else "极度贪婪")
-    return jsonify({"spx": spx, "ndx": ndx, "vix": vix, "environment": env, "environmentClass": env_class,
-                    "sentiment": sentiment, "sentimentLabel": slabel,
-                    "note": "情绪为 VIX/指数趋势/RSI 合成代理"})
+    return {"spx": spx, "ndx": ndx, "vix": vix, "environment": env, "environmentClass": env_class,
+            "sentiment": sentiment, "sentimentLabel": slabel,
+            "note": "情绪为 VIX/指数趋势/RSI 合成代理"}
+
+
+@app.route("/api/market")
+def api_market():
+    return jsonify(_market_overview())
 
 
 # ============================ API: 自选股批量行情 ============================
@@ -1979,6 +2111,21 @@ def api_notify_test():
         return jsonify({"ok": False, "error": "服务器未配置 TG_RELAY_WEBHOOK(联系部署方设置)"}), 400
     ok, info = _tg_send("✅ 个股看板测试推送 · Telegram 链路正常")
     return jsonify({"ok": ok, "info": str(info)})
+
+
+@app.route("/api/report/daily/preview")
+def api_report_preview():
+    """生成盘后总结文本但不推送(用于预览/确认格式)。"""
+    return jsonify({"text": build_daily_report()})
+
+
+@app.route("/api/report/daily/send", methods=["POST"])
+def api_report_send():
+    """立即组装并推送盘后总结(手动触发;需已配置 webhook,不受日报开关限制)。"""
+    if not _tg_relay_webhook():
+        return jsonify({"ok": False, "error": "服务器未配置 TG_RELAY_WEBHOOK"}), 400
+    ok, info, text = send_daily_report()
+    return jsonify({"ok": ok, "info": str(info), "text": text})
 
 
 @app.route("/api/cache/refresh", methods=["POST"])
