@@ -2006,7 +2006,7 @@ def api_position_one(pid):
         db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=? WHERE id=?",
                    (_num(d.get("exit_price")), time.strftime("%Y-%m-%d"), pid))
     else:
-        for field in ("stop", "target", "note"):
+        for field in ("shares", "entry", "stop", "target", "note"):
             if field in d:
                 db.execute(f"UPDATE positions SET {field}=? WHERE id=?", (_num(d[field]) if field != "note" else d[field], pid))
     db.commit()
@@ -2895,17 +2895,18 @@ async function loadTrack(){
     ${card("仓位占账户",s.investedPct!=null?s.investedPct.toFixed(1)+"%":"—")}
     <div class="card"><div class="k">组合风险敞口</div><div class="v ${(s.riskPct||0)>6?'red':''}">${s.totalRisk!=null?"$"+fmtBig(s.totalRisk):"—"} ${s.riskPct!=null?`(${s.riskPct.toFixed(2)}%)`:""}</div></div>
   </div>`;
+  window._openPos=open;
   const openRows=open.map(p=>{
     const plc=(p.pl||0)>=0?"green":"red";
     const stopc=p.toStopPct!=null&&p.toStopPct<5?"red":"";
-    return `<tr>
+    return `<tr id="posrow-${p.id}">
       <td><b class="wchip" style="cursor:pointer;padding:2px 6px" onclick="loadTicker('${p.ticker}')">${p.ticker}</b></td>
       <td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}</td>
       <td class="${plc}">${p.pl!=null?(p.pl>=0?"+":"")+fmtBig(p.pl):"—"} ${p.plPct!=null?`(${fmtPct(p.plPct)})`:""}</td>
       <td>${fmtNum(p.stop)}</td><td class="${stopc}">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
       <td>${p.rMultiple!=null?p.rMultiple.toFixed(2)+"R":"—"}</td>
       <td class="muted">${p.note||""}</td>
-      <td><a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
+      <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
   const closedRows=closed.map(p=>{
     const pl=(p.exit_price!=null)?(p.exit_price-p.entry)*p.shares:null;
@@ -2949,6 +2950,31 @@ async function closePosition(id,price){
 async function delPosition(id){
   if(!confirm("确认删除该记录?"))return;
   await fetch("/api/positions/"+id,{method:"DELETE"});loadTrack();
+}
+// 行内编辑持仓:股数 / 成本 / 止损 / 目标 / 备注
+function editPosition(id){
+  const p=(window._openPos||[]).find(x=>x.id===id);if(!p)return;
+  const tr=document.getElementById("posrow-"+id);if(!tr)return;
+  const ist='type="number" style="width:72px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px"';
+  const esc=s=>String(s==null?"":s).replace(/"/g,"&quot;");
+  tr.innerHTML=`<td><b>${p.ticker}</b></td>
+    <td><input id="ep-shares-${id}" ${ist} value="${p.shares??""}"></td>
+    <td><input id="ep-entry-${id}" ${ist} value="${p.entry??""}"></td>
+    <td class="muted">${fmtNum(p.price)}</td>
+    <td class="muted">—</td>
+    <td><input id="ep-stop-${id}" ${ist} value="${p.stop??""}" placeholder="止损"></td>
+    <td colspan="2"><input id="ep-target-${id}" ${ist} value="${p.target??""}" placeholder="目标价"></td>
+    <td><input id="ep-note-${id}" value="${esc(p.note)}" style="width:120px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px" placeholder="备注"></td>
+    <td><a onclick="savePosition(${id})">存</a> · <a onclick="loadTrack()">取消</a></td>`;
+}
+async function savePosition(id){
+  const v=s=>{const e=document.getElementById("ep-"+s+"-"+id);return e?e.value.trim():"";};
+  const numOrNull=x=>x===""?null:parseFloat(x);
+  const shares=parseFloat(v("shares")),entry=parseFloat(v("entry"));
+  if(!(shares>0)||!(entry>0)){alert("股数/买入价必须为正数");return;}
+  const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note")};
+  await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  loadTrack();
 }
 
 // ---------- 估值 ----------
