@@ -95,6 +95,8 @@ webapp/.venv/bin/python webapp/app.py
 | `/api/options/chain?ticker=AAPL&expiry=YYYY-MM-DD` | 期权链 |
 | `/api/heatmap` | 全市场个股 + 板块热力图(`?force=1` 盘中强制刷新;盘后恒用缓存) |
 | `/api/heatmap/sectors` (GET/POST) | 读取/覆盖自定义板块配置(GET 含内置默认) |
+| `/api/notify/status` | Telegram 推送开关状态 + 是否已配置推送通道 |
+| `/api/notify/test` (POST) | 发送一条测试推送(验证链路) |
 | `/api/cache/refresh` (POST) | 手动触发 K线缓存增量更新(`?ticker=AAPL` 单只;无参刷新自选股∪持仓) |
 | `/api/cache/status` | 缓存概览(每个标的已存日线区间、行数、上次拉取时间) |
 
@@ -108,6 +110,19 @@ gunicorn -w 2 -b 0.0.0.0:8000 'app:app'
 ```
 
 再用 Nginx/Caddy 反代到你的域名即可。也可容器化部署(Dockerfile 可按需补充)。
+
+## Telegram 告警推送(个人持仓/组合)
+
+webapp 的预警(到价/触止损/跌破20MA)+ **持仓止损/目标** 可推送到 Telegram,**复用 tv-relay 中转**(webapp 不存 bot token)。
+盘中后台每 ~3 分钟轮询、触发推一次(去重,条件回落后重新武装);**网页有全局开关,默认关,关→完全不推**。
+分工:个人持仓/组合告警走这里;市场技术形态(突破/急拉)走 TradingView/Pine。
+
+**激活(部署方设置一个环境变量即可)**:给 finance-dash 容器设 `TG_RELAY_WEBHOOK` 指向中转的 webapp 端点:
+```bash
+# 推荐用公网 URL(容器走正常 egress,无需改 docker 网络;secret 从中转 env 取)
+-e TG_RELAY_WEBHOOK="https://tv-relay.traderjiao.com/tv/<TV_RELAY_SECRET>/webapp"
+```
+未设置该变量时,推送功能不可用(网页开关置灰)。设置后在网页打开开关即生效。
 
 ## 文档
 

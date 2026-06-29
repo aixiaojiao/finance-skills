@@ -102,6 +102,11 @@ def init_db():
         sector TEXT NOT NULL, ticker TEXT NOT NULL,
         PRIMARY KEY(sector, ticker)
     );
+    -- 告警推送去重:key=alert:<id> / pos:<id>:stop / pos:<id>:target,记录已推送时间;
+    -- 触发时推一次并落 key,条件回落(不再触发)时删 key 以便重新武装。
+    CREATE TABLE IF NOT EXISTS notify_state(
+        key TEXT PRIMARY KEY, fired_at TEXT
+    );
     """)
     # 自选股默认值(仅首次为空时)
     cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
@@ -387,6 +392,159 @@ def refresh_tracked_bars():
     return res
 
 
+# ============================ 告警 Telegram 推送(个人持仓/组合) ============================
+# 投递复用首尔本机的 tv-relay:把告警文本 POST 到 TG_RELAY_WEBHOOK(形如
+#   http://127.0.0.1:8080/tv/<SECRET>/webapp),由中转转 Telegram —— webapp 本身不存 bot token。
+# 全局开关 settings.telegramPushEnabled(默认 '0' 关闭);关闭或未配置 webhook 则完全不推。
+# 盘中后台每 ~3 分钟轮询「自选/持仓告警」,新触发的推一次(notify_state 去重),条件回落后重新武装。
+
+import urllib.request as _urlreq  # noqa: E402
+
+ALERT_PUSH_INTERVAL = 180  # 盘中轮询间隔(秒)
+
+
+def _tg_relay_webhook():
+    return os.environ.get("TG_RELAY_WEBHOOK", "").strip()
+
+
+def _tg_send(text):
+    """把一条文本经本机 tv-relay 转发到 Telegram。返回 (ok, info)。未配置则不发。"""
+    url = _tg_relay_webhook()
+    if not url:
+        return False, "TG_RELAY_WEBHOOK 未配置"
+    try:
+        data = json.dumps({"text": text, "parse_mode": "HTML"}).encode("utf-8")
+        req = _urlreq.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            return True, resp.status
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def _push_enabled():
+    con = _cache_db()
+    try:
+        r = con.execute("SELECT value FROM settings WHERE key='telegramPushEnabled'").fetchone()
+    finally:
+        con.close()
+    return bool(r) and str(r[0]) == "1"
+
+
+def _fired_keys():
+    con = _cache_db()
+    try:
+        return {r[0] for r in con.execute("SELECT key FROM notify_state")}
+    finally:
+        con.close()
+
+
+def _mark_fired(key):
+    con = _cache_db()
+    try:
+        con.execute("INSERT INTO notify_state(key, fired_at) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET fired_at=excluded.fired_at",
+                    (key, time.strftime("%Y-%m-%d %H:%M:%S")))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _clear_fired(keys):
+    if not keys:
+        return
+    con = _cache_db()
+    try:
+        con.executemany("DELETE FROM notify_state WHERE key=?", [(k,) for k in keys])
+        con.commit()
+    finally:
+        con.close()
+
+
+def _alert_text(kind, level):
+    return {"above": f"≥ {level}", "below": f"≤ {level}", "stop": f"触止损 ≤ {level}",
+            "break_ma20": "跌破 20MA"}.get(kind, kind)
+
+
+def _collect_alert_events():
+    """汇总「自选股手动告警 + 持仓止损/目标」的触发事件。返回 [{key, ticker, text, triggered}]。
+    个人化:只覆盖与你的告警/持仓绑定的条件,市场技术形态交给 TradingView/Pine。"""
+    con = _cache_db()
+    try:
+        alerts = [dict(zip(("id", "ticker", "kind", "level"), r)) for r in con.execute(
+            "SELECT id, ticker, kind, level FROM alerts WHERE active=1")]
+        positions = [dict(zip(("id", "ticker", "stop", "target", "entry"), r)) for r in con.execute(
+            "SELECT id, ticker, stop, target, entry FROM positions WHERE status='open'")]
+    finally:
+        con.close()
+    tickers = {a["ticker"] for a in alerts} | {p["ticker"] for p in positions}
+    if not tickers:
+        return []
+    live = _live_prices(list(tickers))
+    events = []
+    for a in alerts:
+        lp = live.get(a["ticker"], {})
+        price, ma20 = lp.get("price"), lp.get("ma20")
+        if price is None:
+            continue
+        lv = a["level"]
+        trig = False
+        if a["kind"] == "above" and lv is not None:
+            trig = price >= lv
+        elif a["kind"] in ("below", "stop") and lv is not None:
+            trig = price <= lv
+        elif a["kind"] == "break_ma20" and ma20:
+            trig = price < ma20
+        events.append({"key": f"alert:{a['id']}", "ticker": a["ticker"], "triggered": trig,
+                       "text": f"🔔 <b>{a['ticker']}</b> {_alert_text(a['kind'], lv)} 已触发(现价 {round(price, 2)})"})
+    for p in positions:
+        lp = live.get(p["ticker"], {})
+        price = lp.get("price")
+        if price is None:
+            continue
+        if p["stop"]:
+            events.append({"key": f"pos:{p['id']}:stop", "ticker": p["ticker"], "triggered": price <= p["stop"],
+                           "text": f"🛑 <b>{p['ticker']}</b> 持仓触止损 {p['stop']}(现价 {round(price, 2)},成本 {p['entry']})"})
+        if p["target"]:
+            events.append({"key": f"pos:{p['id']}:target", "ticker": p["ticker"], "triggered": price >= p["target"],
+                           "text": f"🎯 <b>{p['ticker']}</b> 持仓到目标价 {p['target']}(现价 {round(price, 2)},成本 {p['entry']})"})
+    return events
+
+
+def _alert_check_and_push():
+    """评估并推送。仅在开关开启且 webhook 已配置时动作。返回推送条数。"""
+    if not _push_enabled() or not _tg_relay_webhook():
+        return 0
+    try:
+        events = _collect_alert_events()
+    except Exception:
+        return 0
+    fired = _fired_keys()
+    sent = 0
+    rearm = []
+    for ev in events:
+        if ev["triggered"]:
+            if ev["key"] not in fired:
+                ok, _ = _tg_send(ev["text"])
+                if ok:
+                    _mark_fired(ev["key"])
+                    sent += 1
+        elif ev["key"] in fired:
+            rearm.append(ev["key"])          # 条件回落 → 删除,以便下次再触发可重新推送
+    _clear_fired(rearm)
+    return sent
+
+
+def _alert_push_loop():
+    # 盘中每 ALERT_PUSH_INTERVAL 秒检查一次(开关关闭/盘后则空转)。
+    while True:
+        time.sleep(ALERT_PUSH_INTERVAL)
+        try:
+            if _market_open():
+                _alert_check_and_push()
+        except Exception:
+            pass
+
+
 def _scheduler_loop():
     # 每天 22:10 UTC(美股 EDT 收盘 20:00 / EST 21:00 UTC 之后)刷新重点标的当日 K 线。
     while True:
@@ -409,6 +567,7 @@ def start_scheduler():
         return
     start_scheduler._started = True
     threading.Thread(target=_scheduler_loop, name="kline-scheduler", daemon=True).start()
+    threading.Thread(target=_alert_push_loop, name="alert-push", daemon=True).start()
 
 
 # ---- 以下接口此前每次请求都现拉 yfinance,统一加缓存(keep_empty=False:不缓存失败值) ----
@@ -1744,6 +1903,21 @@ def api_alerts():
     return jsonify({"alerts": rows})
 
 
+@app.route("/api/notify/status")
+def api_notify_status():
+    """前端用:Telegram 推送是否开启 + webhook 是否已配置(决定开关可用性与提示)。"""
+    return jsonify({"enabled": _push_enabled(), "configured": bool(_tg_relay_webhook())})
+
+
+@app.route("/api/notify/test", methods=["POST"])
+def api_notify_test():
+    """发送一条测试推送(验证 webhook 链路);不受开关影响,但需已配置 webhook。"""
+    if not _tg_relay_webhook():
+        return jsonify({"ok": False, "error": "服务器未配置 TG_RELAY_WEBHOOK(联系部署方设置)"}), 400
+    ok, info = _tg_send("✅ 个股看板测试推送 · Telegram 链路正常")
+    return jsonify({"ok": ok, "info": str(info)})
+
+
 @app.route("/api/cache/refresh", methods=["POST"])
 def api_cache_refresh():
     """手动触发 K 线缓存增量更新。?ticker=AAPL 更新单只;无参则刷新自选股∪持仓。"""
@@ -2247,7 +2421,17 @@ async function loadNews(){
 let allAlerts=[];
 async function loadAlerts(){
   try{const d=await j("/api/alerts");allAlerts=d.alerts||[];}catch(e){allAlerts=[];}
+  try{window._notify=await j("/api/notify/status");}catch(e){window._notify={enabled:false,configured:false};}
   renderAlertBanner();renderAlertsPanel();
+}
+async function toggleTgPush(on){
+  setSetting("telegramPushEnabled",on?"1":"0");
+  window._notify=window._notify||{};window._notify.enabled=on;
+  renderAlertsPanel();
+}
+async function testTgPush(){
+  const r=await(await fetch("/api/notify/test",{method:"POST"})).json();
+  alert(r.ok?"已发送测试推送,去 Telegram 看一眼":("测试失败: "+(r.error||r.info||"")));
 }
 function renderAlertBanner(){
   const el=document.getElementById("alertBanner");if(!el)return;
@@ -2259,7 +2443,14 @@ function renderAlertsPanel(){
   const el=document.getElementById("alertsPanel");if(!el)return;
   const mine=allAlerts.filter(a=>a.ticker===curTicker);
   const rows=mine.map(a=>`<span class="leg-tag">${alertText(a)} ${a.triggered?'<span class="red">●触发</span>':'<span class="muted">待触发</span>'} <a style="color:var(--red)" onclick="delAlert(${a.id})">✕</a></span>`).join("");
-  el.innerHTML=`<div class="cmpbar">
+  const n=window._notify||{enabled:false,configured:false};
+  const pushBar=`<div class="cmpbar" style="margin-bottom:8px;align-items:center">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600">
+      <input type="checkbox" ${n.enabled?"checked":""} ${n.configured?"":"disabled"} onchange="toggleTgPush(this.checked)">
+      🔔 Telegram 推送(全局)</label>
+    <span class="muted" style="font-size:12px">${n.configured?(n.enabled?"已开启 · 盘中自动推送你的预警与持仓止损/目标(关→不推送)":"已关闭 · 不会推送任何消息"):"服务器未配置推送通道(TG_RELAY_WEBHOOK)"}</span>
+    ${n.configured?'<button class="search" style="margin:0" onclick="testTgPush()">测试推送</button>':""}</div>`;
+  el.innerHTML=pushBar+`<div class="cmpbar">
     <select id="alKind" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px;border-radius:8px"><option value="above">价格 ≥</option><option value="below">价格 ≤</option><option value="stop">触及止损 ≤</option><option value="break_ma20">跌破20MA</option></select>
     <input id="alLevel" type="number" placeholder="价格" style="width:100px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
     <button class="search" style="margin:0" onclick="addAlert()">为 ${curTicker} 添加预警</button>
