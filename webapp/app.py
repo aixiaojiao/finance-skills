@@ -684,32 +684,70 @@ def api_quote():
 
 # ============================ API: K线 + 均线 ============================
 
-FETCH_MAP = {"1mo": "1y", "3mo": "2y", "6mo": "2y", "1y": "2y", "2y": "5y", "5y": "max"}
-DISPLAY_BARS = {"1mo": 22, "3mo": 66, "6mo": 126, "1y": 252, "2y": 504, "5y": 1300}
 MA_WINDOWS = [5, 10, 20, 50, 200]
+
+# 时间周期 = 单根 K 线代表的时长(timeframe),而非「看多长历史」。本系统只看趋势,
+# 不做盘中实时(实时报警交由 TradingView),故最小周期为 4h,不提供 4h 以下日内档。
+# 每档配:(yfinance interval, 拉取窗口, 显示根数, 重采样规则)
+#   · 4h Yahoo 不原生支持 → 拉 1h(Yahoo 1h 上限 730 天,已实测)后端重采样合成。
+#   · 1d 走 SQLite 缓存路径(get_history_df interval=1d);其余走 _yf_history。
+INTERVAL_CFG = {
+    "4h":  {"yf": "60m", "fetch": "730d", "bars": 360, "resample": "4h",  "intraday": True},
+    "1d":  {"yf": "1d",  "fetch": "2y",   "bars": 252, "resample": None,  "intraday": False},
+    "1w":  {"yf": "1wk", "fetch": "max",  "bars": 260, "resample": None,  "intraday": False},
+}
+DEFAULT_INTERVAL = "1d"
+
+
+def _resample_ohlc(df, rule):
+    """把更细周期的 OHLCV 重采样成 rule(如 '4h')。"""
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    cols = [c for c in agg if c in df.columns]
+    # origin="start":桶从首根 K(美股为 09:30 开盘)起算;24h 可被 4h 整除 → 每日对齐到 09:30/13:30。
+    out = df[cols].resample(rule, label="left", closed="left", origin="start").agg(
+        {c: agg[c] for c in cols}).dropna(subset=["Open"])
+    return out
+
+
+def _bar_time(idx, intraday):
+    """K 线时间字段:日线/周线用 YYYY-MM-DD(business day);日内用 UNIX 秒。
+    日内把交易所(美东)墙钟时间当作 UTC 输出,使 lightweight-charts 直接显示美东时分。"""
+    if not intraday:
+        return idx.strftime("%Y-%m-%d")
+    ts = idx
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(ZoneInfo("America/New_York")).tz_localize(None)
+    return int(ts.tz_localize(ZoneInfo("UTC")).timestamp())
 
 
 @app.route("/api/history")
 def api_history():
     ticker = (request.args.get("ticker") or "").strip().upper()
-    period = request.args.get("period", "6mo")
+    period = request.args.get("period", DEFAULT_INTERVAL)
+    cfg = INTERVAL_CFG.get(period) or INTERVAL_CFG[DEFAULT_INTERVAL]
     if not ticker:
         return jsonify({"error": "缺少 ticker 参数"}), 400
     try:
-        df = get_history_df(ticker, FETCH_MAP.get(period, "2y")).copy()
+        df = get_history_df(ticker, cfg["fetch"], cfg["yf"]).copy()
     except Exception as e:
         return jsonify({"error": f"获取历史失败: {e}"}), 502
     if df is None or df.empty:
         return jsonify({"error": "无历史数据"}), 404
 
+    if cfg["resample"]:
+        df = _resample_ohlc(df, cfg["resample"])
+        if df.empty:
+            return jsonify({"error": "无历史数据"}), 404
+
+    intraday = cfg["intraday"]
     for w in MA_WINDOWS:
         df[f"ma{w}"] = df["Close"].rolling(w).mean()
-    df = df.tail(DISPLAY_BARS.get(period, 126))
+    df = df.tail(cfg["bars"])
 
     candles, volumes = [], []
     ma_series = {str(w): [] for w in MA_WINDOWS}
     for idx, row in df.iterrows():
-        ts = idx.strftime("%Y-%m-%d")
+        ts = _bar_time(idx, intraday)
         o, h, l, c = _num(row.get("Open")), _num(row.get("High")), _num(row.get("Low")), _num(row.get("Close"))
         if None in (o, h, l, c):
             continue
@@ -721,7 +759,8 @@ def api_history():
             mv = _num(row.get(f"ma{w}"))
             if mv is not None:
                 ma_series[str(w)].append({"time": ts, "value": mv})
-    return jsonify({"ticker": ticker, "candles": candles, "volumes": volumes, "ma": ma_series})
+    return jsonify({"ticker": ticker, "candles": candles, "volumes": volumes,
+                    "ma": ma_series, "interval": period, "intraday": intraday})
 
 
 # ============================ API: SEPA ============================
@@ -2162,7 +2201,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 const POPULAR=["AAPL","TSLA","NVDA","MSFT","GOOGL","AMZN","META","AMD"];
 const MA_COLORS={"5":"#f6c343","10":"#ff9f40","20":"#58a6ff","50":"#a78bfa","200":"#e6edf3"};
 const MA_DEFAULT_ON={"5":false,"10":false,"20":true,"50":true,"200":true};
-let chart,candleSeries,volSeries,maSeries={},curTicker="AAPL",curPeriod="6mo",curTab="overview",curPage="stock";
+let chart,candleSeries,volSeries,maSeries={},curTicker="AAPL",curPeriod="1d",curTab="overview",curPage="stock";
 let loadedTabs={};
 let watchlist=[];
 
@@ -2255,7 +2294,7 @@ function renderOverview(q){
    <div id="decisionCard" style="margin-bottom:16px"></div>
    <div class="ov-grid">
     <div class="ov-main">
-     <div class="controls">${["1mo","3mo","6mo","1y","2y","5y"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}<label style="margin-left:6px"><input type="checkbox" id="wallOverlay" onchange="toggleOptionWall(this.checked)"><span style="color:#f6c343">期权墙</span></label></span></div>
+     <div class="controls">${["4h","1d","1w"].map(p=>`<button class="${p===curPeriod?'active':''}" onclick="loadChart('${p}')">${p}</button>`).join("")}<span class="ma-toggles">${maToggles}<label style="margin-left:6px"><input type="checkbox" id="wallOverlay" onchange="toggleOptionWall(this.checked)"><span style="color:#f6c343">期权墙</span></label></span></div>
      <div id="chart"></div>
      <div class="section-title">SEPA 趋势模板分析 <span class="tag">skill: sepa-strategy</span></div>
      <div id="sepa"><div class="loading">分析中…</div></div>
@@ -2300,7 +2339,7 @@ function renderMaStopBtns(p){
 
 function initChart(){
   const el=document.getElementById("chart");if(!el)return;
-  chart=LightweightCharts.createChart(el,{layout:{background:{color:"#161b22"},textColor:"#8b949e"},grid:{vertLines:{color:"#21262d"},horzLines:{color:"#21262d"}},rightPriceScale:{borderColor:"#21262d"},timeScale:{borderColor:"#21262d"},crosshair:{mode:0},width:el.clientWidth,height:440});
+  chart=LightweightCharts.createChart(el,{layout:{background:{color:"#161b22"},textColor:"#8b949e"},grid:{vertLines:{color:"#21262d"},horzLines:{color:"#21262d"}},rightPriceScale:{borderColor:"#21262d"},timeScale:{borderColor:"#21262d",timeVisible:true,secondsVisible:false},crosshair:{mode:0},width:el.clientWidth,height:440});
   candleSeries=chart.addCandlestickSeries({upColor:"#26a69a",downColor:"#ef5350",borderVisible:false,wickUpColor:"#26a69a",wickDownColor:"#ef5350"});
   maSeries={};Object.keys(MA_COLORS).forEach(w=>{maSeries[w]=chart.addLineSeries({color:MA_COLORS[w],lineWidth:w==="200"?2:1,priceLineVisible:false,lastValueVisible:false,visible:MA_DEFAULT_ON[w]});});
   volSeries=chart.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:""});volSeries.priceScale().applyOptions({scaleMargins:{top:0.85,bottom:0}});

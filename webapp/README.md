@@ -9,6 +9,7 @@
 **概览**
 - 顶部 **一键决策卡**:聚合 SEPA + 估值 + 期权墙 → 买入/观察/回避 + 建议仓位
 - **K线 + MA5/10/20/50/200** 叠加 + 成交量 +(可选)**期权墙位叠加**(Max Pain / 压力墙 / 支撑墙 / Gamma Flip)
+  - **时间周期 = 单根 K 线代表的时长**:`4h / 1d / 1w`(默认 1d)。本系统只看趋势,不做盘中实时(实时报警交由 TradingView),故最小周期为 4h;`4h` 由 1h 后端重采样合成(Yahoo 不原生提供,1h 数据上限 730 天)
 - **SEPA 趋势模板**评分卡:8 条件 + 四阶段 + 基本面评级 + 结论 — `sepa-strategy`
 - **财报日 / 业绩**:下次财报日、预期 EPS、历史 beat/miss — `earnings-preview`
 - **流动性评分** — `stock-liquidity`、关键财务、分析师评级、新闻流
@@ -82,7 +83,7 @@ webapp/.venv/bin/python webapp/app.py
 |---|---|
 | `/` | 前端页面(双页面 SPA) |
 | `/api/quote?ticker=AAPL` | 报价 + 基本面 + 分析师评级 |
-| `/api/history?ticker=AAPL&period=6mo` | K线 OHLC + 成交量 + MA5/10/20/50/200 |
+| `/api/history?ticker=AAPL&period=1d` | K线 OHLC + 成交量 + MA5/10/20/50/200(`period` 为单根 K 时长:`4h/1d/1w`) |
 | `/api/sepa?ticker=AAPL` | SEPA 趋势模板评分卡 |
 | `/api/earnings?ticker=AAPL` | 财报日 + beat/miss 历史 |
 | `/api/news?ticker=AAPL` | 新闻流 |
