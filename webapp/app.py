@@ -1199,35 +1199,51 @@ def api_option_walls():
     if not strikes:
         return jsonify({"error": "无有效行权价"}), 404
 
+    oi_call = sum(v["oi"] for v in cmap.values())
+    oi_put = sum(v["oi"] for v in pmap.values())
+    vol_call = sum(v["vol"] for v in cmap.values())
+    vol_put = sum(v["vol"] for v in pmap.values())
+    total_oi = oi_call + oi_put
+    total_vol = vol_call + vol_put
+
+    # 墙/MaxPain/GEX 的权重依据:正常用未平仓量 OI;但当 OI 缺失或远小于成交量
+    # (如 OI 隔夜未更新、新上市合约、近月 OI=0 但成交活跃)时,改用 Volume 作代理,
+    # 否则会出现「明明有大量成交却看不到墙」。NVDA 近月即此情形。
+    use_vol = total_oi < 0.1 * total_vol
+    basis = "volume" if use_vol else "oi"
+    wfield = "vol" if use_vol else "oi"
+    def w(m, k):
+        return m.get(k, {}).get(wfield, 0)
+
     # Max Pain:使期权买方总收益(=卖方赔付)最小的结算价
-    # 候选结算价限定在现价 ±40% 区间:避免远端稀疏 OI 把痛点拉到离谱位置(如 spot=1132 却报 70)
+    # 候选结算价限定在现价 ±40% 区间:避免远端稀疏持仓把痛点拉到离谱位置(如 spot=1132 却报 70)
     band = [k for k in strikes if 0.6 * spot <= k <= 1.4 * spot] or strikes
     def payout(S):
         tot = 0.0
         for k in strikes:
-            tot += (cmap.get(k, {}).get("oi", 0)) * max(S - k, 0)
-            tot += (pmap.get(k, {}).get("oi", 0)) * max(k - S, 0)
+            tot += w(cmap, k) * max(S - k, 0)
+            tot += w(pmap, k) * max(k - S, 0)
         return tot
     max_pain = min(band, key=payout)
 
-    # OI 墙
-    call_walls = sorted([{"strike": k, "oi": cmap[k]["oi"]} for k in cmap if cmap[k]["oi"] > 0],
+    # 墙(按所选依据:OI 或成交量)
+    call_walls = sorted([{"strike": k, "oi": w(cmap, k)} for k in cmap if w(cmap, k) > 0],
                         key=lambda x: -x["oi"])[:6]
-    put_walls = sorted([{"strike": k, "oi": pmap[k]["oi"]} for k in pmap if pmap[k]["oi"] > 0],
+    put_walls = sorted([{"strike": k, "oi": w(pmap, k)} for k in pmap if w(pmap, k) > 0],
                        key=lambda x: -x["oi"])[:6]
 
-    # GEX:每档 (OI_call·γ - OI_put·γ)·S²·1%·100(在当前现价下的剖面)
+    # GEX:每档 (权重_call·γ - 权重_put·γ)·S²·1%·100(权重缺 OI 时用成交量代理 → gamma flow)
     gex_by_strike = []
     for k in strikes:
         civ = cmap.get(k, {}).get("iv", 0)
         piv = pmap.get(k, {}).get("iv", 0)
         gc = _bs_gamma(spot, k, T, r, civ) if civ > 0 else 0
         gp = _bs_gamma(spot, k, T, r, piv) if piv > 0 else 0
-        gex = (cmap.get(k, {}).get("oi", 0) * gc - pmap.get(k, {}).get("oi", 0) * gp) * spot * spot * 0.01 * 100
+        gex = (w(cmap, k) * gc - w(pmap, k) * gp) * spot * spot * 0.01 * 100
         gex_by_strike.append({"strike": k, "gex": gex})
     net_gex = sum(x["gex"] for x in gex_by_strike)
 
-    # Gamma Flip:净做市商 gamma 随假设现价 S 变化、由负转正的价位(零伽马)
+    # Gamma Flip:净 gamma 随假设现价 S 变化、由负转正的价位(零伽马)
     def gex_at(S):
         tot = 0.0
         for k in strikes:
@@ -1235,7 +1251,7 @@ def api_option_walls():
             piv = pmap.get(k, {}).get("iv", 0)
             gc = _bs_gamma(S, k, T, r, civ) if civ > 0 else 0
             gp = _bs_gamma(S, k, T, r, piv) if piv > 0 else 0
-            tot += (cmap.get(k, {}).get("oi", 0) * gc - pmap.get(k, {}).get("oi", 0) * gp)
+            tot += (w(cmap, k) * gc - w(pmap, k) * gp)
         return tot * S * S
     gamma_flip = None
     lo_s, hi_s = spot * 0.6, spot * 1.4
@@ -1247,7 +1263,6 @@ def api_option_walls():
         s = lo_s + (hi_s - lo_s) * i / steps
         v = gex_at(s)
         if prev_v == 0 or (prev_v < 0 < v) or (prev_v > 0 > v):
-            # 线性插值交叉点
             cross = prev_s if v == prev_v else prev_s + (s - prev_s) * (0 - prev_v) / (v - prev_v)
             if best is None or abs(cross - spot) < abs(best - spot):
                 best = cross
@@ -1255,32 +1270,31 @@ def api_option_walls():
     if best is not None:
         gamma_flip = round(best, 2)
 
-    oi_call = sum(v["oi"] for v in cmap.values())
-    oi_put = sum(v["oi"] for v in pmap.values())
-    vol_call = sum(v["vol"] for v in cmap.values())
-    vol_put = sum(v["vol"] for v in pmap.values())
-
-    # 画图档位:取「OI 最大的若干档(即墙)」∪「现价附近若干档」,确保墙一定出现在图里
-    # (此前只取 ATM±40 档,当 OI 集中在远离现价的行权价时,图会全空 → 误以为没获取到数据)
-    def oi_of(k):
-        return (cmap.get(k, {}).get("oi", 0)) + (pmap.get(k, {}).get("oi", 0))
-    top_oi = sorted(strikes, key=lambda k: -oi_of(k))[:28]
+    # 画图档位:取「权重最大的若干档(即墙)」∪「现价附近若干档」,确保墙一定出现在图里
+    def wt_of(k):
+        return w(cmap, k) + w(pmap, k)
+    top = sorted(strikes, key=lambda k: -wt_of(k))[:28]
     near_spot = sorted(strikes, key=lambda k: abs(k - spot))[:18]
-    sel = sorted(set(top_oi) | set(near_spot))
-    oi_dist = [{"strike": k, "call": cmap.get(k, {}).get("oi", 0), "put": pmap.get(k, {}).get("oi", 0)} for k in sel]
+    sel = sorted(set(top) | set(near_spot))
+    dist = [{"strike": k, "call": w(cmap, k), "put": w(pmap, k)} for k in sel]
     sel_set = set(sel)
     gex_dist = [x for x in gex_by_strike if x["strike"] in sel_set]
 
+    note = ("本到期日 OI 缺失/远小于成交量,墙·MaxPain·GEX 改用『成交量』作代理(更反映当日新建仓)。"
+            if use_vol else
+            "墙·MaxPain·GEX 基于未平仓量 OI。") + "GEX 用 BS gamma 估算,Gamma Flip 为净GEX过零点近似。"
+
     return jsonify({
         "ticker": ticker, "expiry": expiry, "spot": spot, "daysToExpiry": round(days, 1),
+        "basis": basis,
         "maxPain": max_pain, "maxPainVsSpot": round((max_pain / spot - 1) * 100, 2),
         "callWalls": call_walls, "putWalls": put_walls,
         "netGex": net_gex, "gammaFlip": gamma_flip,
         "pcRatioOI": round(oi_put / oi_call, 2) if oi_call else None,
         "pcRatioVol": round(vol_put / vol_call, 2) if vol_call else None,
-        "totalOI": oi_call + oi_put, "totalVol": vol_call + vol_put,
-        "oiDist": oi_dist, "gexDist": gex_dist,
-        "note": "GEX 用 BS gamma(IV/剩余到期/无风险利率)估算,Gamma Flip 为累计净GEX过零点近似",
+        "totalOI": total_oi, "totalVol": total_vol,
+        "oiDist": dist, "gexDist": gex_dist,
+        "note": note,
     })
 
 
@@ -2496,7 +2510,7 @@ async function loadOptions(){
     <div class="cmpbar"><span class="muted">到期日</span><select id="wallExpiry" onchange="loadWalls()" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px 10px;border-radius:8px">${exps.map(x=>`<option ${x===def?"selected":""}>${x}</option>`).join("")}</select>
     <span class="muted">现价 <b>${fmtNum(e.spot)}</b></span></div>
     <div id="wallSummary"></div>
-    <div class="two-col" style="margin-top:8px"><div><div class="section-title" style="font-size:14px">未平仓量 OI 分布(墙)</div><div id="oiChart" style="height:420px;border:1px solid var(--border);border-radius:10px"></div></div>
+    <div class="two-col" style="margin-top:8px"><div><div class="section-title" style="font-size:14px">持仓量/成交量 分布(墙)</div><div id="oiChart" style="height:420px;border:1px solid var(--border);border-radius:10px"></div></div>
     <div><div class="section-title" style="font-size:14px">Gamma 敞口 GEX 剖面</div><div id="gexChart" style="height:420px;border:1px solid var(--border);border-radius:10px"></div></div></div>
     <div class="small" id="wallNote"></div>`;
   loadWalls();
@@ -2511,22 +2525,29 @@ async function loadWalls(){
   document.getElementById("wallSummary").innerHTML='<div class="loading">计算期权墙…</div>';
   const d=await j(`/api/options/walls?ticker=${encodeURIComponent(curTicker)}&expiry=${exp}`);
   if(d.error){document.getElementById("wallSummary").innerHTML='<div class="muted">'+d.error+'</div>';return;}
-  if(!d.totalOI){
-    document.getElementById("wallSummary").innerHTML='<div class="muted">该到期日暂无有效未平仓量(OI)数据 — 可能是新上市/流动性低,或 Yahoo 该到期数据缺失。换个到期日(优先月度第三个周五)再试。</div>';
+  if(!d.totalOI && !d.totalVol){
+    document.getElementById("wallSummary").innerHTML='<div class="muted">该到期日暂无有效期权数据(OI 与成交量均为空)— 可能是新上市/流动性低,或 Yahoo 该到期数据缺失。换个到期日(优先月度第三个周五)再试。</div>';
     ['oiChart','gexChart'].forEach(id=>{const el=document.getElementById(id);if(el)echarts.getInstanceByDom(el)?.clear();});
     document.getElementById("wallNote").textContent=d.note||"";
     return;
   }
   window._walls=d;
+  window._wallBasis=d.basis;
+  const isVol=d.basis==="volume";
+  const basisWord=isVol?"成交量":"未平仓量(OI)";
   const gexPos=d.netGex>=0;
   const gexLabel=gexPos?"正 GEX · 倾向钉价/抑制波动":"负 GEX · 放大波动/助涨助跌";
-  const pcBias=d.pcRatioOI==null?"":(d.pcRatioOI<0.7?"偏看涨":(d.pcRatioOI>1.0?"偏看跌":"中性"));
-  document.getElementById("wallSummary").innerHTML=`<div class="grid">
-    <div class="card"><div class="k">Max Pain 最大痛点</div><div class="v">$${fmtNum(d.maxPain)} <span class="${d.maxPainVsSpot>=0?'green':'red'}" style="font-size:13px">(${fmtPct(d.maxPainVsSpot)})</span></div></div>
+  const pcActive=isVol?d.pcRatioVol:d.pcRatioOI;
+  const pcBias=pcActive==null?"":(pcActive<0.7?"偏看涨":(pcActive>1.0?"偏看跌":"中性"));
+  const basisBanner=isVol
+    ?`<div class="error" style="background:rgba(246,195,67,.12);color:var(--yellow);margin-bottom:10px;font-size:13px">⚠ 本到期日<b>未平仓量(OI)缺失</b>(OI 隔夜更新滞后/近月合约常见),墙·MaxPain·GEX 已自动改用<b>成交量(Volume)</b>作代理 — 更反映当日新建仓,但非持仓累计。</div>`
+    :"";
+  document.getElementById("wallSummary").innerHTML=`${basisBanner}<div class="grid">
+    <div class="card"><div class="k">Max Pain 最大痛点 <span class="muted" style="font-size:10px">(${basisWord})</span></div><div class="v">$${fmtNum(d.maxPain)} <span class="${d.maxPainVsSpot>=0?'green':'red'}" style="font-size:13px">(${fmtPct(d.maxPainVsSpot)})</span></div></div>
     <div class="card"><div class="k">净 Gamma 敞口</div><div class="v ${gexPos?'green':'red'}" style="font-size:15px">${gexLabel}</div></div>
     ${card("Gamma Flip 翻转点",d.gammaFlip!=null?"$"+fmtNum(d.gammaFlip):"—")}
-    <div class="card"><div class="k">Put/Call 比率(OI)</div><div class="v">${d.pcRatioOI??"—"} <span class="muted" style="font-size:12px">${pcBias}</span></div></div>
-    ${card("Put/Call(成交量)",d.pcRatioVol??"—")}
+    <div class="card"><div class="k">Put/Call 比率(${isVol?'成交量':'OI'})</div><div class="v">${pcActive??"—"} <span class="muted" style="font-size:12px">${pcBias}</span></div></div>
+    ${card("总"+basisWord,fmtBig(isVol?d.totalVol:d.totalOI))}
     ${card("到期天数",d.daysToExpiry+" 天")}
   </div>`;
   document.getElementById("wallNote").textContent=d.note;
@@ -2535,15 +2556,16 @@ async function loadWalls(){
 function drawOIChart(d){
   const el=document.getElementById("oiChart");if(!el)return;echarts.getInstanceByDom(el)?.dispose();
   const ks=d.oiDist.map(x=>x.strike);
+  const suf=d.basis==="volume"?"Vol":"OI";
   const ch=echarts.init(el,'dark');
   ch.setOption({backgroundColor:'#161b22',grid:{left:55,right:20,top:30,bottom:30},
-    legend:{data:['Call OI','Put OI'],textStyle:{color:'#8b949e'},top:4},
+    legend:{data:['Call '+suf,'Put '+suf],textStyle:{color:'#8b949e'},top:4},
     tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},
     xAxis:{type:'value',axisLabel:{color:'#8b949e'},splitLine:{lineStyle:{color:'#21262d'}}},
     yAxis:{type:'category',data:ks,axisLabel:{color:'#8b949e'},inverse:false},
     series:[
-      {name:'Call OI',type:'bar',stack:'x',data:d.oiDist.map(x=>x.call),itemStyle:{color:'rgba(239,83,80,.75)'}},
-      {name:'Put OI',type:'bar',stack:'y',data:d.oiDist.map(x=>-x.put),itemStyle:{color:'rgba(38,166,154,.75)'},
+      {name:'Call '+suf,type:'bar',stack:'x',data:d.oiDist.map(x=>x.call),itemStyle:{color:'rgba(239,83,80,.75)'}},
+      {name:'Put '+suf,type:'bar',stack:'y',data:d.oiDist.map(x=>-x.put),itemStyle:{color:'rgba(38,166,154,.75)'},
        markLine:{symbol:'none',silent:true,data:[
          {yAxis:nearestIdx(ks,d.spot),lineStyle:{color:'#f6c343',type:'dashed'},label:{formatter:'现价',color:'#f6c343'}},
          {yAxis:nearestIdx(ks,d.maxPain),lineStyle:{color:'#58a6ff',type:'dotted'},label:{formatter:'MaxPain',color:'#58a6ff'}}]}}
