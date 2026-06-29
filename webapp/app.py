@@ -2288,7 +2288,8 @@ async function renderWatch(){
 }
 // 点击自选股加载;若刚结束一次拖拽则吞掉这次点击
 function wchipClick(t){if(window._wSuppressClick){window._wSuppressClick=false;return;}loadTicker(t);}
-// 长按自选股方块进入拖拽,上下移动改变顺序,松手持久化
+// 长按自选股方块进入拖拽,上下移动改变顺序,松手立即落定。
+// move/up 监听挂在 document 上(只注册一次),拖拽中重排 DOM 不会丢失 pointerup。
 let _wdrag=null;
 function attachWatchDnD(){
   const cont=document.getElementById("watchlist");if(!cont)return;
@@ -2296,34 +2297,37 @@ function attachWatchDnD(){
     el.addEventListener("pointerdown",e=>{
       if(e.target.classList&&e.target.classList.contains("x"))return;   // 删除按钮不拖
       window._wSuppressClick=false;
-      _wdrag={el,active:false,startY:e.clientY,startX:e.clientX,pid:e.pointerId,
-        timer:setTimeout(()=>{if(!_wdrag)return;_wdrag.active=true;el.classList.add("dragging");try{el.setPointerCapture(_wdrag.pid);}catch(_){}},350)};
+      _wdrag={el,active:false,startY:e.clientY,startX:e.clientX,
+        timer:setTimeout(()=>{if(_wdrag){_wdrag.active=true;el.classList.add("dragging");}},350)};
     });
-    el.addEventListener("pointermove",e=>{
-      if(!_wdrag)return;
-      if(!_wdrag.active){ // 长按未触发前移动过大 → 视作滚动/点击,取消
-        if(Math.abs(e.clientY-_wdrag.startY)>8||Math.abs(e.clientX-_wdrag.startX)>8){clearTimeout(_wdrag.timer);_wdrag=null;}
-        return;}
-      e.preventDefault();
-      const chips=[...cont.querySelectorAll(".wchip")];
-      const after=chips.find(c=>c!==_wdrag.el&&e.clientY<c.getBoundingClientRect().top+c.getBoundingClientRect().height/2);
-      if(after){if(after!==_wdrag.el.nextSibling)cont.insertBefore(_wdrag.el,after);}
-      else if(cont.lastElementChild!==_wdrag.el)cont.appendChild(_wdrag.el);
-    });
-    const end=()=>{
-      if(!_wdrag)return;clearTimeout(_wdrag.timer);
-      if(_wdrag.active){
-        _wdrag.el.classList.remove("dragging");
-        const order=[...cont.querySelectorAll(".wchip")].map(c=>c.id.slice(2));
-        if(order.join()!==watchlist.join()){watchlist=order;persistWatchOrder(order);}
-        window._wSuppressClick=true;   // 阻止松手后紧跟的 click 触发加载
-      }
-      _wdrag=null;
-    };
-    el.addEventListener("pointerup",end);
-    el.addEventListener("pointercancel",end);
   });
 }
+function _wdragMove(e){
+  if(!_wdrag)return;
+  if(!_wdrag.active){ // 长按未触发前移动过大 → 视作滚动/点击,取消
+    if(Math.abs(e.clientY-_wdrag.startY)>8||Math.abs(e.clientX-_wdrag.startX)>8){clearTimeout(_wdrag.timer);_wdrag=null;}
+    return;}
+  e.preventDefault();
+  const cont=document.getElementById("watchlist");if(!cont)return;
+  const chips=[...cont.querySelectorAll(".wchip")];
+  const after=chips.find(c=>c!==_wdrag.el&&e.clientY<c.getBoundingClientRect().top+c.getBoundingClientRect().height/2);
+  if(after){if(after!==_wdrag.el.nextSibling)cont.insertBefore(_wdrag.el,after);}
+  else if(cont.lastElementChild!==_wdrag.el)cont.appendChild(_wdrag.el);
+}
+function _wdragEnd(){
+  if(!_wdrag)return;clearTimeout(_wdrag.timer);
+  if(_wdrag.active){
+    _wdrag.el.classList.remove("dragging");
+    const cont=document.getElementById("watchlist");
+    const order=[...cont.querySelectorAll(".wchip")].map(c=>c.id.slice(2));
+    if(order.join()!==watchlist.join()){watchlist=order;persistWatchOrder(order);}
+    window._wSuppressClick=true;   // 阻止松手后紧跟的 click 触发加载
+  }
+  _wdrag=null;
+}
+document.addEventListener("pointermove",_wdragMove,{passive:false});
+document.addEventListener("pointerup",_wdragEnd);
+document.addEventListener("pointercancel",_wdragEnd);
 async function persistWatchOrder(order){try{await fetch("/api/watchlist/reorder",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({order})});}catch(e){}}
 
 // ---------- 主入口 ----------
