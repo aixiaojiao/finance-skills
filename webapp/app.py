@@ -655,8 +655,12 @@ def _daily_report_loop():
         time.sleep(max(60, (target - et).total_seconds()))
         try:
             now_et = datetime.now(ZoneInfo("America/New_York"))
-            if now_et.weekday() < 5 and _tg_relay_webhook() and _daily_report_enabled():
-                send_daily_report()
+            key = f"report:{now_et.date().isoformat()}"        # 每个交易日只发一次(防 worker 重启重发)
+            if (now_et.weekday() < 5 and _tg_relay_webhook() and _daily_report_enabled()
+                    and key not in _fired_keys()):
+                ok, _info, _text = send_daily_report()
+                if ok:
+                    _mark_fired(key)
         except Exception:
             pass
 
