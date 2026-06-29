@@ -2186,7 +2186,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--border:#21262d;--text:#e6edf3;--muted:#8b949e;--green:#26a69a;--red:#ef5350;--accent:#58a6ff;--yellow:#f6c343}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
-  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  a{color:var(--accent);text-decoration:none;cursor:pointer} a:hover{text-decoration:underline}
   .marketbar{display:flex;align-items:center;gap:14px;padding:8px 24px;background:#0a0d12;border-bottom:1px solid var(--border);flex-wrap:wrap;font-size:13px}
   .mb-item{display:flex;gap:6px;align-items:baseline}.mb-item .lbl{color:var(--muted)}
   .badge{padding:3px 10px;border-radius:6px;font-weight:600;font-size:12px}
@@ -2938,6 +2938,7 @@ async function addPositionManual(){
   const tk=document.getElementById("npTicker").value.trim().toUpperCase();
   const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value);
   if(!tk||!shares||!entry){alert("代码/股数/买入价必填");return;}
+  if(stop&&stop>=entry){alert("止损价必须低于买入价(否则每股风险为负,R 会算错)");return;}
   await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null})});
   loadTrack();
 }
@@ -2972,7 +2973,9 @@ async function savePosition(id){
   const numOrNull=x=>x===""?null:parseFloat(x);
   const shares=parseFloat(v("shares")),entry=parseFloat(v("entry"));
   if(!(shares>0)||!(entry>0)){alert("股数/买入价必须为正数");return;}
-  const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note")};
+  const stopv=numOrNull(v("stop"));
+  if(stopv!=null&&stopv>=entry){alert("止损价必须低于买入价(否则每股风险为负,R 会算错)");return;}
+  const body={shares,entry,stop:stopv,target:numOrNull(v("target")),note:v("note")};
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   loadTrack();
 }
