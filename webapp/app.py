@@ -2393,6 +2393,7 @@ const heatColor=c=>{if(c==null)return"#30363d";const x=Math.max(-3,Math.min(3,c)
 // ---------- 页面/标签切换 ----------
 function switchPage(p){
   curPage=p;
+  try{localStorage.setItem("curPage",p);}catch(e){}   // 记住当前页,刷新后恢复
   ["stock","positions","heatmap"].forEach(x=>{
     document.getElementById("page-"+x).classList.toggle("hidden",p!==x);
     document.getElementById("nav-"+x).classList.toggle("active",p===x);
@@ -3241,7 +3242,11 @@ function renderSectorTreemap(){
 
 // ---------- 启动 ----------
 document.getElementById("tickerInput").addEventListener("keydown",e=>{if(e.key==="Enter")loadTicker();});
-loadMarket();loadSettings();loadWatch().then(()=>loadTicker(watchlist[0]||"AAPL"));
+loadMarket();loadSettings();loadWatch().then(()=>{
+  loadTicker(watchlist[0]||"AAPL");                       // 预载个股看板数据(内部会切到 stock 页)
+  let sp;try{sp=localStorage.getItem("curPage");}catch(e){}
+  if(sp&&sp!=="stock")switchPage(sp);                     // 刷新前在别的页 → 恢复到那一页
+});
 setInterval(loadAlerts,60000);
 </script>
 </body>
