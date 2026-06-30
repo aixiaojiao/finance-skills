@@ -72,6 +72,13 @@ def init_db():
         opened_at TEXT, status TEXT DEFAULT 'open',
         exit_price REAL, closed_at TEXT, note TEXT
     );
+    -- 交易明细:每次平仓/减仓写一条(部分平仓也记录),作为已实现盈亏的权威台账
+    CREATE TABLE IF NOT EXISTS trades(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        position_id INTEGER, ticker TEXT NOT NULL, shares REAL NOT NULL,
+        entry REAL NOT NULL, exit_price REAL NOT NULL, pl REAL,
+        closed_at TEXT, note TEXT
+    );
     CREATE TABLE IF NOT EXISTS alerts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ticker TEXT NOT NULL, kind TEXT NOT NULL,
@@ -120,6 +127,12 @@ def init_db():
         con.execute("ALTER TABLE watchlist ADD COLUMN sort INTEGER DEFAULT 0")
         for i, r in enumerate(con.execute("SELECT ticker FROM watchlist ORDER BY added_at, ticker").fetchall()):
             con.execute("UPDATE watchlist SET sort=? WHERE ticker=?", (i, r[0]))
+    # 迁移:把旧库里已平仓的持仓回填进 trades 台账(幂等:已存在 position_id 的不再插入)
+    con.execute("""INSERT INTO trades(position_id, ticker, shares, entry, exit_price, pl, closed_at, note)
+        SELECT id, ticker, shares, entry, exit_price, (exit_price-entry)*shares, closed_at, note
+        FROM positions
+        WHERE status='closed' AND exit_price IS NOT NULL
+          AND id NOT IN (SELECT position_id FROM trades WHERE position_id IS NOT NULL)""")
     # 自选股默认值(仅首次为空时)
     cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
     if cur[0] == 0:
@@ -2043,7 +2056,8 @@ def api_positions():
                "totalRisk": total_risk, "account": acct,
                "investedPct": (total_cost / acct * 100) if acct else None,
                "riskPct": (total_risk / acct * 100) if acct else None}
-    return jsonify({"positions": rows, "summary": summary})
+    trades = [dict(r) for r in db.execute("SELECT * FROM trades ORDER BY id DESC").fetchall()]
+    return jsonify({"positions": rows, "summary": summary, "trades": trades})
 
 
 @app.route("/api/positions/<int:pid>", methods=["PUT", "DELETE"])
@@ -2055,12 +2069,45 @@ def api_position_one(pid):
         return jsonify({"ok": True})
     d = request.get_json(force=True, silent=True) or {}
     if d.get("action") == "close":
-        db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=? WHERE id=?",
-                   (_num(d.get("exit_price")), time.strftime("%Y-%m-%d"), pid))
+        row = db.execute("SELECT ticker, shares, entry, note FROM positions WHERE id=?", (pid,)).fetchone()
+        if row is None:
+            return jsonify({"error": "持仓不存在"}), 404
+        px = _num(d.get("exit_price"))
+        if px is None:
+            return jsonify({"error": "平仓价格必填"}), 400
+        cur_shares = row["shares"]
+        qty = _num(d.get("shares"))
+        if qty is None or qty <= 0 or qty >= cur_shares:
+            qty = cur_shares                                   # 默认/超额视为清仓
+        today = time.strftime("%Y-%m-%d")
+        pl = (px - row["entry"]) * qty
+        db.execute("INSERT INTO trades(position_id,ticker,shares,entry,exit_price,pl,closed_at,note) VALUES(?,?,?,?,?,?,?,?)",
+                   (pid, row["ticker"], qty, row["entry"], px, pl, today, d.get("note") or ""))
+        if qty >= cur_shares:                                  # 清仓
+            db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=?, shares=? WHERE id=?",
+                       (px, today, qty, pid))
+        else:                                                  # 部分平仓:减仓并在条目里注明现有仓位
+            remain = cur_shares - qty
+            qn = (f"{qty:g}") if float(qty).is_integer() else f"{qty}"
+            rn = (f"{remain:g}") if float(remain).is_integer() else f"{remain}"
+            sign = "+" if pl >= 0 else ""
+            tag = f"[减仓 {today} 卖{qn}@{px:g} {sign}{round(pl, 2):g}|剩{rn}股]"
+            new_note = ((row["note"] + " ") if row["note"] else "") + tag
+            db.execute("UPDATE positions SET shares=?, note=? WHERE id=?", (remain, new_note, pid))
+        db.commit()
+        return jsonify({"ok": True})
     else:
         for field in ("shares", "entry", "stop", "target", "note"):
             if field in d:
                 db.execute(f"UPDATE positions SET {field}=? WHERE id=?", (_num(d[field]) if field != "note" else d[field], pid))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/trades/<int:tid>", methods=["DELETE"])
+def api_trade_one(tid):
+    db = get_db()
+    db.execute("DELETE FROM trades WHERE id=?", (tid,))
     db.commit()
     return jsonify({"ok": True})
 
@@ -3017,7 +3064,7 @@ async function loadTrack(){
   const el=document.getElementById("posTrack");
   const d=await j("/api/positions");
   const s=d.summary||{};
-  const open=d.positions.filter(p=>p.status==="open"),closed=d.positions.filter(p=>p.status==="closed");
+  const open=d.positions.filter(p=>p.status==="open"),trades=d.trades||[];
   const acct=getSetting("accountValue","100000");
   const freeCash=(s.totalCost!=null&&acct)?(parseFloat(acct)-s.totalCost):null;
   const capBar=`<div class="capbar">
@@ -3052,11 +3099,12 @@ async function loadTrack(){
       <td class="muted">${p.note||""}</td>
       <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
-  const closedRows=closed.map(p=>{
-    const pl=(p.exit_price!=null)?(p.exit_price-p.entry)*p.shares:null;
-    return `<tr class="muted"><td>${p.ticker}</td><td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.exit_price)}</td>
-      <td class="${(pl||0)>=0?'green':'red'}">${pl!=null?(pl>=0?"+":"")+fmtBig(pl):"—"}</td><td>${p.opened_at||""}→${p.closed_at||""}</td>
-      <td><a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td></tr>`;}).join("");
+  const tradeRows=trades.map(t=>{
+    const plc=(t.pl||0)>=0?"green":"red";
+    return `<tr class="muted"><td>${t.ticker}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.entry)}</td><td>${fmtNum(t.exit_price)}</td>
+      <td class="${plc}">${t.pl!=null?(t.pl>=0?"+":"")+fmtBig(t.pl):"—"}</td><td>${t.closed_at||""}</td>
+      <td class="muted">${t.note||""}</td>
+      <td><a style="color:var(--red)" onclick="delTrade(${t.id})">删</a></td></tr>`;}).join("");
   el.innerHTML=`
     ${capBar}
     ${sumCards}
@@ -3067,7 +3115,7 @@ async function loadTrack(){
       <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
     ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>R</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
-    ${closed.length?`<div class="section-title" style="font-size:14px">已平仓 / 交易记录</div><table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>平仓价</th><th>盈亏</th><th>持有</th><th></th></tr></thead><tbody>${closedRows}</tbody></table>`:""}
+    ${trades.length?`<div class="section-title" style="font-size:14px">交易记录(已实现)</div><table><thead><tr><th>代码</th><th>平仓股数</th><th>成本</th><th>平仓价</th><th>已实现盈亏</th><th>日期</th><th>备注</th><th></th></tr></thead><tbody>${tradeRows}</tbody></table>`:""}
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
 }
 async function saveAccount(){
@@ -3085,15 +3133,37 @@ async function addPositionManual(){
   await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null})});
   loadTrack();
 }
-async function closePosition(id,price){
-  const px=prompt("平仓价格",price?price.toFixed(2):"");
-  if(px===null)return;
-  await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"close",exit_price:parseFloat(px)})});
+// 行内平仓表单:输入平仓价 + 平仓数量(默认全部);数量<持仓为部分平仓(减仓)
+function closePosition(id,price){
+  const p=(window._openPos||[]).find(x=>x.id===id);if(!p)return;
+  const tr=document.getElementById("posrow-"+id);if(!tr)return;
+  const ist='type="number" style="width:80px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px"';
+  tr.innerHTML=`<td><b>${p.ticker}</b></td>
+    <td><input id="cp-shares-${id}" ${ist} value="${p.shares??""}" max="${p.shares??""}" placeholder="平仓数量"></td>
+    <td class="muted">成本 ${fmtNum(p.entry)}</td>
+    <td><input id="cp-price-${id}" ${ist} value="${price?price.toFixed(2):""}" placeholder="平仓价"></td>
+    <td colspan="4" class="muted">持仓 ${fmtNum(p.shares,0)} 股;数量小于持仓即部分减仓,会保留剩余仓位并注明</td>
+    <td><input id="cp-note-${id}" value="" style="width:110px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px" placeholder="备注"></td>
+    <td><a onclick="confirmClose(${id})">确认平仓</a> · <a onclick="loadTrack()">取消</a></td>`;
+  const f=document.getElementById("cp-price-"+id);if(f){f.focus();}
+}
+async function confirmClose(id){
+  const v=s=>{const e=document.getElementById("cp-"+s+"-"+id);return e?e.value.trim():"";};
+  const px=parseFloat(v("price"));
+  if(!(px>0)){alert("请输入有效平仓价格");return;}
+  const qtyRaw=v("shares"),qty=qtyRaw===""?null:parseFloat(qtyRaw);
+  if(qtyRaw!==""&&!(qty>0)){alert("平仓数量必须为正数");return;}
+  await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"close",exit_price:px,shares:qty,note:v("note")})});
   loadTrack();
 }
 async function delPosition(id){
   if(!confirm("确认删除该记录?"))return;
   await fetch("/api/positions/"+id,{method:"DELETE"});loadTrack();
+}
+async function delTrade(id){
+  if(!confirm("确认删除该交易记录?(不影响当前持仓)"))return;
+  await fetch("/api/trades/"+id,{method:"DELETE"});loadTrack();
 }
 // 行内编辑持仓:股数 / 成本 / 止损 / 目标 / 备注
 function editPosition(id){
