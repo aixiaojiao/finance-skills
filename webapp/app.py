@@ -78,7 +78,7 @@ def init_db():
         position_id INTEGER, ticker TEXT NOT NULL,
         action TEXT NOT NULL DEFAULT 'sell',
         shares REAL NOT NULL, price REAL NOT NULL, pl REAL,
-        at TEXT, note TEXT
+        at TEXT, ts TEXT, note TEXT
     );
     CREATE TABLE IF NOT EXISTS alerts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,6 +160,12 @@ def init_db():
         SELECT id, ticker, 'buy', shares, entry, NULL, opened_at, note
         FROM positions
         WHERE id NOT IN (SELECT position_id FROM trades WHERE action='buy' AND position_id IS NOT NULL)""")
+    # 迁移:交易流水补精确时间戳 ts(此前只存日期,无法按先后排序);历史行用 日期+按 id 递增的伪时分秒回填
+    if "ts" not in [r[1] for r in con.execute("PRAGMA table_info(trades)").fetchall()]:
+        con.execute("ALTER TABLE trades ADD COLUMN ts TEXT")
+    con.execute("""UPDATE trades SET ts = COALESCE(NULLIF(at,''),'1970-01-01')
+        || printf(' %02d:%02d:%02d', (id/3600)%24, (id/60)%60, id%60)
+        WHERE ts IS NULL OR ts=''""")
     # 自选股默认值(仅首次为空时)
     cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
     if cur[0] == 0:
@@ -2072,8 +2078,8 @@ def api_positions():
                              (tk, add_shares, add_entry, _num(d.get("stop")), _num(d.get("target")),
                               today, d.get("note") or "", mp))
             pos_id = cur.lastrowid
-        db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'buy',?,?,NULL,?,?)",
-                   (pos_id, tk, add_shares, add_entry, today, d.get("note") or ""))
+        db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'buy',?,?,NULL,?,?,?)",
+                   (pos_id, tk, add_shares, add_entry, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
         db.commit()
         return jsonify({"ok": True, "merged": bool(existing)})
     # GET: 带实时盈亏
@@ -2132,9 +2138,9 @@ def _portfolio_state(db):
                "investedPct": (total_cost / acct * 100) if acct else None,   # 已投入成本占账户
                "marketPct": (total_mv / acct * 100) if acct else None,        # 持仓市值占账户=仓位占账户
                "riskPct": (total_risk / acct * 100) if acct else None}
-    # 倒序:最新交易在最上面;同一天「买入」沉到当天底部(它是当天最早的动作),其余按 id 倒序
+    # 倒序:严格按成交先后,最新在最上面(ts 为精确时间戳,id 兜底)
     trades = [dict(r) for r in db.execute(
-        "SELECT * FROM trades ORDER BY at DESC, (action='buy') ASC, id DESC").fetchall()]
+        "SELECT * FROM trades ORDER BY ts DESC, id DESC").fetchall()]
     return {"positions": rows, "summary": summary, "trades": trades}
 
 
@@ -2159,8 +2165,8 @@ def api_position_one(pid):
             qty = cur_shares                                   # 默认/超额视为清仓
         today = time.strftime("%Y-%m-%d")
         pl = (px - row["entry"]) * qty
-        sell_cur = db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'sell',?,?,?,?,?)",
-                              (pid, row["ticker"], qty, px, pl, today, d.get("note") or ""))
+        sell_cur = db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'sell',?,?,?,?,?,?)",
+                              (pid, row["ticker"], qty, px, pl, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
         if qty >= cur_shares:                                  # 清仓
             db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=?, shares=? WHERE id=?",
                        (px, today, qty, pid))
