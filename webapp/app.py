@@ -122,6 +122,10 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_stock_notes_ticker ON stock_notes(ticker, id DESC);
     """)
+    # 迁移:持仓支持「手填现价」(期权/港股等无实时行情的标的)——非空即视为手动定价,不拉 yfinance
+    pos_cols = [r[1] for r in con.execute("PRAGMA table_info(positions)").fetchall()]
+    if "manual_price" not in pos_cols:
+        con.execute("ALTER TABLE positions ADD COLUMN manual_price REAL")
     # 迁移:为旧库 watchlist 补 sort 列,并按 added_at 回填初始顺序
     wl_cols = [r[1] for r in con.execute("PRAGMA table_info(watchlist)").fetchall()]
     if "sort" not in wl_cols:
@@ -2034,9 +2038,9 @@ def api_positions():
         if not tk or not d.get("shares") or not d.get("entry"):
             return jsonify({"error": "ticker / shares / entry 必填"}), 400
         today = time.strftime("%Y-%m-%d")
-        cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note) VALUES(?,?,?,?,?,?, 'open', ?)",
+        cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price) VALUES(?,?,?,?,?,?, 'open', ?, ?)",
                          (tk, float(d["shares"]), float(d["entry"]), _num(d.get("stop")), _num(d.get("target")),
-                          today, d.get("note") or ""))
+                          today, d.get("note") or "", _num(d.get("manual_price"))))
         db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'buy',?,?,NULL,?,?)",
                    (cur.lastrowid, tk, float(d["shares"]), float(d["entry"]), today, d.get("note") or ""))
         db.commit()
@@ -2044,13 +2048,21 @@ def api_positions():
     # GET: 带实时盈亏
     rows = [dict(r) for r in db.execute("SELECT * FROM positions ORDER BY id DESC").fetchall()]
     open_rows = [r for r in rows if r["status"] == "open"]
-    live = _live_prices([r["ticker"] for r in open_rows])
+    # 仅对「自动行情」的持仓拉 yfinance;手填现价的(期权/港股)跳过
+    live = _live_prices([r["ticker"] for r in open_rows if r.get("manual_price") is None])
     acct = _get_setting("accountValue")
     acct = float(acct) if acct else None
     total_mv = total_cost = total_pl = total_risk = 0.0
     for r in rows:
-        lp = live.get(r["ticker"], {})
-        price = lp.get("price") if r["status"] == "open" else r.get("exit_price")
+        manual = r.get("manual_price") is not None
+        r["manual"] = manual
+        if r["status"] != "open":
+            lp, price = {}, r.get("exit_price")
+        elif manual:
+            lp, price = {}, r.get("manual_price")
+        else:
+            lp = live.get(r["ticker"], {})
+            price = lp.get("price")
         r["price"] = price
         r["ma20"] = lp.get("ma20")
         cost = r["shares"] * r["entry"]
@@ -2124,7 +2136,7 @@ def api_position_one(pid):
         db.commit()
         return jsonify({"ok": True})
     else:
-        for field in ("shares", "entry", "stop", "target", "note"):
+        for field in ("shares", "entry", "stop", "target", "note", "manual_price"):
             if field in d:
                 db.execute(f"UPDATE positions SET {field}=? WHERE id=?", (_num(d[field]) if field != "note" else d[field], pid))
     db.commit()
@@ -3124,7 +3136,7 @@ async function loadTrack(){
       : '<span class="red" title="未设止损,下行风险不封顶">未设止损</span>';
     return `<tr id="posrow-${p.id}">
       <td><b class="wchip" style="cursor:pointer;padding:2px 6px" onclick="loadTicker('${p.ticker}')">${p.ticker}</b></td>
-      <td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}</td>
+      <td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}${p.manual?' <span class="tag" title="手填现价,不走实时行情(期权/港股等)">手填</span>':''}</td>
       <td class="${plc}">${p.pl!=null?(p.pl>=0?"+":"")+fmtBig(p.pl):"—"} ${p.plPct!=null?`(${fmtPct(p.plPct)})`:""}</td>
       <td>${fmtNum(p.stop)}</td><td class="${stopc}" title="现价到止损还要跌多少;止损在成本之上则锁利(绿)">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
       <td>${riskCell}</td>
@@ -3147,6 +3159,7 @@ async function loadTrack(){
       <input id="npShares" placeholder="股数" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npEntry" placeholder="买入价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+      <input id="npPrice" placeholder="现价(手填,选填)" type="number" title="期权/港股等无实时行情时手填现价;留空则走 yfinance" style="width:130px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
     ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
     ${trades.length?`<div class="section-title" style="font-size:14px">交易明细(买卖流水)</div><table><thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>已实现盈亏</th><th>备注</th><th></th></tr></thead><tbody>${tradeRows}</tbody></table>`:""}
@@ -3162,9 +3175,9 @@ async function saveAccount(){
 }
 async function addPositionManual(){
   const tk=document.getElementById("npTicker").value.trim().toUpperCase();
-  const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value);
+  const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value),mp=parseFloat(document.getElementById("npPrice").value);
   if(!tk||!shares||!entry){alert("代码/股数/买入价必填");return;}
-  await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null})});
+  await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null,manual_price:mp>0?mp:null})});
   loadTrack();
 }
 // 行内平仓表单:输入平仓价 + 平仓数量(默认全部);数量<持仓为部分平仓(减仓)
@@ -3208,7 +3221,7 @@ function editPosition(id){
   tr.innerHTML=`<td><b>${p.ticker}</b></td>
     <td><input id="ep-shares-${id}" ${ist} value="${p.shares??""}"></td>
     <td><input id="ep-entry-${id}" ${ist} value="${p.entry??""}"></td>
-    <td class="muted">${fmtNum(p.price)}</td>
+    <td><input id="ep-mprice-${id}" ${ist} value="${p.manual_price??""}" placeholder="${p.manual?'手填现价':'留空=自动'}" title="填入则用手填现价(期权/港股);留空则走实时行情"></td>
     <td class="muted">—</td>
     <td><input id="ep-stop-${id}" ${ist} value="${p.stop??""}" placeholder="止损"></td>
     <td colspan="2"><input id="ep-target-${id}" ${ist} value="${p.target??""}" placeholder="目标价"></td>
@@ -3221,7 +3234,7 @@ async function savePosition(id){
   const shares=parseFloat(v("shares")),entry=parseFloat(v("entry"));
   if(!(shares>0)||!(entry>0)){alert("股数/买入价必须为正数");return;}
   // 止损可高于成本(移动止损锁利),不做 stop<entry 限制
-  const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note")};
+  const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note"),manual_price:numOrNull(v("mprice"))};
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   loadTrack();
 }
