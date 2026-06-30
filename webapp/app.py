@@ -3154,30 +3154,25 @@ function calcSize(p){
   const shares=Math.max(0,Math.min(sharesByRisk,sharesByPos));
   const binding=sharesByRisk<=sharesByPos?"风险上限":"仓位上限";
   const bindClass=sharesByRisk<=sharesByPos?"sell":"hold";
-  window["_lastCalc_"+p]={entry,stop,shares,ticker};
-
-  const capital=shares*entry;
-  const riskDollar=shares*riskPerShare;
   const t1=entry*1.08,t2=entry*1.15;          // SEPA: +8% 卖一半, +15% 再卖25%
   const R=riskPerShare,rr1=(t1-entry)/R,rr2=(t2-entry)/R;
 
   if(shares<=0){
     res.innerHTML=`<div class="error">在当前条件下可买股数为 0 —— 风险上限或仓位上限太小,或止损距离太宽(每股风险 $${fmtNum(riskPerShare)})。</div>`;return;
   }
+  // 计算上下文:条件一变(calcSize 重跑)即覆盖,股数输入框被重置回最大值
+  window["_sizerCtx_"+p]={entry,stop,account,maxShares:shares,riskPerShare,ticker};
   res.innerHTML=`
    <div class="bindbox">
-     <div><div class="muted" style="font-size:12px">建议最大买入</div><div class="shares-big">${shares.toLocaleString()} <span style="font-size:18px;font-weight:600">股</span></div></div>
+     <div><div class="muted" style="font-size:12px">买入股数 <span style="font-size:11px">(默认最大,可改)</span></div>
+       <div class="row" style="align-items:baseline;gap:6px">
+         <input id="${p}Shares" type="number" min="1" step="1" value="${shares}" oninput="onSharesEdit('${p}')" style="font-size:30px;font-weight:800;width:140px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:2px 8px">
+         <span style="font-size:16px;font-weight:600">股</span></div>
+       <div class="hint" id="${p}hShares"></div></div>
      <span class="badge ${bindClass}">受「${binding}」约束</span>
      <button class="search" style="margin:0" onclick="addSizerRecord('${p}')">＋ 记入持仓</button>
    </div>
-   <div class="grid">
-     ${card("投入资金",`$${fmtBig(capital)}`)}
-     ${card("占总资产",`${(capital/account*100).toFixed(1)}%`)}
-     ${card("实际风险金额",`$${fmtBig(riskDollar)}`)}
-     ${card("占总资产(风险)",`${(riskDollar/account*100).toFixed(2)}%`)}
-     ${card("每股风险",`$${fmtNum(riskPerShare)}`)}
-     ${card("止损距离",`${((entry-stop)/entry*100).toFixed(2)}%`)}
-   </div>
+   <div class="grid" id="${p}Derived"></div>
    <div class="section-title" style="font-size:14px">两个约束的候选股数(取较小值)</div>
    <table style="max-width:560px"><thead><tr><th>约束</th><th>可买股数</th><th>对应金额</th><th></th></tr></thead><tbody>
      <tr><td>① 按总仓位上限</td><td>${sharesByPos.toLocaleString()}</td><td class="muted">$${fmtBig(sharesByPos*entry)}</td><td>${binding==="仓位上限"?'<span class="pass">← 生效</span>':''}</td></tr>
@@ -3190,10 +3185,33 @@ function calcSize(p){
      <tr><td>目标2</td><td class="green">$${fmtNum(t2)}</td><td class="green">+15%</td><td>${rr2.toFixed(2)}:1</td><td class="muted">再卖25%,余下跟踪20MA</td></tr>
    </tbody></table>
    <div class="small">公式:股数 = min( 总风险额÷每股风险 , 总仓位额÷买入价 )。SEPA 建议单笔风险 0.5–2%、盈亏比≥2:1、止损 7–8% 内。本工具仅为计算,不构成投资建议。</div>`;
+  renderSizerDerived(p);
 }
+// 按当前(可手改的)股数刷新派生金额,并把真实买入股数写入 _lastCalc;不重置输入框
+function renderSizerDerived(p){
+  const ctx=window["_sizerCtx_"+p];if(!ctx)return;
+  const el=document.getElementById(p+"Derived");if(!el)return;
+  const inp=document.getElementById(p+"Shares");
+  let shares=inp?parseInt(inp.value,10):ctx.maxShares;
+  if(!(shares>0))shares=0;
+  window["_lastCalc_"+p]={entry:ctx.entry,stop:ctx.stop,shares,ticker:ctx.ticker};
+  const capital=shares*ctx.entry,riskDollar=shares*ctx.riskPerShare,acc=ctx.account;
+  const over=shares>ctx.maxShares;
+  const h=document.getElementById(p+"hShares");
+  if(h)h.innerHTML=`最大可买 ${ctx.maxShares.toLocaleString()} 股`
+    +(over?' · <span class="red">已超最大,风险/仓位将超标</span>':(shares>0&&shares<ctx.maxShares?' · <span class="muted">低于最大</span>':''));
+  el.innerHTML=`
+     ${card("投入资金",`$${fmtBig(capital)}`)}
+     ${card("占总资产",`${(capital/acc*100).toFixed(1)}%`)}
+     ${card("实际风险金额",`$${fmtBig(riskDollar)}`)}
+     ${card("占总资产(风险)",`${(riskDollar/acc*100).toFixed(2)}%`)}
+     ${card("每股风险",`$${fmtNum(ctx.riskPerShare)}`)}
+     ${card("止损距离",`${((ctx.entry-ctx.stop)/ctx.entry*100).toFixed(2)}%`)}`;
+}
+function onSharesEdit(p){renderSizerDerived(p);}
 async function addSizerRecord(p){
   const c=window["_lastCalc_"+p];
-  if(!c||!c.shares){alert("请先得到有效的可买股数");return;}
+  if(!c||!c.shares){alert("请先填写有效的买入股数");return;}
   const tk=(c.ticker||"").trim().toUpperCase();
   if(!tk){alert("请先填写股票代码,再记入持仓");return;}
   await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},
