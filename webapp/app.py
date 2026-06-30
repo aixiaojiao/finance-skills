@@ -121,6 +121,10 @@ def init_db():
         ticker TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_stock_notes_ticker ON stock_notes(ticker, id DESC);
+    -- 每日复盘:每天留存一份组合快照(持仓/交易流水/敞口等),外加用户手写复盘 review。
+    CREATE TABLE IF NOT EXISTS snapshots(
+        date TEXT PRIMARY KEY, payload TEXT, review TEXT, created_at TEXT
+    );
     """)
     # 迁移:持仓支持「手填现价」(期权/港股等无实时行情的标的)——非空即视为手动定价,不拉 yfinance
     pos_cols = [r[1] for r in con.execute("PRAGMA table_info(positions)").fetchall()]
@@ -703,6 +707,15 @@ def _daily_report_loop():
                 ok, _info, _text = send_daily_report()
                 if ok:
                     _mark_fired(key)
+        except Exception:
+            pass
+        # 每日组合快照(本地留档,供「每日复盘」回查;与 Telegram 推送开关无关)
+        try:
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            snap_key = f"snapshot:{now_et.date().isoformat()}"
+            if now_et.weekday() < 5 and snap_key not in _fired_keys():
+                take_portfolio_snapshot(now_et.date().isoformat())
+                _mark_fired(snap_key)
         except Exception:
             pass
 
@@ -2046,12 +2059,18 @@ def api_positions():
         db.commit()
         return jsonify({"ok": True})
     # GET: 带实时盈亏
+    return jsonify(_portfolio_state(db))
+
+
+def _portfolio_state(db):
+    """组合实时状态:持仓(含派生值)+ 汇总 + 买卖流水。供 /api/positions 与每日快照复用。
+    db 需 row_factory=sqlite3.Row。不依赖 flask 请求上下文,后台线程亦可调用。"""
     rows = [dict(r) for r in db.execute("SELECT * FROM positions ORDER BY id DESC").fetchall()]
     open_rows = [r for r in rows if r["status"] == "open"]
     # 仅对「自动行情」的持仓拉 yfinance;手填现价的(期权/港股)跳过
     live = _live_prices([r["ticker"] for r in open_rows if r.get("manual_price") is None])
-    acct = _get_setting("accountValue")
-    acct = float(acct) if acct else None
+    arow = db.execute("SELECT value FROM settings WHERE key='accountValue'").fetchone()
+    acct = float(arow["value"]) if arow and arow["value"] else None
     total_mv = total_cost = total_pl = total_risk = 0.0
     for r in rows:
         manual = r.get("manual_price") is not None
@@ -2095,8 +2114,10 @@ def api_positions():
                "investedPct": (total_cost / acct * 100) if acct else None,   # 已投入成本占账户
                "marketPct": (total_mv / acct * 100) if acct else None,        # 持仓市值占账户=仓位占账户
                "riskPct": (total_risk / acct * 100) if acct else None}
-    trades = [dict(r) for r in db.execute("SELECT * FROM trades ORDER BY id DESC").fetchall()]
-    return jsonify({"positions": rows, "summary": summary, "trades": trades})
+    # 按时间正序;同一天「买入」排在「卖出」之前(回填买入的 id 可能晚于早先卖出,故不能只按 id)
+    trades = [dict(r) for r in db.execute(
+        "SELECT * FROM trades ORDER BY at ASC, (action='sell') ASC, id ASC").fetchall()]
+    return {"positions": rows, "summary": summary, "trades": trades}
 
 
 @app.route("/api/positions/<int:pid>", methods=["PUT", "DELETE"])
@@ -2120,11 +2141,19 @@ def api_position_one(pid):
             qty = cur_shares                                   # 默认/超额视为清仓
         today = time.strftime("%Y-%m-%d")
         pl = (px - row["entry"]) * qty
-        db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'sell',?,?,?,?,?)",
-                   (pid, row["ticker"], qty, px, pl, today, d.get("note") or ""))
+        sell_cur = db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'sell',?,?,?,?,?)",
+                              (pid, row["ticker"], qty, px, pl, today, d.get("note") or ""))
         if qty >= cur_shares:                                  # 清仓
             db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=?, shares=? WHERE id=?",
                        (px, today, qty, pid))
+            # 清仓:累计该标的所有卖出的已实现盈亏,写进本笔流水备注,便于复盘看总盈利
+            total = db.execute("SELECT COALESCE(SUM(pl),0) FROM trades WHERE position_id=? AND action='sell'",
+                               (pid,)).fetchone()[0] or 0.0
+            sgn = "+" if total >= 0 else ""
+            base = (d.get("note") or "").strip()
+            clr = f"[清仓·累计已实现 {sgn}{round(total, 2):g}]"
+            db.execute("UPDATE trades SET note=? WHERE id=?",
+                       ((base + " " + clr) if base else clr, sell_cur.lastrowid))
         else:                                                  # 部分平仓:减仓并在条目里注明现有仓位
             remain = cur_shares - qty
             qn = (f"{qty:g}") if float(qty).is_integer() else f"{qty}"
@@ -2147,6 +2176,60 @@ def api_position_one(pid):
 def api_trade_one(tid):
     db = get_db()
     db.execute("DELETE FROM trades WHERE id=?", (tid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+# ============================ 每日复盘:组合快照 ============================
+
+def take_portfolio_snapshot(date_str):
+    """留存当日组合快照(JSON)。同一天再次调用覆盖 payload,但保留已写的 review。可在后台线程调用。"""
+    con = _cache_db()
+    con.row_factory = sqlite3.Row
+    try:
+        payload = json.dumps(_portfolio_state(con), ensure_ascii=False,
+                             default=lambda o: float(o) if hasattr(o, "__float__") else None)
+        con.execute("INSERT INTO snapshots(date,payload,created_at) VALUES(?,?,?) "
+                    "ON CONFLICT(date) DO UPDATE SET payload=excluded.payload, created_at=excluded.created_at",
+                    (date_str, payload, time.strftime("%Y-%m-%d %H:%M:%S")))
+        con.commit()
+    finally:
+        con.close()
+    return date_str
+
+
+@app.route("/api/snapshots", methods=["GET"])
+def api_snapshots():
+    rows = get_db().execute(
+        "SELECT date, created_at, (review IS NOT NULL AND TRIM(review)<>'') AS hr "
+        "FROM snapshots ORDER BY date DESC").fetchall()
+    return jsonify({"snapshots": [
+        {"date": r["date"], "created_at": r["created_at"], "hasReview": bool(r["hr"])} for r in rows]})
+
+
+@app.route("/api/snapshots/take", methods=["POST"])
+def api_snapshot_take():
+    d = datetime.now(ZoneInfo("America/New_York")).date().isoformat()   # 以美东交易日为快照日期
+    take_portfolio_snapshot(d)
+    return jsonify({"ok": True, "date": d})
+
+
+@app.route("/api/snapshots/<date>", methods=["GET"])
+def api_snapshot_one(date):
+    r = get_db().execute("SELECT date, payload, review, created_at FROM snapshots WHERE date=?", (date,)).fetchone()
+    if r is None:
+        return jsonify({"error": "无该日快照"}), 404
+    return jsonify({"date": r["date"], "createdAt": r["created_at"], "review": r["review"] or "",
+                    "state": json.loads(r["payload"]) if r["payload"] else None})
+
+
+@app.route("/api/snapshots/<date>/review", methods=["POST"])
+def api_snapshot_review(date):
+    db = get_db()
+    d = request.get_json(force=True, silent=True) or {}
+    db.execute("INSERT INTO snapshots(date,review,created_at) VALUES(?,?,?) "      # 允许给无快照日期先写复盘
+               "ON CONFLICT(date) DO UPDATE SET review=excluded.review",
+               (date, d.get("review", ""), time.strftime("%Y-%m-%d %H:%M:%S")))
     db.commit()
     return jsonify({"ok": True})
 
@@ -2502,6 +2585,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
    <nav class="sidenav">
      <button id="nav-stock" class="active" onclick="switchPage('stock')">📊 个股看板</button>
      <button id="nav-positions" onclick="switchPage('positions')">💼 持仓</button>
+     <button id="nav-review" onclick="switchPage('review')">📓 每日复盘</button>
      <button id="nav-heatmap" onclick="switchPage('heatmap')">🔥 市场热力图</button>
    </nav>
    <div class="search" id="stockSearch">
@@ -2531,6 +2615,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   <!-- 持仓页 -->
   <div id="page-positions" class="hidden"><div class="loading">加载持仓…</div></div>
+
+  <!-- 每日复盘页 -->
+  <div id="page-review" class="hidden"><div class="loading">加载复盘…</div></div>
 
   <!-- 市场热力图页 -->
   <div id="page-heatmap" class="hidden">
@@ -2572,12 +2659,13 @@ const heatColor=c=>{if(c==null)return"#30363d";const x=Math.max(-3,Math.min(3,c)
 function switchPage(p){
   curPage=p;
   try{localStorage.setItem("curPage",p);}catch(e){}   // 记住当前页,刷新后恢复
-  ["stock","positions","heatmap"].forEach(x=>{
+  ["stock","positions","review","heatmap"].forEach(x=>{
     document.getElementById("page-"+x).classList.toggle("hidden",p!==x);
     document.getElementById("nav-"+x).classList.toggle("active",p===x);
   });
   if(p==="heatmap" && !window._heatLoaded) loadHeatmap();
   if(p==="positions") loadPositions();
+  if(p==="review") loadReview();
 }
 function switchTab(t){
   curTab=t;
@@ -3237,6 +3325,73 @@ async function savePosition(id){
   const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note"),manual_price:numOrNull(v("mprice"))};
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   loadTrack();
+}
+
+// ---------- 每日复盘 ----------
+let _reviewDate=null;
+async function loadReview(){
+  const el=document.getElementById("page-review");
+  el.innerHTML='<div class="loading">加载复盘…</div>';
+  const d=await j("/api/snapshots");
+  const snaps=d.snapshots||[];
+  const opts=snaps.map(s=>`<option value="${s.date}">${s.date}${s.hasReview?' ✍':''}</option>`).join("");
+  el.innerHTML=`
+    <div class="section-title" style="margin-top:6px">每日复盘 <span class="tag">每个交易日 17:00(美东)自动留存快照</span></div>
+    <div class="muted" style="font-size:13px;margin-bottom:12px">每天自动留存一份组合快照(持仓、交易流水、盈亏、风险敞口),并可写下自己的复盘,日后回查、提升交易能力。</div>
+    <div class="cmpbar">
+      <span class="muted">选择日期</span>
+      <select id="revDate" onchange="showSnapshot(this.value)" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px 10px;border-radius:8px">${opts||'<option value="">暂无快照</option>'}</select>
+      <button class="search" style="margin:0" onclick="takeSnapshotNow()">📸 立即生成今日快照</button>
+    </div>
+    <div id="revBody">${snaps.length?'<div class="loading">加载快照…</div>':'<div class="muted">还没有快照。点「立即生成今日快照」手动创建一份;之后每个交易日 17:00(美东)会自动留存。</div>'}</div>`;
+  if(snaps.length)showSnapshot(snaps[0].date);
+}
+async function showSnapshot(date){
+  if(!date)return;
+  _reviewDate=date;
+  const dd=document.getElementById("revDate");if(dd)dd.value=date;
+  const body=document.getElementById("revBody");
+  body.innerHTML='<div class="loading">加载快照…</div>';
+  const d=await j("/api/snapshots/"+encodeURIComponent(date));
+  if(d.error){body.innerHTML='<div class="error">'+d.error+'</div>';return;}
+  const st=d.state||{},s=st.summary||{};
+  const pos=(st.positions||[]).filter(p=>p.status==='open');
+  const trades=(st.trades||[]).filter(t=>t.at===date);
+  const cards=`<div class="grid" style="margin-bottom:14px">
+    ${card("账户总值",s.account!=null?'$'+fmtBig(s.account):'—')}
+    ${card("持仓市值",s.totalMarketValue!=null?'$'+fmtBig(s.totalMarketValue):'—')}
+    ${card("总成本",s.totalCost!=null?'$'+fmtBig(s.totalCost):'—')}
+    <div class="card"><div class="k">总浮盈亏</div><div class="v ${(s.totalPL||0)>=0?'green':'red'}">${s.totalPL!=null?(s.totalPL>=0?'+':'')+'$'+fmtBig(Math.abs(s.totalPL)):'—'} ${s.totalPLPct!=null?'('+fmtPct(s.totalPLPct)+')':''}</div></div>
+    ${card("仓位占账户",s.marketPct!=null?s.marketPct.toFixed(1)+'%':'—')}
+    <div class="card"><div class="k">组合风险敞口</div><div class="v">${s.totalRisk!=null?'$'+fmtBig(s.totalRisk):'—'} ${s.riskPct!=null?'('+s.riskPct.toFixed(2)+'%)':''}</div></div>
+  </div>`;
+  const posRows=pos.map(p=>`<tr><td>${p.ticker}${p.manual?' <span class="tag">手填</span>':''}</td><td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}</td>
+    <td class="${(p.pl||0)>=0?'green':'red'}">${p.pl!=null?(p.pl>=0?'+':'')+fmtBig(p.pl):'—'} ${p.plPct!=null?'('+fmtPct(p.plPct)+')':''}</td>
+    <td>${fmtNum(p.stop)}</td><td>${p.toStopPct!=null?fmtPct(p.toStopPct):'—'}</td>
+    <td>${p.riskDollar!=null?'$'+fmtBig(p.riskDollar):'—'}</td><td class="muted">${p.note||''}</td></tr>`).join("");
+  const trRows=trades.map(t=>`<tr class="muted"><td>${t.ticker}</td><td>${t.action==='buy'?'买入':'卖出'}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.price)}</td><td class="${t.action==='buy'?'muted':((t.pl||0)>=0?'green':'red')}">${(t.action!=='buy'&&t.pl!=null)?(t.pl>=0?'+':'')+fmtBig(t.pl):'—'}</td><td class="muted">${t.note||''}</td></tr>`).join("");
+  const revEsc=(d.review||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  body.innerHTML=`
+    <div class="muted" style="font-size:12px;margin-bottom:10px">快照生成时间:${d.createdAt||'—'}</div>
+    ${cards}
+    <div class="section-title" style="font-size:14px">当日持仓</div>
+    ${pos.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注</th></tr></thead><tbody>${posRows}</tbody></table>`:'<div class="muted">当日无持仓</div>'}
+    <div class="section-title" style="font-size:14px">当日交易</div>
+    ${trades.length?`<table><thead><tr><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>已实现盈亏</th><th>备注</th></tr></thead><tbody>${trRows}</tbody></table>`:'<div class="muted">当日无交易</div>'}
+    <div class="section-title" style="font-size:14px">我的复盘</div>
+    <textarea id="revText" placeholder="写下今天的复盘:做对/做错了什么、情绪与纪律、明天的改进点……" style="width:100%;min-height:200px;box-sizing:border-box;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:12px;border-radius:10px;font-size:14px;line-height:1.7;resize:vertical">${revEsc}</textarea>
+    <div style="margin-top:10px"><button class="search" style="margin:0" onclick="saveReview()">保存复盘</button> <span id="revSaved" class="muted" style="margin-left:10px"></span></div>`;
+}
+async function saveReview(){
+  if(!_reviewDate){alert("请先选择日期");return;}
+  const txt=document.getElementById("revText").value;
+  await fetch("/api/snapshots/"+encodeURIComponent(_reviewDate)+"/review",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({review:txt})});
+  const el=document.getElementById("revSaved");if(el){el.textContent="已保存 ✓";setTimeout(()=>{if(el)el.textContent="";},2000);}
+}
+async function takeSnapshotNow(){
+  const r=await fetch("/api/snapshots/take",{method:"POST"});let d={};try{d=await r.json();}catch(e){}
+  await loadReview();
+  if(d.date)showSnapshot(d.date);
 }
 
 // ---------- 估值 ----------
