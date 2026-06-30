@@ -2070,16 +2070,18 @@ def api_positions():
                     r["rMultiple"] = (price - r["entry"]) / rps
                 else:                                         # 止损≥成本:已锁定利润,R 无意义
                     r["lockedPct"] = (r["stop"] / r["entry"] - 1) * 100
-            if r["status"] == "open":
-                total_mv += mv
-                total_cost += cost
+        if r["status"] == "open":
+            total_cost += cost                                  # 成本不依赖现价,务必全量累加
+            total_mv += mv if price is not None else cost        # 缺现价时回退用成本,避免漏算市值
+            if price is not None:
                 total_pl += mv - cost
                 if r["stop"]:
                     total_risk += max(0.0, (price - r["stop"]) * r["shares"])
     summary = {"openCount": len(open_rows), "totalMarketValue": total_mv, "totalCost": total_cost,
                "totalPL": total_pl, "totalPLPct": (total_pl / total_cost * 100) if total_cost else None,
                "totalRisk": total_risk, "account": acct,
-               "investedPct": (total_cost / acct * 100) if acct else None,
+               "investedPct": (total_cost / acct * 100) if acct else None,   # 已投入成本占账户
+               "marketPct": (total_mv / acct * 100) if acct else None,        # 持仓市值占账户=仓位占账户
                "riskPct": (total_risk / acct * 100) if acct else None}
     trades = [dict(r) for r in db.execute("SELECT * FROM trades ORDER BY id DESC").fetchall()]
     return jsonify({"positions": rows, "summary": summary, "trades": trades})
@@ -3091,7 +3093,7 @@ async function loadTrack(){
   const s=d.summary||{};
   const open=d.positions.filter(p=>p.status==="open"),trades=d.trades||[];
   const acct=getSetting("accountValue","100000");
-  const freeCash=(s.totalCost!=null&&acct)?(parseFloat(acct)-s.totalCost):null;
+  const freeCash=(s.totalMarketValue!=null&&acct)?(parseFloat(acct)-s.totalMarketValue):null;
   const capBar=`<div class="capbar">
     <div class="caprow"><span class="caplabel">总资金量</span><span class="capcur">$</span>
       <input id="acctInput" type="number" value="${acct}" onkeydown="if(event.key==='Enter')saveAccount()">
@@ -3108,7 +3110,7 @@ async function loadTrack(){
     ${card("总市值",s.totalMarketValue!=null?"$"+fmtBig(s.totalMarketValue):"—")}
     ${card("总成本",s.totalCost!=null?"$"+fmtBig(s.totalCost):"—")}
     <div class="card"><div class="k">总浮盈亏</div><div class="v ${(s.totalPL||0)>=0?'green':'red'}">${s.totalPL!=null?(s.totalPL>=0?"+":"")+"$"+fmtBig(Math.abs(s.totalPL)):"—"} ${s.totalPLPct!=null?`(${fmtPct(s.totalPLPct)})`:""}</div></div>
-    ${card("仓位占账户",s.investedPct!=null?s.investedPct.toFixed(1)+"%":"—")}
+    ${card("仓位占账户",s.marketPct!=null?s.marketPct.toFixed(1)+"%":"—")}
     <div class="card"><div class="k">组合风险敞口</div><div class="v ${(s.riskPct||0)>6?'red':''}">${s.totalRisk!=null?"$"+fmtBig(s.totalRisk):"—"} ${s.riskPct!=null?`(${s.riskPct.toFixed(2)}%)`:""}</div></div>
   </div>`;
   window._openPos=open;
