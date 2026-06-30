@@ -2192,6 +2192,13 @@ def api_position_one(pid):
         for field in ("shares", "entry", "stop", "target", "note", "manual_price"):
             if field in d:
                 db.execute(f"UPDATE positions SET {field}=? WHERE id=?", (_num(d[field]) if field != "note" else d[field], pid))
+        # 改了股数/成本时,若该仓位只有一笔买入且无卖出,同步修正其交易明细(如期权忘记×100 的手误)
+        if "shares" in d or "entry" in d:
+            buys = db.execute("SELECT id FROM trades WHERE position_id=? AND action='buy'", (pid,)).fetchall()
+            sells = db.execute("SELECT COUNT(*) FROM trades WHERE position_id=? AND action='sell'", (pid,)).fetchone()[0]
+            if len(buys) == 1 and sells == 0:
+                pos = db.execute("SELECT shares, entry FROM positions WHERE id=?", (pid,)).fetchone()
+                db.execute("UPDATE trades SET shares=?, price=? WHERE id=?", (pos["shares"], pos["entry"], buys[0]["id"]))
     db.commit()
     return jsonify({"ok": True})
 
