@@ -2114,7 +2114,7 @@ def _portfolio_state(db):
             mv = r["shares"] * price
             r["marketValue"] = mv
             r["pl"] = mv - cost
-            r["plPct"] = (price / r["entry"] - 1) * 100
+            r["plPct"] = (r["pl"] / abs(cost) * 100) if cost else None   # 用 pl/|成本|,空头(负股数)盈亏方向也正确
             # 距止损:现价回落到止损的跌幅(负数=还要跌多少才触发止损),遵循绿涨红跌
             r["toStopPct"] = ((r["stop"] / price - 1) * 100) if r["stop"] else None
             # 风险敞口($):从现价回落到止损会亏多少(现价−止损)×股数;止损≥成本则为锁定的利润回吐
@@ -2161,13 +2161,16 @@ def api_position_one(pid):
             return jsonify({"error": "平仓价格必填"}), 400
         cur_shares = row["shares"]
         qty = _num(d.get("shares"))
-        if qty is None or qty <= 0 or qty >= cur_shares:
-            qty = cur_shares                                   # 默认/超额视为清仓
+        # 支持空头(负股数,如卖出开仓的期权/备兑):按绝对值判断清仓/部分,并对齐持仓方向
+        if qty is None or qty == 0 or abs(qty) >= abs(cur_shares):
+            qty = cur_shares                                   # 默认/全部视为清仓
+        else:
+            qty = -abs(qty) if cur_shares < 0 else abs(qty)    # 部分:对齐持仓方向
         today = time.strftime("%Y-%m-%d")
         pl = (px - row["entry"]) * qty
         sell_cur = db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'sell',?,?,?,?,?,?)",
                               (pid, row["ticker"], qty, px, pl, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
-        if qty >= cur_shares:                                  # 清仓
+        if abs(qty) >= abs(cur_shares):                        # 清仓
             db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=?, shares=? WHERE id=?",
                        (px, today, qty, pid))
             # 清仓:累计该标的所有卖出的已实现盈亏,写进本笔流水备注,便于复盘看总盈利
@@ -3353,7 +3356,7 @@ async function confirmClose(id){
   const px=parseFloat(v("price"));
   if(!(px>0)){alert("请输入有效平仓价格");return;}
   const qtyRaw=v("shares"),qty=qtyRaw===""?null:parseFloat(qtyRaw);
-  if(qtyRaw!==""&&!(qty>0)){alert("平仓数量必须为正数");return;}
+  if(qtyRaw!==""&&(!isFinite(qty)||qty===0)){alert("平仓数量不能为 0");return;}  // 允许负数(空头/卖出开仓的期权)
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({action:"close",exit_price:px,shares:qty,note:v("note")})});
   loadTrack();
