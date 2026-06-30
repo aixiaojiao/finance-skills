@@ -2237,7 +2237,8 @@ def api_snapshots():
     rows = get_db().execute(
         "SELECT date, created_at, (review IS NOT NULL AND TRIM(review)<>'') AS hr "
         "FROM snapshots ORDER BY date DESC").fetchall()
-    return jsonify({"snapshots": [
+    return jsonify({"today": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+                    "snapshots": [
         {"date": r["date"], "created_at": r["created_at"], "hasReview": bool(r["hr"])} for r in rows]})
 
 
@@ -3403,27 +3404,42 @@ async function loadReview(){
   el.innerHTML='<div class="loading">加载复盘…</div>';
   const d=await j("/api/snapshots");
   const snaps=d.snapshots||[];
-  const opts=snaps.map(s=>`<option value="${s.date}">${s.date}${s.hasReview?' ✍':''}</option>`).join("");
+  window._todayET=d.today;
+  const tag=s=>(s.date===d.today?'(今天·实时)':'')+(s.hasReview?' ✍':'');
+  let opts="";
+  if(!snaps.some(s=>s.date===d.today))opts+=`<option value="${d.today}">${d.today}(今天·实时)</option>`;
+  opts+=snaps.map(s=>`<option value="${s.date}">${s.date}${tag(s)}</option>`).join("");
   el.innerHTML=`
-    <div class="section-title" style="margin-top:6px">每日复盘 <span class="tag">每个交易日 17:00(美东)自动留存快照</span></div>
-    <div class="muted" style="font-size:13px;margin-bottom:12px">每天自动留存一份组合快照(持仓、交易流水、盈亏、风险敞口),并可写下自己的复盘,日后回查、提升交易能力。</div>
+    <div class="section-title" style="margin-top:6px">每日复盘 <span class="tag">收盘后 17:00(美东)自动冻结当日存档</span></div>
+    <div class="muted" style="font-size:13px;margin-bottom:12px">「今天」始终显示实时组合(改总资金量、价格、交易会即时反映);收盘后 17:00(美东)自动把当日定格为历史存档。历史日期为冻结快照,仅复盘文字可改。</div>
     <div class="cmpbar">
       <span class="muted">选择日期</span>
-      <select id="revDate" onchange="showSnapshot(this.value)" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px 10px;border-radius:8px">${opts||'<option value="">暂无快照</option>'}</select>
-      <button class="search" style="margin:0" onclick="takeSnapshotNow()">📸 立即生成今日快照</button>
+      <select id="revDate" onchange="showSnapshot(this.value)" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:7px 10px;border-radius:8px">${opts}</select>
+      <button class="search" style="margin:0" onclick="takeSnapshotNow()">📸 立即冻结/更新今日存档</button>
     </div>
-    <div id="revBody">${snaps.length?'<div class="loading">加载快照…</div>':'<div class="muted">还没有快照。点「立即生成今日快照」手动创建一份;之后每个交易日 17:00(美东)会自动留存。</div>'}</div>`;
-  if(snaps.length)showSnapshot(snaps[0].date);
+    <div id="revBody"><div class="loading">加载…</div></div>`;
+  showSnapshot(d.today);
 }
 async function showSnapshot(date){
   if(!date)return;
   _reviewDate=date;
   const dd=document.getElementById("revDate");if(dd)dd.value=date;
   const body=document.getElementById("revBody");
-  body.innerHTML='<div class="loading">加载快照…</div>';
-  const d=await j("/api/snapshots/"+encodeURIComponent(date));
-  if(d.error){body.innerHTML='<div class="error">'+d.error+'</div>';return;}
-  const st=d.state||{},s=st.summary||{};
+  body.innerHTML='<div class="loading">加载…</div>';
+  const isToday=(date===window._todayET);
+  let st,review="",createdAt="";
+  if(isToday){
+    // 今天:实时取当前组合;复盘文字单独取(可能尚无存档行)
+    const live=await j("/api/positions");
+    st={positions:live.positions||[],summary:live.summary||{},trades:live.trades||[]};
+    const snap=await j("/api/snapshots/"+encodeURIComponent(date));
+    if(snap&&!snap.error){review=snap.review||"";createdAt=snap.createdAt||"";}
+  }else{
+    const dd2=await j("/api/snapshots/"+encodeURIComponent(date));
+    if(dd2.error){body.innerHTML='<div class="error">'+dd2.error+'</div>';return;}
+    st=dd2.state||{};review=dd2.review||"";createdAt=dd2.createdAt||"";
+  }
+  const s=st.summary||{};
   const pos=(st.positions||[]).filter(p=>p.status==='open');
   const trades=(st.trades||[]).filter(t=>t.at===date);
   const cards=`<div class="grid" style="margin-bottom:14px">
@@ -3439,9 +3455,12 @@ async function showSnapshot(date){
     <td>${fmtNum(p.stop)}</td><td>${p.toStopPct!=null?fmtPct(p.toStopPct):'—'}</td>
     <td>${p.riskDollar!=null?'$'+fmtBig(p.riskDollar):'—'}</td><td class="muted">${p.note||''}</td></tr>`).join("");
   const trRows=trades.map(t=>`<tr class="muted"><td>${t.ticker}</td><td>${t.action==='buy'?'买入':'卖出'}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.price)}</td><td class="${t.action==='buy'?'muted':((t.pl||0)>=0?'green':'red')}">${(t.action!=='buy'&&t.pl!=null)?(t.pl>=0?'+':'')+fmtBig(t.pl):'—'}</td><td class="muted">${t.note||''}</td></tr>`).join("");
-  const revEsc=(d.review||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  const revEsc=(review||"").replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  const hdr=isToday
+    ? `<span class="green">● 实时</span> · 收盘后 17:00(美东)自动冻结为当日存档${createdAt?` · 已有存档(${createdAt})` : " · 今日尚无存档"}`
+    : `已冻结存档 · 生成时间 ${createdAt||'—'}`;
   body.innerHTML=`
-    <div class="muted" style="font-size:12px;margin-bottom:10px">快照生成时间:${d.createdAt||'—'}</div>
+    <div class="muted" style="font-size:12px;margin-bottom:10px">${hdr}</div>
     ${cards}
     <div class="section-title" style="font-size:14px">当日持仓</div>
     ${pos.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注</th></tr></thead><tbody>${posRows}</tbody></table>`:'<div class="muted">当日无持仓</div>'}
