@@ -107,6 +107,12 @@ def init_db():
     CREATE TABLE IF NOT EXISTS notify_state(
         key TEXT PRIMARY KEY, fired_at TEXT
     );
+    -- 个股研究笔记:在个股界面随手记录想法,系统自动记时间;按标的归档。
+    CREATE TABLE IF NOT EXISTS stock_notes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_stock_notes_ticker ON stock_notes(ticker, id DESC);
     """)
     # 迁移:为旧库 watchlist 补 sort 列,并按 added_at 回填初始顺序
     wl_cols = [r[1] for r in con.execute("PRAGMA table_info(watchlist)").fetchall()]
@@ -763,6 +769,41 @@ def get_financials(ticker):
     return out
 
 
+def _fin_fallback(ticker):
+    """从利润表(income_stmt)补算被 .info 漏掉的基本面字段。
+
+    yfinance 的 .info(quoteSummary)被限流时会回一个「非空但残缺」的 dict,
+    缺 trailingEps / profitMargins / grossMargins —— 残缺响应还会被 get_info 缓存住,
+    于是个股界面这些指标显示「—」(MU 复现)。这里用已为 DCF 拉取并缓存 30min 的
+    利润表做兜底,取最近一个财年口径,把缺失项补齐。返回值会覆盖到 None 的项上。"""
+    out = {"eps": None, "revenue": None, "profitMargin": None, "grossMargin": None}
+    try:
+        inc = get_financials(ticker).get("inc")
+        if inc is None or inc.empty:
+            return out
+        col = inc.columns[0]  # 最近一期(列按时间倒序)
+
+        def row(name):
+            try:
+                return _num(inc.loc[name, col]) if name in inc.index else None
+            except Exception:
+                return None
+
+        rev = row("Total Revenue") or row("Operating Revenue")
+        net = row("Net Income") or row("Net Income Common Stockholders")
+        gross = row("Gross Profit")
+        out["revenue"] = rev
+        out["eps"] = row("Diluted EPS") or row("Basic EPS")
+        if rev:
+            if net is not None:
+                out["profitMargin"] = net / rev
+            if gross is not None:
+                out["grossMargin"] = gross / rev
+    except Exception:
+        pass
+    return out
+
+
 # ============================ API: 报价 + 基本面 ============================
 
 @app.route("/api/quote")
@@ -784,6 +825,21 @@ def api_quote():
         change = price - prev
         change_pct = change / prev * 100
 
+    financials = {
+        "marketCap": _num(info.get("marketCap")), "trailingPE": _num(info.get("trailingPE")),
+        "forwardPE": _num(info.get("forwardPE")), "priceToBook": _num(info.get("priceToBook")),
+        "eps": _num(info.get("trailingEps")), "revenue": _num(info.get("totalRevenue")),
+        "profitMargin": _num(info.get("profitMargins")), "grossMargin": _num(info.get("grossMargins")),
+        "dividendYield": _num(info.get("dividendYield")), "beta": _num(info.get("beta")),
+        "fiftyTwoWeekHigh": _num(info.get("fiftyTwoWeekHigh")), "fiftyTwoWeekLow": _num(info.get("fiftyTwoWeekLow")),
+    }
+    # .info 被限流时常漏掉 eps/利润率/营收(MU 复现)→ 用利润表兜底补齐缺失项
+    if any(financials[k] is None for k in ("eps", "revenue", "profitMargin", "grossMargin")):
+        fb = _fin_fallback(ticker)
+        for k, v in fb.items():
+            if financials.get(k) is None and v is not None:
+                financials[k] = v
+
     return jsonify({
         "ticker": ticker,
         "name": _safe(info.get("longName") or info.get("shortName")),
@@ -794,14 +850,7 @@ def api_quote():
         "dayHigh": _num(info.get("dayHigh")), "dayLow": _num(info.get("dayLow")),
         "open": _num(info.get("open") or info.get("regularMarketOpen")),
         "volume": _num(info.get("volume") or info.get("regularMarketVolume")),
-        "financials": {
-            "marketCap": _num(info.get("marketCap")), "trailingPE": _num(info.get("trailingPE")),
-            "forwardPE": _num(info.get("forwardPE")), "priceToBook": _num(info.get("priceToBook")),
-            "eps": _num(info.get("trailingEps")), "revenue": _num(info.get("totalRevenue")),
-            "profitMargin": _num(info.get("profitMargins")), "grossMargin": _num(info.get("grossMargins")),
-            "dividendYield": _num(info.get("dividendYield")), "beta": _num(info.get("beta")),
-            "fiftyTwoWeekHigh": _num(info.get("fiftyTwoWeekHigh")), "fiftyTwoWeekLow": _num(info.get("fiftyTwoWeekLow")),
-        },
+        "financials": financials,
         "analyst": {
             "targetMean": _num(info.get("targetMeanPrice")), "targetHigh": _num(info.get("targetHighPrice")),
             "targetLow": _num(info.get("targetLowPrice")), "recommendation": _safe(info.get("recommendationKey")),
@@ -2050,6 +2099,36 @@ def api_watchlist_reorder():
     return jsonify({"watchlist": [r["ticker"] for r in rows]})
 
 
+@app.route("/api/notes", methods=["GET", "POST", "DELETE"])
+def api_notes():
+    """个股研究笔记。GET ?ticker= 列出某只标的的笔记(新→旧);
+    POST {ticker, body} 新增一条并自动记当前时间;DELETE ?id= 删除一条。"""
+    db = get_db()
+    if request.method == "GET":
+        tk = (request.args.get("ticker") or "").strip().upper()
+        if not tk:
+            return jsonify({"notes": []})
+        rows = db.execute("SELECT id, ticker, body, created_at FROM stock_notes WHERE ticker=? ORDER BY id DESC", (tk,)).fetchall()
+        return jsonify({"notes": [dict(r) for r in rows]})
+    if request.method == "POST":
+        d = request.get_json(force=True, silent=True) or {}
+        tk = (d.get("ticker") or "").strip().upper()
+        body = (d.get("body") or "").strip()
+        if not tk or not body:
+            return jsonify({"error": "ticker / body 必填"}), 400
+        cur = db.execute("INSERT INTO stock_notes(ticker, body, created_at) VALUES(?,?,?)",
+                         (tk, body, time.strftime("%Y-%m-%d %H:%M:%S")))
+        db.commit()
+        row = db.execute("SELECT id, ticker, body, created_at FROM stock_notes WHERE id=?", (cur.lastrowid,)).fetchone()
+        return jsonify({"note": dict(row)})
+    # DELETE
+    nid = request.args.get("id")
+    if nid:
+        db.execute("DELETE FROM stock_notes WHERE id=?", (nid,))
+        db.commit()
+    return jsonify({"ok": True})
+
+
 def _get_setting(key):
     row = get_db().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else None
@@ -2212,6 +2291,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .side-watch{display:flex;flex-direction:column;gap:6px;min-height:0}
   .side-watch-hd{display:flex;align-items:center;justify-content:space-between}
   .side-watch-hd .lbl{color:var(--muted);font-size:12px;font-weight:600}
+  .wl-sort{background:none;border:1px solid var(--border);color:var(--muted);font-size:11px;padding:2px 7px;border-radius:6px;cursor:pointer}
+  .wl-sort:hover{border-color:var(--accent);color:var(--text)}
   .watchlist{display:flex;flex-direction:column;gap:5px;overflow-y:auto}
   .wchip{display:flex;gap:6px;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--border);padding:7px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;touch-action:none;user-select:none}
   .wchip:hover{border-color:var(--accent)}
@@ -2220,6 +2301,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .wchip .wq{display:flex;align-items:center;gap:5px;font-size:12px}
   .wchip .wprice{color:var(--text)}
   .wchip .x{color:var(--muted);font-size:11px;padding-left:4px}.wchip .x:hover{color:var(--red)}
+  .notes-box{display:flex;flex-direction:column;gap:8px}
+  .note-input{width:100%;box-sizing:border-box;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 11px;font:inherit;font-size:13px;resize:vertical}
+  .note-input:focus{outline:none;border-color:var(--accent)}
+  .note-actions{display:flex;justify-content:flex-end}
+  .note-save{background:var(--accent);border:none;color:#fff;padding:6px 16px;border-radius:7px;cursor:pointer;font-size:13px}
+  .note-save:hover{opacity:.9}
+  .note-item{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:9px 11px;display:flex;flex-direction:column;gap:4px}
+  .note-item .note-meta{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:11px}
+  .note-item .note-body{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5}
+  .note-item .note-del{color:var(--muted);cursor:pointer;font-size:11px}.note-item .note-del:hover{color:var(--red)}
+  .notes-empty{color:var(--muted);font-size:12px;padding:4px 0}
   .content{flex:1 1 auto;min-width:0;padding:20px 24px;max-width:1520px}
   @media(max-width:880px){
     .app{flex-direction:column}
@@ -2331,7 +2423,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
      <button onclick="loadTicker()">查询</button>
    </div>
    <div class="side-watch">
-     <div class="side-watch-hd"><span class="lbl">自选股</span></div>
+     <div class="side-watch-hd"><span class="lbl">自选股</span><button class="wl-sort" onclick="sortWatchByChange()" title="按当日涨跌幅降序排列">涨跌幅 ↓</button></div>
      <div class="watchlist" id="watchlist"></div>
    </div>
  </aside>
@@ -2442,7 +2534,17 @@ async function renderWatch(){
   el.innerHTML=watchlist.map(t=>`<span class="wchip" id="w-${t}" onclick="wchipClick('${t}')"><span class="wtk">${t}</span><span class="muted">…</span></span>`).join("");
   attachWatchDnD();
   const q=await j("/api/quotes?tickers="+watchlist.join(","));
-  q.quotes.forEach(x=>{const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`<span class="wtk">${x.ticker}</span><span class="wq"><span class="wprice">${fmtNum(x.price)}</span><span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span></span>`;});
+  window._wq={};
+  q.quotes.forEach(x=>{window._wq[x.ticker]=x;const c=document.getElementById("w-"+x.ticker);if(c)c.innerHTML=`<span class="wtk">${x.ticker}</span><span class="wq"><span class="wprice">${fmtNum(x.price)}</span><span class="${(x.changePct||0)>=0?'green':'red'}">${fmtPct(x.changePct)}</span><span class="x" onclick="event.stopPropagation();toggleWatch('${x.ticker}')">✕</span></span>`;});
+}
+// 按当日涨跌幅降序重排自选股(无行情数据的排末尾),并持久化新顺序
+async function sortWatchByChange(){
+  if(!watchlist.length)return;
+  let q=window._wq;
+  if(!q){try{const d=await j("/api/quotes?tickers="+watchlist.join(","));q={};(d.quotes||[]).forEach(x=>q[x.ticker]=x);window._wq=q;}catch(e){return;}}
+  const chg=t=>{const v=q[t]&&q[t].changePct;return v==null?-Infinity:v;};
+  watchlist=[...watchlist].sort((a,b)=>chg(b)-chg(a));
+  renderWatch();persistWatchOrder(watchlist);
 }
 // 点击自选股加载;若刚结束一次拖拽则吞掉这次点击
 function wchipClick(t){if(window._wSuppressClick){window._wSuppressClick=false;return;}loadTicker(t);}
@@ -2488,6 +2590,38 @@ document.addEventListener("pointerup",_wdragEnd);
 document.addEventListener("pointercancel",_wdragEnd);
 async function persistWatchOrder(order){try{await fetch("/api/watchlist/reorder",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({order})});}catch(e){}}
 
+// ---------- 个股笔记 ----------
+function _noteEsc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+async function loadNotes(){
+  const list=document.getElementById("notesList");if(!list)return;
+  let d;try{d=await j("/api/notes?ticker="+encodeURIComponent(curTicker));}catch(e){list.innerHTML='<div class="notes-empty">加载失败</div>';return;}
+  renderNotes(d.notes||[]);
+}
+function renderNotes(notes){
+  const list=document.getElementById("notesList");if(!list)return;
+  if(!notes.length){list.innerHTML='<div class="notes-empty">还没有笔记,写点什么吧。</div>';return;}
+  list.innerHTML=notes.map(n=>`<div class="note-item"><div class="note-meta"><span>🕒 ${n.created_at||""}</span><span class="note-del" onclick="deleteNote(${n.id})">删除</span></div><div class="note-body">${_noteEsc(n.body)}</div></div>`).join("");
+}
+async function saveNote(){
+  const ta=document.getElementById("noteInput");if(!ta)return;
+  const body=ta.value.trim();if(!body)return;
+  const tk=curTicker;
+  try{
+    const r=await(await fetch("/api/notes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,body})})).json();
+    if(r.error){alert(r.error);return;}
+    ta.value="";
+    if(tk===curTicker)loadNotes();
+  }catch(e){alert("保存失败");}
+}
+async function deleteNote(id){
+  if(!confirm("删除这条笔记?"))return;
+  try{await fetch("/api/notes?id="+id,{method:"DELETE"});loadNotes();}catch(e){}
+}
+// Ctrl/⌘+Enter 在笔记框内快捷保存
+document.addEventListener("keydown",e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==="Enter"&&e.target&&e.target.id==="noteInput"){e.preventDefault();saveNote();}
+});
+
 // ---------- 主入口 ----------
 async function loadTicker(t){
   if(curPage!=="stock")switchPage("stock");
@@ -2501,7 +2635,7 @@ async function loadTicker(t){
   if(q.error){document.getElementById("tabc-overview").innerHTML='<div class="error">'+q.error+'</div>';return;}
   window._curPrice=q.price;
   renderOverview(q);
-  loadChart(curPeriod);loadSepa();loadEarnings();loadLiquidity();loadNews();loadDecision();loadAlerts();
+  loadChart(curPeriod);loadSepa();loadEarnings();loadLiquidity();loadNews();loadDecision();loadAlerts();loadNotes();
 }
 function card(k,v){return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`;}
 
@@ -2535,6 +2669,12 @@ function renderOverview(q){
      <div class="section-title">财报日 / 业绩 <span class="tag">skill: earnings-preview</span></div><div id="earnings"><div class="loading">加载中…</div></div>
      <div class="section-title">价格 / 止损预警 <span class="tag">到价 · 跌破20MA · 止损</span></div><div id="alertsPanel"></div>
      <div class="section-title">重要消息 / 新闻</div><div id="news"><div class="loading">加载中…</div></div>
+     <div class="section-title">我的笔记</div>
+     <div class="notes-box">
+       <textarea id="noteInput" class="note-input" rows="3" placeholder="记点关于 ${q.ticker} 的想法…(Ctrl+Enter 保存)"></textarea>
+       <div class="note-actions"><button class="note-save" onclick="saveNote()">保存笔记</button></div>
+       <div id="notesList"><div class="loading">加载中…</div></div>
+     </div>
     </div>
     <aside class="ov-side"><div id="sizerPanel" class="sizer-panel"></div></aside>
    </div>`;
