@@ -2051,13 +2051,31 @@ def api_positions():
         if not tk or not d.get("shares") or not d.get("entry"):
             return jsonify({"error": "ticker / shares / entry 必填"}), 400
         today = time.strftime("%Y-%m-%d")
-        cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price) VALUES(?,?,?,?,?,?, 'open', ?, ?)",
-                         (tk, float(d["shares"]), float(d["entry"]), _num(d.get("stop")), _num(d.get("target")),
-                          today, d.get("note") or "", _num(d.get("manual_price"))))
+        add_shares, add_entry = float(d["shares"]), float(d["entry"])
+        mp = _num(d.get("manual_price"))
+        # 加仓合并:同标的已有未平仓仓位则按加权成本并入,不再新建一行
+        existing = db.execute("SELECT * FROM positions WHERE ticker=? AND status='open' ORDER BY id LIMIT 1",
+                              (tk,)).fetchone()
+        if existing:
+            new_shares = existing["shares"] + add_shares
+            new_entry = (existing["shares"] * existing["entry"] + add_shares * add_entry) / new_shares
+            qn = f"{add_shares:g}" if float(add_shares).is_integer() else f"{add_shares}"
+            tn = f"{new_shares:g}" if float(new_shares).is_integer() else f"{new_shares}"
+            tag = f"[加仓 {today} +{qn}@{add_entry:g}|共{tn}股 均价{round(new_entry, 4):g}]"
+            new_note = ((existing["note"] + " ") if existing["note"] else "") + tag
+            new_mp = mp if mp is not None else existing["manual_price"]   # 提供新现价则更新,否则保留
+            db.execute("UPDATE positions SET shares=?, entry=?, note=?, manual_price=? WHERE id=?",
+                       (new_shares, new_entry, new_note, new_mp, existing["id"]))
+            pos_id = existing["id"]
+        else:
+            cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price) VALUES(?,?,?,?,?,?, 'open', ?, ?)",
+                             (tk, add_shares, add_entry, _num(d.get("stop")), _num(d.get("target")),
+                              today, d.get("note") or "", mp))
+            pos_id = cur.lastrowid
         db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'buy',?,?,NULL,?,?)",
-                   (cur.lastrowid, tk, float(d["shares"]), float(d["entry"]), today, d.get("note") or ""))
+                   (pos_id, tk, add_shares, add_entry, today, d.get("note") or ""))
         db.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "merged": bool(existing)})
     # GET: 带实时盈亏
     return jsonify(_portfolio_state(db))
 
@@ -2114,9 +2132,9 @@ def _portfolio_state(db):
                "investedPct": (total_cost / acct * 100) if acct else None,   # 已投入成本占账户
                "marketPct": (total_mv / acct * 100) if acct else None,        # 持仓市值占账户=仓位占账户
                "riskPct": (total_risk / acct * 100) if acct else None}
-    # 按时间正序;同一天「买入」排在「卖出」之前(回填买入的 id 可能晚于早先卖出,故不能只按 id)
+    # 倒序:最新交易在最上面;同一天「买入」沉到当天底部(它是当天最早的动作),其余按 id 倒序
     trades = [dict(r) for r in db.execute(
-        "SELECT * FROM trades ORDER BY at ASC, (action='sell') ASC, id ASC").fetchall()]
+        "SELECT * FROM trades ORDER BY at DESC, (action='buy') ASC, id DESC").fetchall()]
     return {"positions": rows, "summary": summary, "trades": trades}
 
 
@@ -3231,14 +3249,7 @@ async function loadTrack(){
       <td class="muted">${p.note||""}</td>
       <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
-  const tradeRows=trades.map(t=>{
-    const isBuy=t.action==="buy";
-    const plc=(t.pl||0)>=0?"green":"red";
-    return `<tr class="muted"><td>${t.at||""}</td><td>${t.ticker}</td>
-      <td>${isBuy?"买入":"卖出"}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.price)}</td>
-      <td class="${isBuy?'muted':plc}">${(!isBuy&&t.pl!=null)?(t.pl>=0?"+":"")+fmtBig(t.pl):"—"}</td>
-      <td class="muted">${t.note||""}</td>
-      <td><a style="color:var(--red)" onclick="delTrade(${t.id})">删</a></td></tr>`;}).join("");
+  window._allTrades=trades;window._tradePage=0;
   el.innerHTML=`
     ${capBar}
     ${sumCards}
@@ -3250,9 +3261,33 @@ async function loadTrack(){
       <input id="npPrice" placeholder="现价(手填,选填)" type="number" title="期权/港股等无实时行情时手填现价;留空则走 yfinance" style="width:130px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
     ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
-    ${trades.length?`<div class="section-title" style="font-size:14px">交易明细(买卖流水)</div><table><thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>已实现盈亏</th><th>备注</th><th></th></tr></thead><tbody>${tradeRows}</tbody></table>`:""}
+    <div id="tradeBox"></div>
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
+  renderTrades();
 }
+const TRADES_PER_PAGE=20;
+function renderTrades(){
+  const box=document.getElementById("tradeBox");if(!box)return;
+  const all=window._allTrades||[];
+  if(!all.length){box.innerHTML="";return;}
+  const pages=Math.ceil(all.length/TRADES_PER_PAGE);
+  let pg=window._tradePage||0;if(pg<0)pg=0;if(pg>=pages)pg=pages-1;window._tradePage=pg;
+  const rows=all.slice(pg*TRADES_PER_PAGE,pg*TRADES_PER_PAGE+TRADES_PER_PAGE).map(t=>{
+    const isBuy=t.action==="buy";
+    const plc=(t.pl||0)>=0?"green":"red";
+    return `<tr class="muted"><td>${t.at||""}</td><td>${t.ticker}</td>
+      <td>${isBuy?"买入":"卖出"}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.price)}</td>
+      <td class="${isBuy?'muted':plc}">${(!isBuy&&t.pl!=null)?(t.pl>=0?"+":"")+fmtBig(t.pl):"—"}</td>
+      <td class="muted">${t.note||""}</td>
+      <td><a style="color:var(--red)" onclick="delTrade(${t.id})">删</a></td></tr>`;}).join("");
+  const nav=pages>1?`<div class="cmpbar" style="justify-content:flex-end;gap:10px;margin-top:8px">
+      <button class="search" style="margin:0;opacity:${pg<=0?0.4:1}" ${pg<=0?"disabled":""} onclick="changeTradePage(-1)">← 上一页</button>
+      <span class="muted" style="align-self:center">第 ${pg+1}/${pages} 页 · 共 ${all.length} 条</span>
+      <button class="search" style="margin:0;opacity:${pg>=pages-1?0.4:1}" ${pg>=pages-1?"disabled":""} onclick="changeTradePage(1)">下一页 →</button></div>`:"";
+  box.innerHTML=`<div class="section-title" style="font-size:14px">交易明细(买卖流水) <span class="muted" style="font-size:12px">最新在前</span></div>
+    <table><thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>已实现盈亏</th><th>备注</th><th></th></tr></thead><tbody>${rows}</tbody></table>${nav}`;
+}
+function changeTradePage(delta){window._tradePage=(window._tradePage||0)+delta;renderTrades();}
 async function saveAccount(){
   const v=parseFloat(document.getElementById("acctInput").value);
   if(!(v>0)){alert("请输入正数总资金量");return;}
