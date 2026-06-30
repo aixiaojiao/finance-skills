@@ -72,12 +72,13 @@ def init_db():
         opened_at TEXT, status TEXT DEFAULT 'open',
         exit_price REAL, closed_at TEXT, note TEXT
     );
-    -- 交易明细:每次平仓/减仓写一条(部分平仓也记录),作为已实现盈亏的权威台账
+    -- 交易明细:买卖流水台账。建仓=buy(记成本价,无盈亏);平仓/减仓=sell(记成交价+已实现盈亏)
     CREATE TABLE IF NOT EXISTS trades(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        position_id INTEGER, ticker TEXT NOT NULL, shares REAL NOT NULL,
-        entry REAL NOT NULL, exit_price REAL NOT NULL, pl REAL,
-        closed_at TEXT, note TEXT
+        position_id INTEGER, ticker TEXT NOT NULL,
+        action TEXT NOT NULL DEFAULT 'sell',
+        shares REAL NOT NULL, price REAL NOT NULL, pl REAL,
+        at TEXT, note TEXT
     );
     CREATE TABLE IF NOT EXISTS alerts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,12 +128,30 @@ def init_db():
         con.execute("ALTER TABLE watchlist ADD COLUMN sort INTEGER DEFAULT 0")
         for i, r in enumerate(con.execute("SELECT ticker FROM watchlist ORDER BY added_at, ticker").fetchall()):
             con.execute("UPDATE watchlist SET sort=? WHERE ticker=?", (i, r[0]))
-    # 迁移:把旧库里已平仓的持仓回填进 trades 台账(幂等:已存在 position_id 的不再插入)
-    con.execute("""INSERT INTO trades(position_id, ticker, shares, entry, exit_price, pl, closed_at, note)
-        SELECT id, ticker, shares, entry, exit_price, (exit_price-entry)*shares, closed_at, note
+    # 迁移:旧版 trades(仅卖出台账,列为 entry/exit_price/closed_at)→ 统一买卖流水(action/price/at)
+    tr_cols = [r[1] for r in con.execute("PRAGMA table_info(trades)").fetchall()]
+    if "action" not in tr_cols:
+        con.execute("ALTER TABLE trades RENAME TO trades_old")
+        con.execute("""CREATE TABLE trades(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id INTEGER, ticker TEXT NOT NULL,
+            action TEXT NOT NULL DEFAULT 'sell',
+            shares REAL NOT NULL, price REAL NOT NULL, pl REAL,
+            at TEXT, note TEXT)""")
+        con.execute("""INSERT INTO trades(id, position_id, ticker, action, shares, price, pl, at, note)
+            SELECT id, position_id, ticker, 'sell', shares, exit_price, pl, closed_at, note FROM trades_old""")
+        con.execute("DROP TABLE trades_old")
+    # 回填卖出:旧库里已平仓的持仓补一条 sell 流水(幂等)
+    con.execute("""INSERT INTO trades(position_id, ticker, action, shares, price, pl, at, note)
+        SELECT id, ticker, 'sell', shares, exit_price, (exit_price-entry)*shares, closed_at, note
         FROM positions
         WHERE status='closed' AND exit_price IS NOT NULL
-          AND id NOT IN (SELECT position_id FROM trades WHERE position_id IS NOT NULL)""")
+          AND id NOT IN (SELECT position_id FROM trades WHERE action='sell' AND position_id IS NOT NULL)""")
+    # 回填买入:已有持仓(建仓时未记流水的)补一条 buy 流水(幂等),让交易明细完整
+    con.execute("""INSERT INTO trades(position_id, ticker, action, shares, price, pl, at, note)
+        SELECT id, ticker, 'buy', shares, entry, NULL, opened_at, note
+        FROM positions
+        WHERE id NOT IN (SELECT position_id FROM trades WHERE action='buy' AND position_id IS NOT NULL)""")
     # 自选股默认值(仅首次为空时)
     cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
     if cur[0] == 0:
@@ -2014,9 +2033,12 @@ def api_positions():
         tk = (d.get("ticker") or "").strip().upper()
         if not tk or not d.get("shares") or not d.get("entry"):
             return jsonify({"error": "ticker / shares / entry 必填"}), 400
-        db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note) VALUES(?,?,?,?,?,?, 'open', ?)",
-                   (tk, float(d["shares"]), float(d["entry"]), _num(d.get("stop")), _num(d.get("target")),
-                    time.strftime("%Y-%m-%d"), d.get("note") or ""))
+        today = time.strftime("%Y-%m-%d")
+        cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note) VALUES(?,?,?,?,?,?, 'open', ?)",
+                         (tk, float(d["shares"]), float(d["entry"]), _num(d.get("stop")), _num(d.get("target")),
+                          today, d.get("note") or ""))
+        db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'buy',?,?,NULL,?,?)",
+                   (cur.lastrowid, tk, float(d["shares"]), float(d["entry"]), today, d.get("note") or ""))
         db.commit()
         return jsonify({"ok": True})
     # GET: 带实时盈亏
@@ -2038,7 +2060,10 @@ def api_positions():
             r["marketValue"] = mv
             r["pl"] = mv - cost
             r["plPct"] = (price / r["entry"] - 1) * 100
-            r["toStopPct"] = ((price / r["stop"] - 1) * 100) if r["stop"] else None
+            # 距止损:现价回落到止损的跌幅(负数=还要跌多少才触发止损),遵循绿涨红跌
+            r["toStopPct"] = ((r["stop"] / price - 1) * 100) if r["stop"] else None
+            # 风险敞口($):从现价回落到止损会亏多少(现价−止损)×股数;止损≥成本则为锁定的利润回吐
+            r["riskDollar"] = ((price - r["stop"]) * r["shares"]) if r["stop"] else None
             if r["stop"] and r["status"] == "open":
                 rps = r["entry"] - r["stop"]
                 if rps > 0:                                   # 止损低于成本:正常 R 倍数
@@ -2081,8 +2106,8 @@ def api_position_one(pid):
             qty = cur_shares                                   # 默认/超额视为清仓
         today = time.strftime("%Y-%m-%d")
         pl = (px - row["entry"]) * qty
-        db.execute("INSERT INTO trades(position_id,ticker,shares,entry,exit_price,pl,closed_at,note) VALUES(?,?,?,?,?,?,?,?)",
-                   (pid, row["ticker"], qty, row["entry"], px, pl, today, d.get("note") or ""))
+        db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,note) VALUES(?,?,'sell',?,?,?,?,?)",
+                   (pid, row["ticker"], qty, px, pl, today, d.get("note") or ""))
         if qty >= cur_shares:                                  # 清仓
             db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=?, shares=? WHERE id=?",
                        (px, today, qty, pid))
@@ -3089,20 +3114,27 @@ async function loadTrack(){
   window._openPos=open;
   const openRows=open.map(p=>{
     const plc=(p.pl||0)>=0?"green":"red";
-    const stopc=p.toStopPct!=null&&p.toStopPct<5?"red":"";
+    // 止损≥成本=锁利(绿),否则=亏损风险(红);遵循绿赚红亏
+    const locked=(p.stop!=null&&p.entry!=null&&p.stop>=p.entry);
+    const stopc=p.stop==null?"":(locked?"green":"red");
+    const riskCell=p.riskDollar!=null
+      ? `<span class="${stopc}" title="(现价−止损)×股数;${locked?'止损已在成本之上,这是会回吐的利润':'触及止损将亏损此金额'}">${p.riskDollar>=0?"":"-"}$${fmtBig(Math.abs(p.riskDollar))}</span>`
+      : '<span class="red" title="未设止损,下行风险不封顶">未设止损</span>';
     return `<tr id="posrow-${p.id}">
       <td><b class="wchip" style="cursor:pointer;padding:2px 6px" onclick="loadTicker('${p.ticker}')">${p.ticker}</b></td>
       <td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}</td>
       <td class="${plc}">${p.pl!=null?(p.pl>=0?"+":"")+fmtBig(p.pl):"—"} ${p.plPct!=null?`(${fmtPct(p.plPct)})`:""}</td>
-      <td>${fmtNum(p.stop)}</td><td class="${stopc}">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
-      <td>${p.rMultiple!=null?p.rMultiple.toFixed(2)+"R":(p.lockedPct!=null?`<span class="green" title="止损在成本之上,已锁定利润;R 不适用">🔒锁利 +${p.lockedPct.toFixed(1)}%</span>`:'<span class="muted" title="未设止损,R 不适用">NA</span>')}</td>
+      <td>${fmtNum(p.stop)}</td><td class="${stopc}" title="现价到止损还要跌多少;止损在成本之上则锁利(绿)">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
+      <td>${riskCell}</td>
       <td class="muted">${p.note||""}</td>
       <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
   const tradeRows=trades.map(t=>{
+    const isBuy=t.action==="buy";
     const plc=(t.pl||0)>=0?"green":"red";
-    return `<tr class="muted"><td>${t.ticker}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.entry)}</td><td>${fmtNum(t.exit_price)}</td>
-      <td class="${plc}">${t.pl!=null?(t.pl>=0?"+":"")+fmtBig(t.pl):"—"}</td><td>${t.closed_at||""}</td>
+    return `<tr class="muted"><td>${t.at||""}</td><td>${t.ticker}</td>
+      <td>${isBuy?"买入":"卖出"}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.price)}</td>
+      <td class="${isBuy?'muted':plc}">${(!isBuy&&t.pl!=null)?(t.pl>=0?"+":"")+fmtBig(t.pl):"—"}</td>
       <td class="muted">${t.note||""}</td>
       <td><a style="color:var(--red)" onclick="delTrade(${t.id})">删</a></td></tr>`;}).join("");
   el.innerHTML=`
@@ -3114,8 +3146,8 @@ async function loadTrack(){
       <input id="npEntry" placeholder="买入价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
-    ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>R</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
-    ${trades.length?`<div class="section-title" style="font-size:14px">交易记录(已实现)</div><table><thead><tr><th>代码</th><th>平仓股数</th><th>成本</th><th>平仓价</th><th>已实现盈亏</th><th>日期</th><th>备注</th><th></th></tr></thead><tbody>${tradeRows}</tbody></table>`:""}
+    ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
+    ${trades.length?`<div class="section-title" style="font-size:14px">交易明细(买卖流水)</div><table><thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>已实现盈亏</th><th>备注</th><th></th></tr></thead><tbody>${tradeRows}</tbody></table>`:""}
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
 }
 async function saveAccount(){
