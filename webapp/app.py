@@ -41,6 +41,8 @@ app = Flask(__name__)
 # ============================ SQLite 持久化 ============================
 # 持仓 / 自选 / 预警 / 设置 落盘,跨设备。路径可用 DASHBOARD_DB 覆盖。
 
+APP_VERSION = "1.0.0"   # 版本号(见 CHANGELOG.md);按语义化版本管理
+
 DB_PATH = os.environ.get("DASHBOARD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dashboard.db"))
 
 
@@ -2457,7 +2459,7 @@ def api_cache_status():
 
 @app.route("/")
 def index():
-    return Response(INDEX_HTML, mimetype="text/html")
+    return Response(INDEX_HTML.replace("{{VERSION}}", APP_VERSION), mimetype="text/html")
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -2616,7 +2618,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="app">
  <!-- 全局左侧栏:品牌 + 导航 + 搜索 + 自选股 -->
  <aside class="sidebar">
-   <div class="brand">📈 看板</div>
+   <div class="brand">📈 看板 <span style="font-size:11px;color:var(--muted);font-weight:500">v{{VERSION}}</span></div>
    <nav class="sidenav">
      <button id="nav-stock" class="active" onclick="switchPage('stock')">📊 个股看板</button>
      <button id="nav-positions" onclick="switchPage('positions')">💼 持仓</button>

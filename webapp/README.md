@@ -1,6 +1,10 @@
 # 个股看板 · Stock Dashboard
 
-一个 Flask + yfinance 的个人炒股决策仪表盘,三页面 SPA。前端用 [TradingView lightweight-charts](https://github.com/tradingview/lightweight-charts) 画 K 线、[ECharts](https://echarts.apache.org/) 画热力图/期权墙/GEX,暗色主题。持仓/自选/预警/设置存在服务端 **SQLite**。
+![version](https://img.shields.io/badge/version-1.0.0-blue)
+
+一个 Flask + yfinance 的个人炒股决策仪表盘,**四页面** SPA。前端用 [TradingView lightweight-charts](https://github.com/tradingview/lightweight-charts) 画 K 线、[ECharts](https://echarts.apache.org/) 画热力图/期权墙/GEX,暗色主题。持仓/交易流水/复盘/自选/预警/设置存在服务端 **SQLite**。
+
+> 当前版本 **V1.0.0**。完整变更见 [`CHANGELOG.md`](CHANGELOG.md)。按[语义化版本](https://semver.org/lang/zh-CN/)管理,git 标签为 `webapp-v<版本>`。
 
 ## 页面1 · 个股看板
 
@@ -16,7 +20,9 @@
 - **价格 / 止损预警**:到价、跌破 20MA、触及止损(后端实时评估,触发上 banner)
 
 **仓位计算** — `sepa-strategy/position-sizing`
-- 输入买入价/止损价/总资产 + 总仓位上限 + 总风险上限(% 或 $),算同时满足全部条件的最大股数;一键「记入持仓」
+- 输入买入价/止损价/总资产 + 总仓位上限 + 总风险上限(% 或 $),算同时满足全部条件的最大股数
+- **买入股数可手改**(默认最大值),投入资金/风险金额实时重算;改任一条件即重置回最大值
+- 一键「记入持仓」,按实际填入的股数记录
 
 **估值** — `company-valuation` + `estimate-analysis`
 - DCF + 分析师目标 + 远期PE 三角定位合理价与上下空间;分析师预期表 + EPS 预期修正方向
@@ -31,10 +37,24 @@
 ## 页面2 · 持仓(SQLite 持久化)
 
 - 顶部 **总资金量**:可编辑、持久化,作为唯一真相;显示已投入/可用现金/浮盈亏;仓位计算默认从此取值
-- 持仓表:实时浮盈亏、距止损、R 倍数;汇总:总市值/浮盈亏、仓位占比、**组合风险敞口(热度)**
-- 手动添加 / 平仓 / 删除;已平仓沉淀为交易记录
+- 持仓表:实时浮盈亏、**距止损(回落跌幅,绿赚红亏)**、**风险敞口($ = (现价−止损)×股数)**、备注
+- 汇总:总市值/浮盈亏、**仓位占账户(按市值)**、**组合风险敞口(热度)**
+- **行内编辑**(股数/成本/现价/止损/目标/备注);只有一笔买入的仓位编辑后会同步修正其交易明细
+- **加仓自动合并**到同标的仓位(加权平均成本),不再重复建行
+- **手填现价**:期权/港股等无实时行情的标的可自填现价,不走 yfinance
+- **空头支持**:负股数表示卖出开仓(如备兑 call),盈亏方向与平仓均正确
+- **平仓**:行内输入平仓价 + 数量,支持部分平仓(保留剩余并注明)与清仓(记累计已实现盈亏)
 
-## 页面3 · 市场热力图(独立页签)
+### 交易明细(买卖流水台账)
+- 每笔买入/卖出独立记录,带精确时间戳,**严格按成交先后倒序**(最新在最上);分页,每页 20 条,可单条删除
+
+## 页面3 · 每日复盘
+
+- **「今天」实时显示**当前组合(改总资金量/价格/交易即时反映)
+- 每个交易日 **17:00(美东)自动冻结**当日存档(持仓、交易、盈亏、敞口);历史日期为只读快照
+- 每日可写**复盘文字**并持久化,供日后回查、提升交易能力;另有「立即冻结/更新今日存档」按钮
+
+## 页面4 · 市场热力图(独立页签)
 
 - **个股热力图**:按板块分组 treemap,面积≈市值,颜色=当日涨跌
 - **板块热力图**:板块 treemap(同风格,面积=板块市值,色=市值加权涨跌),ETF 数据在悬浮提示
@@ -94,6 +114,14 @@ webapp/.venv/bin/python webapp/app.py
 | `/api/valuation?ticker=AAPL` | DCF + 相对估值 + 预期趋势 |
 | `/api/options/expiries?ticker=AAPL` | 期权到期日列表 |
 | `/api/options/chain?ticker=AAPL&expiry=YYYY-MM-DD` | 期权链 |
+| `/api/positions` (GET/POST) | 持仓列表(实时盈亏/敞口 + 汇总 + 买卖流水);POST 建仓/加仓(同标的合并),记买入流水 |
+| `/api/positions/<id>` (PUT/DELETE) | 编辑/平仓(`action=close`,支持部分与空头)/删除;单买入仓位编辑同步流水 |
+| `/api/trades/<id>` (DELETE) | 删除一条交易流水 |
+| `/api/snapshots` (GET) | 复盘存档日期列表 + 美东 today |
+| `/api/snapshots/take` (POST) | 立即冻结/更新今日存档 |
+| `/api/snapshots/<date>` (GET) | 某日冻结快照(持仓/交易/汇总)+ 复盘文字 |
+| `/api/snapshots/<date>/review` (POST) | 保存某日复盘文字 |
+| `/api/notes?ticker=AAPL` (GET/POST/DELETE) | 个股研究笔记 |
 | `/api/heatmap` | 全市场个股 + 板块热力图(`?force=1` 盘中强制刷新;盘后恒用缓存) |
 | `/api/heatmap/sectors` (GET/POST) | 读取/覆盖自定义板块配置(GET 含内置默认) |
 | `/api/notify/status` | Telegram 推送开关状态 + 是否已配置推送通道 |
