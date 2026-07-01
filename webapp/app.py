@@ -147,6 +147,16 @@ def init_db():
         mistake_tags TEXT, lesson TEXT,
         created_at TEXT, updated_at TEXT
     );
+    -- 每日市场环境日志:扩展「每日复盘」的结构化环境卡。auto_json=盘后自动带入的
+    --   指数/VIX/情绪/板块/组合快照(当天实时、盘后冻结);其余为手填结构化字段(随时可改)。
+    CREATE TABLE IF NOT EXISTS market_journal(
+        date TEXT PRIMARY KEY,
+        auto_json TEXT,
+        trend_view TEXT, ftd INTEGER, distribution_days INTEGER,
+        fed_note TEXT, macro_events TEXT, intl_note TEXT,
+        feeling TEXT, mood_score INTEGER, discipline_score INTEGER,
+        created_at TEXT, updated_at TEXT
+    );
     """)
     # 迁移:持仓支持「手填现价」(期权/港股等无实时行情的标的)——非空即视为手动定价,不拉 yfinance
     pos_cols = [r[1] for r in con.execute("PRAGMA table_info(positions)").fetchall()]
@@ -746,6 +756,7 @@ def _daily_report_loop():
             snap_key = f"snapshot:{now_et.date().isoformat()}"
             if now_et.weekday() < 5 and snap_key not in _fired_keys():
                 take_portfolio_snapshot(now_et.date().isoformat())
+                freeze_market_journal(now_et.date().isoformat())   # 同时冻结当日市场环境 auto_json
                 _mark_fired(snap_key)
         except Exception:
             pass
@@ -2614,6 +2625,102 @@ def api_performance():
     return jsonify({"overall": overall, "bySetup": setups, "trades": trades})
 
 
+# ============================ 每日市场环境日志(plan #2 B) ============================
+
+MARKET_JOURNAL_FIELDS = ("trend_view", "ftd", "distribution_days", "fed_note",
+                         "macro_events", "intl_note", "feeling", "mood_score", "discipline_score")
+
+
+def _market_auto_snapshot(db):
+    """盘后自动带入的市场环境快照(信息性):指数/VIX/情绪/环境 + 领涨领跌板块 + 我的组合。
+    板块复用已缓存的热力图(不重算);组合取 _portfolio_state 汇总。db 需 row_factory=Row。"""
+    mkt = _market_overview()
+    dji = None
+    try:
+        dji = _index_snapshot("^DJI")
+    except Exception:
+        pass
+    chg = lambda o: (o.get("changePct") if isinstance(o, dict) else None)
+    # 板块:读缓存热力图,按当日涨跌幅排序取领涨/领跌 Top3
+    hm, _epoch = _read_heatmap_cache()
+    secs = [s for s in ((hm or {}).get("sectors") or []) if s.get("change") is not None]
+    ranked = sorted(secs, key=lambda s: s["change"], reverse=True)
+    top = [{"sector": s["sector"], "change": s["change"]} for s in ranked[:3]]
+    bottom = [{"sector": s["sector"], "change": s["change"]} for s in ranked[-3:][::-1]]
+    summ = _portfolio_state(db)["summary"]
+    return {
+        "asof": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "indices": {"spx": chg(mkt.get("spx")), "ndx": chg(mkt.get("ndx")), "dji": chg(dji)},
+        "vix": mkt.get("vix"), "environment": mkt.get("environment"),
+        "environmentClass": mkt.get("environmentClass"),
+        "sentiment": mkt.get("sentiment"), "sentimentLabel": mkt.get("sentimentLabel"),
+        "sectorsTop": top, "sectorsBottom": bottom,
+        "portfolio": {"marketValue": summ.get("totalMarketValue"), "pl": summ.get("totalPL"),
+                      "plPct": summ.get("totalPLPct"), "riskPct": summ.get("riskPct"),
+                      "marketPct": summ.get("marketPct")},
+    }
+
+
+def freeze_market_journal(date_str, db=None):
+    """盘后冻结当日 auto_json(保留已填手填字段)。可后台线程调用(自带连接)。"""
+    con = db or _cache_db()
+    con.row_factory = sqlite3.Row
+    try:
+        auto = json.dumps(_market_auto_snapshot(con), ensure_ascii=False,
+                          default=lambda o: float(o) if hasattr(o, "__float__") else None)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        con.execute("INSERT INTO market_journal(date,auto_json,created_at,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(date) DO UPDATE SET auto_json=excluded.auto_json, updated_at=excluded.updated_at",
+                    (date_str, auto, now, now))
+        con.commit()
+    finally:
+        if db is None:
+            con.close()
+    return date_str
+
+
+def _et_today():
+    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+
+@app.route("/api/market_journal/<date>", methods=["GET", "POST"])
+def api_market_journal(date):
+    db = get_db()
+    if request.method == "POST":
+        d = request.get_json(force=True, silent=True) or {}
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        exists = db.execute("SELECT 1 FROM market_journal WHERE date=?", (date,)).fetchone()
+        vals = {}
+        for f in MARKET_JOURNAL_FIELDS:
+            if f not in d:
+                continue
+            vals[f] = _num(d[f]) if f in ("ftd", "distribution_days", "mood_score", "discipline_score") else d[f]
+        if exists:
+            if vals:
+                sets = ", ".join(f"{k}=?" for k in vals) + ", updated_at=?"
+                db.execute(f"UPDATE market_journal SET {sets} WHERE date=?", (*vals.values(), now, date))
+        else:
+            cols = ["date", "created_at", "updated_at", *vals.keys()]
+            db.execute(f"INSERT INTO market_journal({', '.join(cols)}) VALUES({', '.join('?' * len(cols))})",
+                       (date, now, now, *vals.values()))
+        db.commit()
+        return jsonify({"ok": True})
+    # GET:auto 数据——今天实时算,历史读冻结的 auto_json;手填字段照读
+    row = db.execute("SELECT * FROM market_journal WHERE date=?", (date,)).fetchone()
+    is_today = (date == _et_today())
+    if is_today:
+        auto = _market_auto_snapshot(db)
+    else:
+        auto = None
+        if row and row["auto_json"]:
+            try:
+                auto = json.loads(row["auto_json"])
+            except Exception:
+                auto = None
+    manual = {f: (row[f] if row else None) for f in MARKET_JOURNAL_FIELDS}
+    return jsonify({"date": date, "isToday": is_today, "auto": auto, "manual": manual})
+
+
 # ============================ 每日复盘:组合快照 ============================
 
 def take_portfolio_snapshot(date_str):
@@ -2646,6 +2753,10 @@ def api_snapshots():
 def api_snapshot_take():
     d = datetime.now(ZoneInfo("America/New_York")).date().isoformat()   # 以美东交易日为快照日期
     take_portfolio_snapshot(d)
+    try:
+        freeze_market_journal(d, get_db())     # 同时冻结当日市场环境 auto_json
+    except Exception:
+        pass
     return jsonify({"ok": True, "date": d})
 
 
@@ -4024,6 +4135,64 @@ async function loadReview(){
     <div id="revBody"><div class="loading">加载…</div></div>`;
   showSnapshot(d.today);
 }
+// ---------- 市场环境结构化卡(plan #2 B) ----------
+let _mjDraft={};
+function mjIdx(label,v){return `<span class="mb-item"><span class="lbl">${label}</span><span class="${(v||0)>=0?'green':'red'}">${v==null?'—':fmtPct(v)}</span></span>`;}
+function mjScale(field,n){_mjDraft[field]=n;const b=document.getElementById('mj-'+field);if(b)[...b.children].forEach((c,i)=>c.classList.toggle('on',i+1===n));}
+function renderMarketEnv(mj,date){
+  const a=mj&&mj.auto, m=(mj&&mj.manual)||{};
+  _mjDraft={mood:m.mood_score||0,disc:m.discipline_score||0};
+  const esc=s=>String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
+  const secLine=arr=>(arr&&arr.length)?arr.map(x=>`${x.sector} <span class="${(x.change||0)>=0?'green':'red'}">${fmtPct(x.change)}</span>`).join("　·　"):'<span class="muted">—(热力图未生成)</span>';
+  let autoHtml;
+  if(a){
+    const idx=a.indices||{},pf=a.portfolio||{};
+    autoHtml=`<div style="display:flex;flex-wrap:wrap;gap:16px;align-items:baseline;margin-bottom:6px">
+      ${mjIdx("标普",idx.spx)}${mjIdx("纳指",idx.ndx)}${mjIdx("道指",idx.dji)}
+      <span class="mb-item"><span class="lbl">VIX</span><b>${fmtNum(a.vix)}</b></span>
+      <span class="mb-item"><span class="lbl">情绪</span><b>${a.sentiment??'—'} · ${a.sentimentLabel||''}</b></span>
+      <span class="mb-item"><span class="lbl">环境</span><span class="badge ${a.environmentClass||''}">${a.environment||'—'}</span></span>
+    </div>
+    <div class="disc-line"><span>领涨板块:${secLine(a.sectorsTop)}</span></div>
+    <div class="disc-line"><span>领跌板块:${secLine(a.sectorsBottom)}</span></div>
+    <div class="disc-line"><span>我的组合:市值 <b>${pf.marketValue!=null?'$'+fmtBig(pf.marketValue):'—'}</b> · 浮盈亏 <b class="${(pf.pl||0)>=0?'green':'red'}">${pf.pl!=null?(pf.pl>=0?'+':'')+'$'+fmtBig(Math.abs(pf.pl)):'—'}${pf.plPct!=null?' ('+fmtPct(pf.plPct)+')':''}</b> · 热度 <b>${pf.riskPct!=null?pf.riskPct.toFixed(2)+'%':'—'}</b> · 仓位 <b>${pf.marketPct!=null?pf.marketPct.toFixed(1)+'%':'—'}</b></span></div>
+    <div class="small">${mj.isToday?'● 实时,收盘后 17:00(美东)冻结为当日存档':'已冻结存档'} · 板块取热力图缓存 · asof ${a.asof||''}</div>`;
+  }else{
+    autoHtml=`<div class="muted" style="font-size:12px">当日无冻结的市场环境快照(历史日期需当天盘后冻结过才有)。</div>`;
+  }
+  const scale=(field,val)=>`<div class="scale" id="mj-${field}">`+[1,2,3,4,5].map(n=>`<span class="chip ${val==n?'on':''}" onclick="mjScale('${field}',${n})">${n}</span>`).join("")+`</div>`;
+  const trendSel=`<select id="mj-trend">`+["","多头","空头","震荡"].map(t=>`<option value="${t}" ${m.trend_view===t?'selected':''}>${t||'— 选择 —'}</option>`).join("")+`</select>`;
+  const manualHtml=`
+    <div class="pform" style="max-width:none;margin-bottom:10px">
+      <div><label>大盘趋势研判</label>${trendSel}</div>
+      <div><label>Follow-Through Day?</label><label style="display:flex;gap:8px;align-items:center;color:var(--text);font-size:13px"><input type="checkbox" id="mj-ftd" ${m.ftd?'checked':''}> 今日出现 FTD(确认反转)</label></div>
+      <div><label>Distribution Day 计数</label><input type="number" id="mj-dd" value="${m.distribution_days??''}" placeholder="近25日派发天数"></div>
+    </div>
+    <div class="jfield"><label>美联储 / 利率预期</label><input type="text" id="mj-fed" value="${esc(m.fed_note)}" placeholder="发声、点阵图、加/降息预期变化…"></div>
+    <div class="jfield"><label>重大宏观数据 + 你的解读(CPI / PPI / 非农 / FOMC…)</label><textarea id="mj-macro">${esc(m.macro_events)}</textarea></div>
+    <div class="jfield"><label>国际局势 / 突发事件</label><textarea id="mj-intl">${esc(m.intl_note)}</textarea></div>
+    <div class="jfield"><label>我的感受</label><textarea id="mj-feeling">${esc(m.feeling)}</textarea></div>
+    <div class="jfield" style="display:flex;gap:36px;flex-wrap:wrap">
+      <div><label>情绪分(1 差 – 5 好)</label>${scale('mood',_mjDraft.mood)}</div>
+      <div><label>今日纪律打分(1–5)</label>${scale('disc',_mjDraft.disc)}</div>
+    </div>
+    <div style="margin-top:2px"><button class="search" style="margin:0" onclick="saveMarketEnv()">保存市场环境</button> <span id="mjSaved" class="muted" style="margin-left:10px"></span></div>`;
+  return `<div class="section-title" style="font-size:14px">市场环境 <span class="muted" style="font-size:12px">自动带入 + 结构化手填</span></div>
+    ${autoHtml}
+    <div style="margin-top:12px">${manualHtml}</div>`;
+}
+async function saveMarketEnv(){
+  if(!_reviewDate)return;
+  const g=id=>{const e=document.getElementById(id);return e?e.value.trim():"";};
+  const dd=g("mj-dd");
+  const body={trend_view:g("mj-trend"),
+    ftd:(document.getElementById("mj-ftd")&&document.getElementById("mj-ftd").checked)?1:0,
+    distribution_days:dd===""?null:parseInt(dd,10),
+    fed_note:g("mj-fed"),macro_events:g("mj-macro"),intl_note:g("mj-intl"),feeling:g("mj-feeling"),
+    mood_score:_mjDraft.mood||null,discipline_score:_mjDraft.disc||null};
+  await fetch("/api/market_journal/"+encodeURIComponent(_reviewDate),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const el=document.getElementById("mjSaved");if(el){el.textContent="已保存 ✓";setTimeout(()=>{if(el)el.textContent="";},2000);}
+}
 async function showSnapshot(date){
   if(!date)return;
   _reviewDate=date;
@@ -4043,6 +4212,7 @@ async function showSnapshot(date){
     if(dd2.error){body.innerHTML='<div class="error">'+dd2.error+'</div>';return;}
     st=dd2.state||{};review=dd2.review||"";createdAt=dd2.createdAt||"";
   }
+  const mj=await j("/api/market_journal/"+encodeURIComponent(date)).catch(()=>({auto:null,manual:{},isToday:isToday}));
   const s=st.summary||{};
   const pos=(st.positions||[]).filter(p=>p.status==='open');
   const trades=(st.trades||[]).filter(t=>t.at===date);
@@ -4066,6 +4236,7 @@ async function showSnapshot(date){
   body.innerHTML=`
     <div class="muted" style="font-size:12px;margin-bottom:10px">${hdr}</div>
     ${cards}
+    ${renderMarketEnv(mj,date)}
     <div class="section-title" style="font-size:14px">当日持仓</div>
     ${pos.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注</th></tr></thead><tbody>${posRows}</tbody></table>`:'<div class="muted">当日无持仓</div>'}
     <div class="section-title" style="font-size:14px">当日交易</div>
