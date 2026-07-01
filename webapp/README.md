@@ -1,10 +1,10 @@
 # 个股看板 · Stock Dashboard
 
-![version](https://img.shields.io/badge/version-1.0.0-blue)
+![version](https://img.shields.io/badge/version-1.0.1-blue)
 
 一个 Flask + yfinance 的个人炒股决策仪表盘,**四页面** SPA。前端用 [TradingView lightweight-charts](https://github.com/tradingview/lightweight-charts) 画 K 线、[ECharts](https://echarts.apache.org/) 画热力图/期权墙/GEX,暗色主题。持仓/交易流水/复盘/自选/预警/设置存在服务端 **SQLite**。
 
-> 当前版本 **V1.0.0**。完整变更见 [`CHANGELOG.md`](CHANGELOG.md)。按[语义化版本](https://semver.org/lang/zh-CN/)管理,git 标签为 `webapp-v<版本>`。
+> 当前版本 **V1.0.1**。完整变更见 [`CHANGELOG.md`](CHANGELOG.md)。按[语义化版本](https://semver.org/lang/zh-CN/)管理,git 标签为 `webapp-v<版本>`。
 
 ## 页面1 · 个股看板
 
@@ -54,7 +54,15 @@
 - 每个交易日 **17:00(美东)自动冻结**当日存档(持仓、交易、盈亏、敞口);历史日期为只读快照
 - 每日可写**复盘文字**并持久化,供日后回查、提升交易能力;另有「立即冻结/更新今日存档」按钮
 
-## 页面4 · 市场热力图(独立页签)
+## 页面4 · 资金曲线 · 收益跟踪
+
+- **每日快照(8点→8点窗口)**:美东 20:00 自动锁定当日总资金量 + 收盘持仓市值/成本;在持仓页更新总资金量时即时落当日快照
+- **收益口径**:累计/区间收益率按每日收益率连乘的**时间加权**计算,**净入金(出入金)不计入收益**;当日收益 = 今值 − 昨值 − 当日净入金
+- **echarts 双轴曲线**:总资金量 + 累计收益率,出入金标记点;区间切换(全部 / 近30 / 近7天)
+- 支持**手动补录 / 编辑 / 删除**历史快照
+- 独立 `/api/equity` 路由与「每日复盘」(`/api/snapshots`)分离,互不冲突
+
+## 页面5 · 市场热力图(独立页签)
 
 - **个股热力图**:按板块分组 treemap,面积≈市值,颜色=当日涨跌
 - **板块热力图**:板块 treemap(同风格,面积=板块市值,色=市值加权涨跌),ETF 数据在悬浮提示
