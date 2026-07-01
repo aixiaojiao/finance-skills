@@ -87,6 +87,15 @@ def init_db():
         ticker TEXT NOT NULL, kind TEXT NOT NULL,
         level REAL, note TEXT, active INTEGER DEFAULT 1, created_at TEXT
     );
+    -- 资金曲线快照(每日一条,8点→8点窗口,date=窗口收盘的美东日期)。
+    --   account_value 为用户手动总资金量(权威,含期权/港股,自动算不准);net_flow 为当日净入金,用于剔除出入金影响。
+    --   market_value/cost/positions_json 为锁定时持仓快照(信息性);manual=1 表示当日手动更新过总资金量。
+    CREATE TABLE IF NOT EXISTS equity_snapshots(
+        date TEXT PRIMARY KEY,
+        account_value REAL, net_flow REAL DEFAULT 0,
+        market_value REAL, cost REAL, positions_json TEXT,
+        manual INTEGER DEFAULT 0, note TEXT, locked_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS watchlist(
         ticker TEXT PRIMARY KEY, added_at TEXT, sort INTEGER DEFAULT 0
     );
@@ -754,6 +763,21 @@ def _scheduler_loop():
             pass
 
 
+def _equity_snapshot_loop():
+    # 每天美东 20:00 锁定当日资金快照(8点→8点窗口收盘)。结转手动总资金量 + 抓持仓收盘市值。
+    while True:
+        et = datetime.now(ZoneInfo("America/New_York"))
+        target = et.replace(hour=20, minute=0, second=0, microsecond=0)
+        if target <= et:
+            target += timedelta(days=1)
+        time.sleep(max(60, (target - et).total_seconds()))
+        try:
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            _capture_snapshot(now_et.date().isoformat())   # 此刻刚过 20:00,锁定的正是当日窗口
+        except Exception:
+            pass
+
+
 def start_scheduler():
     if os.environ.get("ENABLE_SCHEDULER", "1") != "1":
         return
@@ -763,6 +787,7 @@ def start_scheduler():
     threading.Thread(target=_scheduler_loop, name="kline-scheduler", daemon=True).start()
     threading.Thread(target=_alert_push_loop, name="alert-push", daemon=True).start()
     threading.Thread(target=_daily_report_loop, name="daily-report", daemon=True).start()
+    threading.Thread(target=_equity_snapshot_loop, name="equity-snapshot", daemon=True).start()
 
 
 # ---- 以下接口此前每次请求都现拉 yfinance,统一加缓存(keep_empty=False:不缓存失败值) ----
@@ -2050,6 +2075,181 @@ def _live_prices(tickers):
     return out
 
 
+# ============================ 资金曲线快照(8点→8点窗口) ============================
+
+def _snapshot_date(et=None):
+    """当前更新归属哪一天的快照。美东 20:00 为窗口界限:<20:00 算今天,≥20:00 归到明天。
+    即 date=D 的快照,收集 (D-1)20:00 ~ D 19:59(美东)之间的最后一次更新,在 D 日 20:00 锁定。"""
+    et = et or datetime.now(ZoneInfo("America/New_York"))
+    d = et.date()
+    if et.hour >= 20:
+        d = d + timedelta(days=1)
+    return d.isoformat()
+
+
+def _upsert_account_snapshot(date_str, value):
+    """轻量:仅写入/覆盖某日的手动总资金量(不打 yfinance)。供「更新总资金量」即时落快照——当日最后一次为准。"""
+    con = _cache_db()
+    try:
+        ex = con.execute("SELECT 1 FROM equity_snapshots WHERE date=?", (date_str,)).fetchone()
+        if ex:
+            con.execute("UPDATE equity_snapshots SET account_value=?, manual=1 WHERE date=?", (value, date_str))
+        else:
+            con.execute("INSERT INTO equity_snapshots(date,account_value,net_flow,manual) VALUES(?,?,0,1)", (date_str, value))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _capture_snapshot(date_str, manual_value=None, mark_manual=False):
+    """完整锁定某日快照:抓当前持仓现价算市值/成本并存持仓明细。account_value 优先级:
+    传入 manual_value > 该日已存手动值 > 当前 accountValue 设置(结转)。供 20:00 定时任务与「今日快照」按钮调用。"""
+    con = _cache_db()
+    try:
+        rows = con.execute("SELECT ticker,shares,entry FROM positions WHERE status='open'").fetchall()
+        live = _live_prices([r[0] for r in rows])
+        mv = cost = 0.0
+        pj = []
+        for tk, shares, entry in rows:
+            price = live.get(tk, {}).get("price")
+            cost += shares * entry
+            if price is not None:
+                mv += shares * price
+            pj.append({"ticker": tk, "shares": shares, "entry": entry, "price": price})
+        ex = con.execute("SELECT account_value, net_flow, manual FROM equity_snapshots WHERE date=?", (date_str,)).fetchone()
+        if manual_value is not None:
+            av = float(manual_value)
+        elif ex and ex[0] is not None:
+            av = ex[0]
+        else:
+            s = con.execute("SELECT value FROM settings WHERE key='accountValue'").fetchone()
+            av = float(s[0]) if s and s[0] else None
+        net_flow = (ex[1] if ex else 0) or 0
+        manual_flag = 1 if (mark_manual or (ex and ex[2])) else 0
+        con.execute(
+            """INSERT INTO equity_snapshots(date,account_value,net_flow,market_value,cost,positions_json,manual,locked_at)
+               VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(date) DO UPDATE SET account_value=excluded.account_value,
+                 market_value=excluded.market_value, cost=excluded.cost,
+                 positions_json=excluded.positions_json, manual=excluded.manual, locked_at=excluded.locked_at""",
+            (date_str, av, net_flow, mv, cost, json.dumps(pj, ensure_ascii=False),
+             manual_flag, datetime.now(timezone.utc).isoformat()))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _build_equity_series(rows):
+    """rows: 按日期升序的快照 [{date, account_value, net_flow, ...}]。计算每日/累计收益与收益率(剔除出入金)。
+    口径:每日收益 = 今值 − 昨值 − 当日净入金;每日收益率 = 每日收益 / 昨值;
+    累计收益率 = 各日(1+每日收益率)连乘 − 1(时间加权,出入金不计入收益)。"""
+    series = []
+    prev_v = None
+    cum_factor = 1.0
+    cum_profit = 0.0
+    for r in rows:
+        v = r["account_value"]
+        flow = r.get("net_flow") or 0.0
+        daily_profit = daily_return = None
+        if prev_v is not None and v is not None:
+            daily_profit = v - prev_v - flow
+            cum_profit += daily_profit
+            if prev_v:
+                daily_return = daily_profit / prev_v * 100
+                cum_factor *= (1 + daily_profit / prev_v)
+        series.append({
+            "date": r["date"], "accountValue": v, "netFlow": flow,
+            "marketValue": r.get("market_value"), "cost": r.get("cost"),
+            "manual": bool(r.get("manual")), "note": r.get("note") or "",
+            "dailyProfit": daily_profit, "dailyReturn": daily_return,
+            "cumProfit": cum_profit if v is not None else None,
+            "cumReturn": (cum_factor - 1) * 100 if v is not None else None,
+        })
+        if v is not None:
+            prev_v = v
+    return series
+
+
+def _range_return(series):
+    """窗口内每日收益率连乘 − 1(%)。series 已是切片后的子区间。"""
+    f = 1.0
+    seen = False
+    for s in series:
+        if s["dailyReturn"] is not None:
+            f *= (1 + s["dailyReturn"] / 100)
+            seen = True
+    return (f - 1) * 100 if seen else None
+
+
+@app.route("/api/equity", methods=["GET", "POST"])
+def api_equity():
+    db = get_db()
+    if request.method == "POST":
+        d = request.get_json(force=True, silent=True) or {}
+        if d.get("action") == "capture":        # 「今日快照」:用当前总资金量 + 持仓即时锁定当日
+            _capture_snapshot(_snapshot_date())
+            return jsonify({"ok": True})
+        date_str = (d.get("date") or _snapshot_date()).strip()
+        av = _num(d.get("accountValue"))
+        if av is None:
+            return jsonify({"error": "accountValue 必填"}), 400
+        db.execute(
+            """INSERT INTO equity_snapshots(date,account_value,net_flow,note,manual)
+               VALUES(?,?,?,?,1)
+               ON CONFLICT(date) DO UPDATE SET account_value=excluded.account_value,
+                 net_flow=excluded.net_flow, note=excluded.note, manual=1""",
+            (date_str, av, _num(d.get("netFlow")) or 0, d.get("note") or ""))
+        db.commit()
+        return jsonify({"ok": True})
+    # GET: 计算曲线 + 收益/收益率
+    rng = request.args.get("range", "all")
+    rows = [dict(r) for r in db.execute("SELECT * FROM equity_snapshots ORDER BY date ASC").fetchall()]
+    full = _build_equity_series(rows)
+    if rng in ("7", "30", "90"):
+        win = full[-int(rng):]
+    else:
+        win = full
+    valid = [s for s in full if s["accountValue"] is not None]
+    summary = {
+        "startDate": valid[0]["date"] if valid else None,
+        "startValue": valid[0]["accountValue"] if valid else None,
+        "latestDate": valid[-1]["date"] if valid else None,
+        "latestValue": valid[-1]["accountValue"] if valid else None,
+        "totalProfit": valid[-1]["cumProfit"] if valid else None,
+        "cumReturn": valid[-1]["cumReturn"] if valid else None,
+        "todayProfit": valid[-1]["dailyProfit"] if valid else None,
+        "todayReturn": valid[-1]["dailyReturn"] if valid else None,
+        "rangeReturn": _range_return(win),
+        "count": len(valid),
+    }
+    return jsonify({"series": win, "summary": summary})
+
+
+@app.route("/api/equity/<date_str>", methods=["PUT", "DELETE"])
+def api_equity_one(date_str):
+    db = get_db()
+    if request.method == "DELETE":
+        db.execute("DELETE FROM equity_snapshots WHERE date=?", (date_str,))
+        db.commit()
+        return jsonify({"ok": True})
+    d = request.get_json(force=True, silent=True) or {}
+    sets, vals = [], []
+    for field, col in (("accountValue", "account_value"), ("netFlow", "net_flow")):
+        if field in d:
+            sets.append(f"{col}=?")
+            vals.append(_num(d[field]))
+    if "note" in d:
+        sets.append("note=?")
+        vals.append(d["note"])
+    if not sets:
+        return jsonify({"error": "无可更新字段"}), 400
+    sets.append("manual=1")
+    vals.append(date_str)
+    db.execute(f"UPDATE equity_snapshots SET {', '.join(sets)} WHERE date=?", vals)
+    db.commit()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/positions", methods=["GET", "POST"])
 def api_positions():
     db = get_db()
@@ -2350,6 +2550,14 @@ def api_settings():
     for k, v in d.items():
         db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
     db.commit()
+    # 总资金量每次更新即落入「当日」快照(8点→8点窗口),当日最后一次为准 → 资金曲线
+    if "accountValue" in d:
+        try:
+            av = float(d["accountValue"])
+            if av > 0:
+                _upsert_account_snapshot(_snapshot_date(), av)
+        except Exception:
+            pass
     return jsonify({"ok": True})
 
 
@@ -2623,6 +2831,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
      <button id="nav-stock" class="active" onclick="switchPage('stock')">📊 个股看板</button>
      <button id="nav-positions" onclick="switchPage('positions')">💼 持仓</button>
      <button id="nav-review" onclick="switchPage('review')">📓 每日复盘</button>
+     <button id="nav-equity" onclick="switchPage('equity')">📈 资金曲线</button>
      <button id="nav-heatmap" onclick="switchPage('heatmap')">🔥 市场热力图</button>
    </nav>
    <div class="search" id="stockSearch">
@@ -2655,6 +2864,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   <!-- 每日复盘页 -->
   <div id="page-review" class="hidden"><div class="loading">加载复盘…</div></div>
+
+  <!-- 资金曲线页 -->
+  <div id="page-equity" class="hidden"><div class="loading">加载资金曲线…</div></div>
 
   <!-- 市场热力图页 -->
   <div id="page-heatmap" class="hidden">
@@ -2696,13 +2908,14 @@ const heatColor=c=>{if(c==null)return"#30363d";const x=Math.max(-3,Math.min(3,c)
 function switchPage(p){
   curPage=p;
   try{localStorage.setItem("curPage",p);}catch(e){}   // 记住当前页,刷新后恢复
-  ["stock","positions","review","heatmap"].forEach(x=>{
+  ["stock","positions","review","equity","heatmap"].forEach(x=>{
     document.getElementById("page-"+x).classList.toggle("hidden",p!==x);
     document.getElementById("nav-"+x).classList.toggle("active",p===x);
   });
   if(p==="heatmap" && !window._heatLoaded) loadHeatmap();
   if(p==="positions") loadPositions();
   if(p==="review") loadReview();
+  if(p==="equity") loadEquity();
 }
 function switchTab(t){
   curTab=t;
@@ -3482,6 +3695,131 @@ async function takeSnapshotNow(){
   const r=await fetch("/api/snapshots/take",{method:"POST"});let d={};try{d=await r.json();}catch(e){}
   await loadReview();
   if(d.date)showSnapshot(d.date);
+}
+
+// ---------- 资金曲线页 ----------
+let _equityRange="all";
+const _rangeLabel={all:"全部","30":"近30天","7":"近7天"};
+async function loadEquity(){
+  const el=document.getElementById("page-equity");
+  el.innerHTML=`<div class="section-title" style="margin-top:6px">资金曲线 · 收益跟踪 <span class="tag">每日快照 · 美东20:00锁定</span></div>
+    <div class="muted" style="font-size:13px;margin-bottom:12px">总资金量以你在<b>持仓页顶部「更新」</b>的手动值为准(含期权/港股,自动算不准);每天美东20:00把当天最后一次更新固化为当日快照。出入金请在下表对应日填「净入金」以剔除其对收益的影响。</div>
+    <div id="equityBody"><div class="loading">加载中…</div></div>`;
+  renderEquity();
+}
+async function renderEquity(){
+  const d=await j("/api/equity?range="+_equityRange);
+  const s=d.summary||{},series=d.series||[];
+  window._snapMap={};series.forEach(p=>{window._snapMap[p.date]=p;});
+  const el=document.getElementById("equityBody");
+  if(!series.length){
+    el.innerHTML=`<div class="muted" style="margin-bottom:14px">还没有任何快照。去<b>持仓页</b>更新一次总资金量即可生成今天的快照,或在下方手动补录历史。</div>${equityAddRow()}`;
+    return;
+  }
+  const rangeBtns=["all","30","7"].map(r=>`<button class="${r===_equityRange?'active':''}" onclick="setEquityRange('${r}')">${_rangeLabel[r]}</button>`).join("");
+  const cards=`<div class="grid" style="margin-bottom:16px">
+    ${card("起始本金",s.startValue!=null?"$"+fmtBig(s.startValue):"—")}
+    ${card("最新资金量",s.latestValue!=null?"$"+fmtBig(s.latestValue):"—")}
+    <div class="card"><div class="k">累计收益</div><div class="v ${(s.totalProfit||0)>=0?'green':'red'}">${s.totalProfit!=null?(s.totalProfit>=0?"+":"")+"$"+fmtBig(Math.abs(s.totalProfit)):"—"}</div></div>
+    <div class="card"><div class="k">累计收益率<span class="muted" style="font-size:10px"> 对起始本金·时间加权</span></div><div class="v ${(s.cumReturn||0)>=0?'green':'red'}">${s.cumReturn!=null?fmtPct(s.cumReturn):"—"}</div></div>
+    <div class="card"><div class="k">最近一日收益</div><div class="v ${(s.todayProfit||0)>=0?'green':'red'}">${s.todayProfit!=null?(s.todayProfit>=0?"+":"")+"$"+fmtBig(Math.abs(s.todayProfit)):"—"} ${s.todayReturn!=null?`(${fmtPct(s.todayReturn)})`:""}</div></div>
+    <div class="card"><div class="k">${_rangeLabel[_equityRange]}收益率</div><div class="v ${(s.rangeReturn||0)>=0?'green':'red'}">${s.rangeReturn!=null?fmtPct(s.rangeReturn):"—"}</div></div>
+  </div>`;
+  const rows=series.slice().reverse().map(p=>{
+    const dp=p.dailyProfit,dr=p.dailyReturn;
+    return `<tr id="snaprow-${p.date}">
+      <td>${p.date} ${p.manual?'':'<span class="muted" title="自动结转,非当日手动更新" style="font-size:10px">·自动</span>'}</td>
+      <td>${p.accountValue!=null?"$"+fmtBig(p.accountValue):"—"}</td>
+      <td class="${(p.netFlow||0)>0?'green':((p.netFlow||0)<0?'red':'muted')}">${p.netFlow?((p.netFlow>0?"+":"")+"$"+fmtBig(p.netFlow)):"—"}</td>
+      <td class="${(dp||0)>=0?'green':'red'}">${dp!=null?(dp>=0?"+":"")+"$"+fmtBig(dp):"—"}</td>
+      <td class="${(dr||0)>=0?'green':'red'}">${dr!=null?fmtPct(dr):"—"}</td>
+      <td class="${(p.cumReturn||0)>=0?'green':'red'}">${p.cumReturn!=null?fmtPct(p.cumReturn):"—"}</td>
+      <td class="muted">${p.note||""}</td>
+      <td><a onclick="editSnap('${p.date}')">改</a> · <a style="color:var(--red)" onclick="delSnap('${p.date}')">删</a></td>
+    </tr>`;}).join("");
+  el.innerHTML=`
+    ${cards}
+    <div class="cmpbar"><span class="controls">${rangeBtns}</span>
+      <button class="search" style="margin:0 0 0 auto" onclick="captureToday()">＋ 今日快照(用当前总资金量)</button></div>
+    <div id="equityChart" style="height:380px;border:1px solid var(--border);border-radius:10px;margin:12px 0"></div>
+    <div class="section-title" style="font-size:14px">每日快照 <span class="muted" style="font-size:11px">可改总资金量 / 出入金 / 备注</span></div>
+    <table><thead><tr><th>日期</th><th>总资金量</th><th>净入金</th><th>当日收益</th><th>当日收益率</th><th>累计收益率</th><th>备注</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>
+    ${equityAddRow()}
+    <div class="small">累计/区间收益率为「每日收益率连乘」的时间加权口径,出入金不计入收益;当日收益 = 今值 − 昨值 − 当日净入金。现价为 yfinance 延迟数据。</div>`;
+  drawEquityChart(series);
+}
+function equityAddRow(){
+  return `<div class="cmpbar" style="margin-top:12px"><b>手动补录:</b>
+    <input id="snapDate" placeholder="YYYY-MM-DD" style="width:130px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+    <input id="snapAcct" placeholder="总资金量" type="number" style="width:120px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+    <input id="snapFlow" placeholder="净入金(可空)" type="number" style="width:120px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+    <button class="search" style="margin:0" onclick="addSnap()">补录/覆盖</button></div>`;
+}
+function setEquityRange(r){_equityRange=r;renderEquity();}
+function drawEquityChart(series){
+  const el=document.getElementById("equityChart");if(!el)return;
+  echarts.getInstanceByDom(el)?.dispose();
+  const ch=echarts.init(el,'dark');
+  const dates=series.map(p=>p.date);
+  const av=series.map(p=>p.accountValue);
+  const cum=series.map(p=>p.cumReturn!=null?+p.cumReturn.toFixed(2):null);
+  const flowPts=series.filter(p=>p.netFlow).map(p=>({coord:[p.date,p.accountValue],value:(p.netFlow>0?"入":"出")}));
+  ch.setOption({
+    backgroundColor:"transparent",
+    tooltip:{trigger:"axis"},
+    legend:{data:["总资金量","累计收益率"],textStyle:{color:"#8b949e"}},
+    grid:{left:64,right:64,top:36,bottom:40},
+    xAxis:{type:"category",data:dates,axisLine:{lineStyle:{color:"#30363d"}}},
+    yAxis:[
+      {type:"value",name:"$",scale:true,axisLabel:{formatter:v=>fmtBig(v)},splitLine:{lineStyle:{color:"#21262d"}}},
+      {type:"value",name:"%",axisLabel:{formatter:"{value}%"},splitLine:{show:false}}
+    ],
+    series:[
+      {name:"总资金量",type:"line",data:av,smooth:true,showSymbol:false,lineStyle:{width:2,color:"#58a6ff"},
+       areaStyle:{color:"rgba(88,166,255,0.10)"},
+       markPoint:{symbol:"pin",symbolSize:30,data:flowPts,label:{fontSize:10},itemStyle:{color:"#d29922"}}},
+      {name:"累计收益率",type:"line",yAxisIndex:1,data:cum,smooth:true,showSymbol:false,lineStyle:{width:1.5,color:"#3fb950"}}
+    ]
+  });
+  window.addEventListener("resize",()=>ch.resize());
+}
+async function captureToday(){
+  await fetch("/api/equity",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"capture"})});
+  renderEquity();
+}
+async function addSnap(){
+  const date=document.getElementById("snapDate").value.trim();
+  const acct=parseFloat(document.getElementById("snapAcct").value);
+  const flow=document.getElementById("snapFlow").value.trim();
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date)){alert("日期格式 YYYY-MM-DD");return;}
+  if(!(acct>0)){alert("总资金量必须为正数");return;}
+  await fetch("/api/equity",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({date,accountValue:acct,netFlow:flow===""?0:parseFloat(flow)})});
+  renderEquity();
+}
+function editSnap(date){
+  const tr=document.getElementById("snaprow-"+date);if(!tr)return;
+  const p=(window._snapMap||{})[date]||{};
+  const ist='type="number" style="width:110px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px"';
+  const esc=s=>String(s==null?"":s).replace(/"/g,"&quot;");
+  tr.innerHTML=`<td>${date}</td>
+    <td><input id="es-acct-${date}" ${ist} value="${p.accountValue??""}"></td>
+    <td><input id="es-flow-${date}" ${ist} value="${p.netFlow||""}" placeholder="净入金"></td>
+    <td colspan="3" class="muted">保存后重算收益</td>
+    <td><input id="es-note-${date}" value="${esc(p.note)}" style="width:120px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px" placeholder="备注"></td>
+    <td><a onclick="saveSnap('${date}')">存</a> · <a onclick="renderEquity()">取消</a></td>`;
+}
+async function saveSnap(date){
+  const g=s=>{const e=document.getElementById("es-"+s+"-"+date);return e?e.value.trim():"";};
+  const acct=parseFloat(g("acct"));
+  if(!(acct>0)){alert("总资金量必须为正数");return;}
+  const flow=g("flow");
+  await fetch("/api/equity/"+date,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({accountValue:acct,netFlow:flow===""?0:parseFloat(flow),note:g("note")})});
+  renderEquity();
+}
+async function delSnap(date){
+  if(!confirm("确认删除 "+date+" 的快照?"))return;
+  await fetch("/api/equity/"+date,{method:"DELETE"});
+  renderEquity();
 }
 
 // ---------- 估值 ----------
