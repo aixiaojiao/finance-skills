@@ -3283,7 +3283,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   h1{font-size:18px;margin:0;font-weight:600}
   /* ---- 全局左侧栏布局 ---- */
   .app{display:flex;align-items:flex-start}
-  .sidebar{flex:0 0 212px;position:sticky;top:0;align-self:stretch;min-height:calc(100vh - 41px);max-height:calc(100vh - 41px);overflow-y:auto;background:#0a0d12;border-right:1px solid var(--border);padding:14px 12px;display:flex;flex-direction:column;gap:14px}
+  .sidebar{flex:0 0 280px;position:sticky;top:0;align-self:stretch;min-height:calc(100vh - 41px);max-height:calc(100vh - 41px);overflow-y:auto;background:#0a0d12;border-right:1px solid var(--border);padding:14px 12px;display:flex;flex-direction:column;gap:14px}
   .sidebar .brand{font-size:18px;font-weight:700;padding:2px 4px 6px}
   .sidenav{display:flex;flex-direction:column;gap:6px}
   .sidenav button{background:transparent;border:1px solid var(--border);color:var(--muted);padding:10px 14px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500;text-align:left}
@@ -3298,13 +3298,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .wl-sort{background:none;border:1px solid var(--border);color:var(--muted);font-size:11px;padding:2px 7px;border-radius:6px;cursor:pointer}
   .wl-sort:hover{border-color:var(--accent);color:var(--text)}
   .watchlist{display:flex;flex-direction:column;gap:5px;overflow-y:auto}
-  .wchip{display:flex;gap:6px;align-items:center;justify-content:space-between;background:var(--panel);border:1px solid var(--border);padding:7px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;touch-action:none;user-select:none}
+  .wchip{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;background:var(--panel);border:1px solid var(--border);padding:7px 10px;border-radius:8px;cursor:pointer;white-space:nowrap;font-size:13px;touch-action:none;user-select:none}
   .wchip:hover{border-color:var(--accent)}
   .wchip.dragging{opacity:.7;border-color:var(--accent);box-shadow:0 4px 14px rgba(0,0,0,.45)}
-  .wchip .wtk{font-weight:600}
-  .wchip .wq{display:flex;align-items:center;gap:5px;font-size:12px}
-  .wchip .wprice{color:var(--text)}
-  .wchip .x{color:var(--muted);font-size:11px;padding-left:4px}.wchip .x:hover{color:var(--red)}
+  .wchip .wtk{font-weight:600;overflow:hidden;text-overflow:ellipsis}
+  /* 固定列宽让各行的价格、涨跌幅上下对齐 */
+  .wchip .wq{display:grid;grid-template-columns:62px 56px 12px;align-items:center;gap:6px;font-size:12px}
+  .wchip .wprice{color:var(--text);text-align:right}
+  .wchip .wq>span:nth-child(2){text-align:right}
+  .wchip .x{color:var(--muted);font-size:11px;justify-self:end}.wchip .x:hover{color:var(--red)}
   .notes-box{display:flex;flex-direction:column;gap:8px}
   .note-input{width:100%;box-sizing:border-box;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 11px;font:inherit;font-size:13px;resize:vertical}
   .note-input:focus{outline:none;border-color:var(--accent)}
