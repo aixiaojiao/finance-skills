@@ -213,6 +213,14 @@ def init_db():
     con.execute("""UPDATE trades SET ts = COALESCE(NULLIF(at,''),'1970-01-01')
         || printf(' %02d:%02d:%02d', (id/3600)%24, (id/60)%60, id%60)
         WHERE ts IS NULL OR ts=''""")
+    # 迁移:旧版把「加仓/减仓」等操作堆进 positions.note,现改为交易明细编号引用(建仓#1 加仓#2 …)。
+    # 一次性剥离历史遗留的 [建仓/加仓/减仓/清仓 …] 自动标签,只保留用户手写内容。
+    import re as _re
+    _tag_re = _re.compile(r"\s*\[(?:建仓|加仓|减仓|清仓)[^\]]*\]")
+    for r in con.execute("SELECT id, note FROM positions WHERE note LIKE '%[%'").fetchall():
+        cleaned = _tag_re.sub("", r[1] or "").strip()
+        if cleaned != (r[1] or ""):
+            con.execute("UPDATE positions SET note=? WHERE id=?", (cleaned, r[0]))
     # 自选股默认值(仅首次为空时)
     cur = con.execute("SELECT COUNT(*) c FROM watchlist").fetchone()
     if cur[0] == 0:
@@ -2334,19 +2342,16 @@ def api_positions():
         if merge:
             new_shares = existing["shares"] + add_shares
             new_entry = (existing["shares"] * existing["entry"] + add_shares * add_entry) / new_shares
-            qn = f"{add_shares:g}" if float(add_shares).is_integer() else f"{add_shares}"
-            tag = f"[加仓+{qn}@{add_entry:g}]"                              # 简化备注(任务1)
-            new_note = ((existing["note"] + " ") if existing["note"] else "") + tag
             new_mp = mp if mp is not None else existing["manual_price"]   # 提供新现价则更新,否则保留
-            db.execute("UPDATE positions SET shares=?, entry=?, note=?, manual_price=? WHERE id=?",
-                       (new_shares, new_entry, new_note, new_mp, existing["id"]))
+            # 加仓不再往备注堆文字:操作留痕靠交易明细编号,前端按 position_id 汇总为「建仓#/加仓#」
+            db.execute("UPDATE positions SET shares=?, entry=?, manual_price=? WHERE id=?",
+                       (new_shares, new_entry, new_mp, existing["id"]))
             pos_id = existing["id"]
         else:
-            # 止损不同的加仓:单独成行,注明是加仓;全新建仓则用用户备注
-            note = d.get("note") or ("[加仓·独立止损]" if existing else "")
+            # 全新建仓或止损不同的独立加仓:备注仅存用户手写内容(操作留痕靠交易明细编号)
             cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price,no_stop_ack) VALUES(?,?,?,?,?,?, 'open', ?, ?, ?)",
                              (tk, add_shares, add_entry, stop, _num(d.get("target")),
-                              today, note, mp, no_stop_ack))
+                              today, d.get("note") or "", mp, no_stop_ack))
             pos_id = cur.lastrowid
         db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'buy',?,?,NULL,?,?,?)",
                    (pos_id, tk, add_shares, add_entry, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
@@ -2460,14 +2465,10 @@ def api_position_one(pid):
             clr = f"[清仓·累计已实现 {sgn}{round(total, 2):g}]"
             db.execute("UPDATE trades SET note=? WHERE id=?",
                        ((base + " " + clr) if base else clr, sell_cur.lastrowid))
-        else:                                                  # 部分平仓:减仓并在条目里注明现有仓位
+        else:                                                  # 部分平仓:减仓
             remain = cur_shares - qty
-            qn = (f"{qty:g}") if float(qty).is_integer() else f"{qty}"
-            rn = (f"{remain:g}") if float(remain).is_integer() else f"{remain}"
-            sign = "+" if pl >= 0 else ""
-            tag = f"[减仓 {today} 卖{qn}@{px:g} {sign}{round(pl, 2):g}|剩{rn}股]"
-            new_note = ((row["note"] + " ") if row["note"] else "") + tag
-            db.execute("UPDATE positions SET shares=?, note=? WHERE id=?", (remain, new_note, pid))
+            # 减仓不再堆备注:这笔卖出已在交易明细单独成行(含编号/股数/价/盈亏),备注只引用其编号
+            db.execute("UPDATE positions SET shares=? WHERE id=?", (remain, pid))
         db.commit()
         return jsonify({"ok": True})
     else:
@@ -3436,6 +3437,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .capbar .capmeta{display:flex;gap:20px;flex-wrap:wrap;font-size:13px;color:var(--muted)}
   .subtabs{display:flex;gap:6px;margin:14px 0}
   .subtabs button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.subtabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  /* 持仓表:一个标的一行,操作留痕用交易明细编号引用(建仓#1 加仓#2 …),保持不换行、紧凑 */
+  .postbl td,.postbl th{white-space:nowrap;vertical-align:middle}
+  .postbl td.ops{font-size:12px;color:var(--muted)}
+  .postbl td.ops .opsnote{font-size:11px}
+  .postbl td.posact{font-size:13px}
 </style>
 </head>
 <body>
@@ -4144,6 +4150,15 @@ async function loadTrack(){
   </div>`;
   window._openPos=open;
   const maxRiskNum=parseFloat(maxRiskPct);
+  // 每个持仓的操作留痕:从交易明细按「编号」汇总(建仓/加仓=买入,减仓=卖出),只引用编号,极简
+  const opsSummary=(pid)=>{
+    const ts=trades.filter(t=>t.position_id===pid).sort((a,b)=>a.id-b.id);
+    if(!ts.length)return"";
+    const buys=ts.filter(t=>t.action==="buy"),sells=ts.filter(t=>t.action==="sell"),parts=[];
+    if(buys.length){parts.push("建仓#"+buys[0].id);if(buys.length>1)parts.push("加仓#"+buys.slice(1).map(t=>t.id).join(",#"));}
+    if(sells.length)parts.push("减仓#"+sells.map(t=>t.id).join(",#"));
+    return parts.join(" ");
+  };
   const openRows=open.map(p=>{
     const plc=(p.pl||0)>=0?"green":"red";
     // 止损≥成本=锁利(绿),否则=亏损风险(红);遵循绿赚红亏
@@ -4162,8 +4177,8 @@ async function loadTrack(){
       <td class="${plc}">${p.pl!=null?(p.pl>=0?"+":"")+fmtBig(p.pl):"—"} ${p.plPct!=null?`(${fmtPct(p.plPct)})`:""}</td>
       <td>${p.stop!=null?fmtNum(p.stop):(p.no_stop_ack?'<span class="muted">无</span>':'<span class="red">—</span>')}</td><td class="${stopc}" title="现价到止损还要跌多少;止损在成本之上则锁利(绿)">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
       <td>${riskCell}</td>
-      <td class="muted">${p.note||""}</td>
-      <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a onclick="openJournal(${p.id},'${p.ticker}',{hadStop:${p.stop!=null}})" title="记录 setup/理由/信念/情绪(事后也可补)">日志${jmap[p.id]?" ✍":""}</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
+      <td class="ops" title="操作留痕:对应下方「交易明细」的编号(#)">${opsSummary(p.id)||'<span class="muted">—</span>'}${p.note?` <span class="opsnote muted" title="备注">· ${p.note}</span>`:""}</td>
+      <td class="posact"><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a onclick="openJournal(${p.id},'${p.ticker}',{hadStop:${p.stop!=null}})" title="记录 setup/理由/信念/情绪(事后也可补)">日志${jmap[p.id]?" ✍":""}</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
   window._allTrades=trades;window._tradePage=0;
   // 止损纪律 banner:只对「遗漏」(未确认)的无止损持仓报警;已二次确认(no_stop_ack)的不再打扰
@@ -4184,7 +4199,7 @@ async function loadTrack(){
       <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npPrice" placeholder="现价(手填,选填)" type="number" title="期权/港股等无实时行情时手填现价;留空则走 yfinance" style="width:130px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
-    ${open.length?`<table><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
+    ${open.length?`<table class="postbl"><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>操作(编号)</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
     <div id="tradeBox"></div>
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
   renderTrades();
@@ -4199,7 +4214,7 @@ function renderTrades(){
   const rows=all.slice(pg*TRADES_PER_PAGE,pg*TRADES_PER_PAGE+TRADES_PER_PAGE).map(t=>{
     const isBuy=t.action==="buy";
     const plc=(t.pl||0)>=0?"green":"red";
-    return `<tr class="muted"><td>${t.at||""}</td><td>${t.ticker}</td>
+    return `<tr class="muted"><td><b style="color:var(--accent)">#${t.id}</b></td><td>${t.at||""}</td><td>${t.ticker}</td>
       <td>${isBuy?"买入":"卖出"}</td><td>${fmtNum(t.shares,0)}</td><td>${fmtNum(t.price)}</td>
       <td class="${isBuy?'muted':plc}">${(!isBuy&&t.pl!=null)?(t.pl>=0?"+":"")+fmtBig(t.pl):"—"}</td>
       <td class="muted">${t.note||""}</td>
@@ -4209,7 +4224,7 @@ function renderTrades(){
       <span class="muted" style="align-self:center">第 ${pg+1}/${pages} 页 · 共 ${all.length} 条</span>
       <button class="search" style="margin:0;opacity:${pg>=pages-1?0.4:1}" ${pg>=pages-1?"disabled":""} onclick="changeTradePage(1)">下一页 →</button></div>`:"";
   box.innerHTML=`<div class="section-title" style="font-size:14px">交易明细(买卖流水) <span class="muted" style="font-size:12px">最新在前</span></div>
-    <table><thead><tr><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>已实现盈亏</th><th>备注</th><th></th></tr></thead><tbody>${rows}</tbody></table>${nav}`;
+    <table><thead><tr><th>编号</th><th>日期</th><th>代码</th><th>方向</th><th>股数</th><th>价格</th><th>已实现盈亏</th><th>备注</th><th></th></tr></thead><tbody>${rows}</tbody></table>${nav}`;
 }
 function changeTradePage(delta){window._tradePage=(window._tradePage||0)+delta;renderTrades();}
 async function saveAccount(){
