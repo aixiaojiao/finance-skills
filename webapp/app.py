@@ -41,7 +41,7 @@ app = Flask(__name__)
 # ============================ SQLite 持久化 ============================
 # 持仓 / 自选 / 预警 / 设置 落盘,跨设备。路径可用 DASHBOARD_DB 覆盖。
 
-APP_VERSION = "1.2.0"   # 版本号(见 CHANGELOG.md);按语义化版本管理
+APP_VERSION = "1.3.0"   # 版本号(见 CHANGELOG.md);按语义化版本管理
 
 DB_PATH = os.environ.get("DASHBOARD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dashboard.db"))
 
