@@ -1118,9 +1118,22 @@ def _compute_sepa(ticker):
             bench_ret = _num(bench.iloc[-1]) / _num(bench.iloc[-lookback]) - 1
             if stock_ret is not None and bench_ret is not None:
                 rs_val = (stock_ret - bench_ret) * 100
-                rs_pass = stock_ret > bench_ret
+                beat = stock_ret > bench_ret
+                # RS 线 = 个股/基准 比值(同一 lookback 窗口,iloc 对齐,与上面收益口径一致)。
+                # 收紧:不仅要跑赢,还要 RS 线在窗口高点附近(领涨,Minervini 看重的领导股信号)。
+                try:
+                    sc = close.iloc[-lookback:].to_numpy(dtype=float)
+                    bc = bench.iloc[-lookback:].to_numpy(dtype=float)
+                    rs_line = sc / bc
+                    cur_rs, hi_rs = float(rs_line[-1]), float(rs_line.max())
+                    rs_off_high = (cur_rs / hi_rs - 1) * 100 if hi_rs else None   # 0=新高,负=低于高点
+                except Exception:
+                    rs_off_high = None
+                rs_newhigh = rs_off_high is not None and rs_off_high >= -3      # 距 RS 线高点 3% 内视为新高
+                rs_pass = bool(beat and rs_newhigh)
                 wlabel = "1年" if lookback >= 252 else f"{lookback}日"
-                rs_value_str = f"相对标普 {rs_val:+.1f}pp({wlabel})"
+                nh = "RS线新高✓" if rs_newhigh else (f"RS线距高 {rs_off_high:.0f}%" if rs_off_high is not None else "RS线—")
+                rs_value_str = f"相对标普 {rs_val:+.1f}pp · {nh}({wlabel})"
             else:
                 rs_value_str = "数据不足"
 
@@ -1147,7 +1160,7 @@ def _compute_sepa(ticker):
          f"+{pct_above_low:.1f}%" if pct_above_low is not None else "—")
     cond(7, "距 52周高点 ≤ 25%", (pct_from_high is not None and pct_from_high >= -25),
          f"{pct_from_high:.1f}%" if pct_from_high is not None else "—")
-    cond(8, "相对强度 RS 跑赢大盘(代理)", rs_pass, rs_value_str)
+    cond(8, "相对强度:跑赢大盘 且 RS 线新高(领涨)", rs_pass, rs_value_str)
 
     passed = sum(1 for c in conds if c["pass"] is True)
 
@@ -4714,7 +4727,28 @@ function equityAddRow(){
     <input id="snapDate" placeholder="YYYY-MM-DD" style="width:130px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
     <input id="snapAcct" placeholder="总资金量" type="number" style="width:120px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
     <input id="snapFlow" placeholder="净入金(可空)" type="number" style="width:120px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
-    <button class="search" style="margin:0" onclick="addSnap()">补录/覆盖</button></div>`;
+    <button class="search" style="margin:0" onclick="addSnap()">补录/覆盖</button></div>
+  <div style="margin-top:10px">
+    <div class="muted" style="font-size:12px;margin-bottom:5px"><b>批量补录</b>(补几笔历史总资金,给曲线一个有意义的起点):每行 <code>日期 总资金量 [净入金]</code>,空格或逗号分隔</div>
+    <textarea id="bulkSnap" placeholder="2026-05-01 100000&#10;2026-06-01, 110000, 5000&#10;2026-06-15 108000" style="width:100%;max-width:520px;min-height:84px;box-sizing:border-box;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:9px;border-radius:8px;font-size:13px;line-height:1.6"></textarea>
+    <div style="margin-top:6px"><button class="search" style="margin:0" onclick="bulkBackfill()">批量补录</button></div>
+  </div>`;
+}
+async function bulkBackfill(){
+  const raw=(document.getElementById("bulkSnap").value||"").trim();
+  if(!raw){alert("先粘贴数据");return;}
+  const lines=raw.split("\n").map(l=>l.trim()).filter(Boolean);
+  let ok=0;const bad=[];
+  for(const ln of lines){
+    const p=ln.split(/[\s,]+/);
+    const date=p[0],acct=parseFloat(p[1]),flow=p[2]!=null?parseFloat(p[2]):0;
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!(acct>0)){bad.push(ln);continue;}
+    await fetch("/api/equity",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({date,accountValue:acct,netFlow:isFinite(flow)?flow:0})});
+    ok++;
+  }
+  if(bad.length)alert(`已补录 ${ok} 条;${bad.length} 行格式无效已跳过:\n`+bad.slice(0,6).join("\n"));
+  document.getElementById("bulkSnap").value="";
+  renderEquity();
 }
 function setEquityRange(r){_equityRange=r;renderEquity();}
 function drawEquityChart(series){
