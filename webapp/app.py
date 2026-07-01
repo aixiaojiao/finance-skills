@@ -2755,6 +2755,54 @@ SIGNAL_INFO = {
 TRACKER_SIGNALS = tuple(SIGNAL_INFO.keys())
 
 
+def _base_stats(df):
+    """VCP-lite:用日线识别最近整理基座,给出建议枢轴 + 基座质量(信息性,供你确认参考)。
+    只做建议、不做定论——机器易误判 VCP,最终以你在跟踪池确认为准。"""
+    if df is None or len(df) < 40:
+        return None
+    try:
+        hi = df["High"].astype(float).to_numpy()
+        lo = df["Low"].astype(float).to_numpy()
+        cl = df["Close"].astype(float).to_numpy()
+        vv = df["Volume"].astype(float).to_numpy()
+    except Exception:
+        return None
+    n = len(cl)
+    W = min(n, 130)                                   # 回看约 6 个月
+    h, l, c, v = hi[-W:], lo[-W:], cl[-W:], vv[-W:]
+    m = len(c)
+    k = 3                                             # k 根分形定摆动高/低点
+    sh = [i for i in range(k, m - k) if h[i] == h[i - k:i + k + 1].max()]
+    sl = [i for i in range(k, m - k) if l[i] == l[i - k:i + k + 1].min()]
+    recent_start = max(0, m - 60)                     # 基座取最近 ~3 个月
+    recent_sh = [i for i in sh if i >= recent_start]
+    pivot = max((h[i] for i in recent_sh), default=float(h[recent_start:].max()))
+    # 收缩:按时间交替的 摆动高→随后摆动低 计算回调深度%
+    ext = sorted([(i, "H") for i in sh] + [(i, "L") for i in sl])
+    contractions = []
+    for a, b in zip(ext, ext[1:]):
+        if a[1] == "H" and b[1] == "L":
+            peak, trough = h[a[0]], l[b[0]]
+            if peak > 0:
+                contractions.append(round((peak - trough) / peak * 100, 1))
+    contractions = contractions[-4:]                  # 只看最近几次
+    tightening = len(contractions) >= 2 and all(
+        contractions[i] >= contractions[i + 1] - 1 for i in range(len(contractions) - 1))
+    depth = max(contractions) if contractions else None
+    base_start = recent_sh[0] if recent_sh else recent_start
+    base_weeks = round((m - 1 - base_start) / 5, 1)
+    vol_dry = float(v[-10:].mean() / v[-50:].mean()) if (m >= 50 and v[-50:].mean() > 0) else None
+    ma = lambda p: float(cl[-p:].mean()) if n >= p else None
+    ma50, ma150, ma200 = ma(50), ma(150), ma(200)
+    px = float(cl[-1])
+    stage2 = bool(ma50 and px > ma50 and (not ma150 or ma50 > ma150)
+                  and (not ma200 or (ma150 or ma50) > ma200))
+    return {"suggestedPivot": round(pivot, 2), "baseWeeks": base_weeks, "depthPct": depth,
+            "contractions": contractions, "contractionCount": len(contractions),
+            "tightening": bool(tightening), "volDryUp": round(vol_dry, 2) if vol_dry else None,
+            "stage2": stage2}
+
+
 def _tracker_eval_one(r, df):
     """对一条跟踪记录结合日线算派生值 + 判定信号/状态(不落库)。"""
     out = dict(r)
@@ -2803,6 +2851,7 @@ def _tracker_eval_one(r, df):
     out["signalInfo"] = SIGNAL_INFO.get(signal)
     out["computedStatus"] = status
     out["needsPivot"] = pivot is None
+    out["baseStats"] = _base_stats(df)             # VCP-lite 建议枢轴 + 基座质量(信息性)
     return out
 
 
@@ -2896,6 +2945,22 @@ def api_tracker():
     # GET:实时评估全池(不落库;落库交给盘后 job)
     return jsonify({"tracker": _evaluate_tracker(db, persist=False),
                     "approachPct": TRACKER_APPROACH_PCT, "volMult": TRACKER_VOL_MULT})
+
+
+@app.route("/api/tracker/pivot")
+def api_tracker_pivot():
+    """轻量查询:某标的在跟踪池的枢轴/可买区/止损(供个股 K 线叠加,不做全池评估)。"""
+    tk = (request.args.get("ticker") or "").strip().upper()
+    if not tk:
+        return jsonify({})
+    r = get_db().execute(
+        "SELECT pivot_price, buy_limit_pct, stop_ref FROM tracker "
+        "WHERE ticker=? AND status NOT IN('expired') ORDER BY id LIMIT 1", (tk,)).fetchone()
+    if not r or r["pivot_price"] is None:
+        return jsonify({})
+    blimit = r["buy_limit_pct"] if r["buy_limit_pct"] is not None else 5
+    return jsonify({"pivot": r["pivot_price"], "buyLimit": r["pivot_price"] * (1 + blimit / 100),
+                    "buyLimitPct": blimit, "stopRef": r["stop_ref"]})
 
 
 @app.route("/api/tracker/<int:tid>", methods=["PUT", "DELETE"])
@@ -3719,6 +3784,17 @@ async function toggleOptionWall(on){
   if(d.putWalls&&d.putWalls[0])add(d.putWalls[0].strike,"#26a69a","Put墙(支撑)");
   add(d.gammaFlip,"#58a6ff","Gamma Flip");
 }
+// 跟踪池枢轴叠加:该股在跟踪池且已设枢轴时,K 线上画 枢轴 / 可买上限 / 参考止损 三条线
+let pivotLines=[];
+async function drawPivotOverlay(){
+  pivotLines.forEach(l=>{try{candleSeries.removePriceLine(l);}catch(e){}});pivotLines=[];
+  if(!candleSeries)return;
+  let p;try{p=await j("/api/tracker/pivot?ticker="+encodeURIComponent(curTicker));}catch(e){return;}
+  if(!p||p.pivot==null)return;
+  pivotLines.push(candleSeries.createPriceLine({price:p.pivot,color:"#58a6ff",lineWidth:2,lineStyle:0,axisLabelVisible:true,title:"枢轴"}));
+  if(p.buyLimit!=null)pivotLines.push(candleSeries.createPriceLine({price:p.buyLimit,color:"#a78bfa",lineWidth:1,lineStyle:2,axisLabelVisible:true,title:"可买上限"}));
+  if(p.stopRef!=null)pivotLines.push(candleSeries.createPriceLine({price:p.stopRef,color:"#ef5350",lineWidth:1,lineStyle:2,axisLabelVisible:true,title:"参考止损"}));
+}
 async function loadChart(period){
   curPeriod=period;
   document.querySelectorAll("#tabc-overview .controls>button").forEach(b=>b.classList.toggle("active",b.textContent===period));
@@ -3734,6 +3810,7 @@ async function loadChart(period){
   renderMaStopBtns("ov");
   applyOvDefaultStop();   // 均线就绪/切周期后,若用户未改过止损则取最近均线为默认
   chart.timeScale().fitContent();
+  drawPivotOverlay();     // 叠加跟踪池枢轴线(若该股在池中)
 }
 
 async function loadSepa(){
@@ -4345,12 +4422,17 @@ async function loadTracker(){
     const volHi=(t.volRatio!=null&&t.volRatio>=d.volMult);
     const buyZone=(t.pivot_price!=null)?`${fmtNum(t.pivot_price)} ~ ${fmtNum(t.buyLimitPrice)}`:'<span class="muted">—</span>';
     const action=t.signalInfo?t.signalInfo.action:(t.needsPivot?'<span class="red">先填枢轴</span>':'观察中');
+    const bs=t.baseStats;
+    const pivotCell=t.pivot_price!=null
+      ? fmtNum(t.pivot_price)
+      : (bs&&bs.suggestedPivot?`<a onclick="applySuggest(${t.id},${bs.suggestedPivot})" title="用系统建议枢轴(VCP-lite 回看基座得出);确认后仍可改">用建议 ${fmtNum(bs.suggestedPivot)}</a>`:'<span class="red">未填</span>');
     return `<tr id="trkrow-${t.id}">
       <td><b class="wchip" style="cursor:pointer;padding:2px 6px" onclick="jumpToStock('${t.ticker}')">${t.ticker}</b>${t.pivot_source==='confirmed'?' <span class="tag" title="已确认枢轴">✓</span>':''}</td>
-      <td>${t.pivot_price!=null?fmtNum(t.pivot_price):'<span class="red">未填</span>'}</td>
+      <td>${pivotCell}</td>
       <td>${fmtNum(t.price)}</td>
       <td class="${distc}">${t.distPct!=null?fmtPct(t.distPct):'—'}</td>
       <td>${trkBadge(t)}</td>
+      <td style="font-size:11px">${baseQualCell(bs)}</td>
       <td class="${volHi?'green':'muted'}" title="当日量 ÷ 50日均量;≥${d.volMult}=放量">${t.volRatio!=null?t.volRatio.toFixed(1)+'x':'—'}</td>
       <td class="muted" style="font-size:12px">${buyZone}</td>
       <td>${t.stop_ref!=null?fmtNum(t.stop_ref):'<span class="muted">—</span>'}</td>
@@ -4370,8 +4452,20 @@ async function loadTracker(){
     <div class="cmpbar"><b>批量粘贴导入:</b>
       <input id="trkPaste" placeholder="从 TradingView 粘贴代码(空格/逗号/换行分隔),先入池后逐个填枢轴" style="flex:1;min-width:280px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px;text-transform:uppercase">
       <button class="search" style="margin:0" onclick="importTracker()">导入</button></div>
-    ${rows.length?`<table><thead><tr><th>代码</th><th>枢轴</th><th>现价</th><th>距枢轴</th><th>状态/信号</th><th>量能</th><th>可买区</th><th>参考止损</th><th>建议动作</th><th>操作</th></tr></thead><tbody>${trkRows}</tbody></table>`:'<div class="muted">跟踪池为空。上方添加单只,或批量粘贴一批代码。</div>'}
-    <div class="small">接近=进入枢轴下方 ${d.approachPct}% 内;突破=现价≥枢轴,放量(量≥${d.volMult}×50日均量)=可买、缩量=存疑;已过可买区=追高勿追;跌破参考止损=出局。</div>`;
+    ${rows.length?`<table><thead><tr><th>代码</th><th>枢轴</th><th>现价</th><th>距枢轴</th><th>状态/信号</th><th>基座质量</th><th>量能</th><th>可买区</th><th>参考止损</th><th>建议动作</th><th>操作</th></tr></thead><tbody>${trkRows}</tbody></table>`:'<div class="muted">跟踪池为空。上方添加单只,或批量粘贴一批代码。</div>'}
+    <div class="small">接近=进入枢轴下方 ${d.approachPct}% 内;突破=现价≥枢轴,放量(量≥${d.volMult}×50日均量)=可买、缩量=存疑;已过可买区=追高勿追;跌破参考止损=出局。基座质量为 VCP-lite 自动估算(收缩=回调一次比一次浅、缩量、仍在 Stage 2 为佳),仅供确认枢轴时参考。</div>`;
+}
+function baseQualCell(bs){
+  if(!bs)return '<span class="muted">—</span>';
+  const contr=(bs.contractions&&bs.contractions.length)?bs.contractions.join("→")+"%":"—";
+  const tight=bs.tightening?' <span class="green" title="回调一次比一次浅,典型 VCP 收缩">收缩✓</span>':'';
+  const s2=bs.stage2?'<span class="green" title="仍在 Stage 2 上升趋势">S2</span>':'<span class="muted" title="未确认在 Stage 2">非S2</span>';
+  const vd=bs.volDryUp!=null?(bs.volDryUp<1?` <span class="green" title="近10日均量÷50日均量,<1=缩量,VCP 想要的">缩量${bs.volDryUp}x</span>`:` <span class="muted">量${bs.volDryUp}x</span>`):'';
+  return `<span title="基座约 ${bs.baseWeeks} 周,最大回调 ${bs.depthPct??'—'}%,收缩序列 ${contr}">${bs.baseWeeks}周·深${bs.depthPct??'—'}%${tight}${vd} ${s2}</span>`;
+}
+async function applySuggest(id,pivot){
+  await fetch("/api/tracker/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({pivot_price:pivot})});
+  loadTracker();
 }
 function jumpToStock(tk){switchPage('stock');if(typeof loadTicker==='function')loadTicker(tk);}
 async function addTracker(){
