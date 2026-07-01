@@ -2319,33 +2319,39 @@ def api_positions():
         mp = _num(d.get("manual_price"))
         stop = _num(d.get("stop"))
         no_stop_ack = 1 if d.get("no_stop_ack") else 0
-        # 加仓合并:同标的已有未平仓仓位则按加权成本并入,不再新建一行
+        # 加仓合并:同标的已有未平仓仓位。仅当「本次未填止损」或「止损与既有相同」才按加权成本并入;
+        # 止损不同则单独建仓(任务3)——否则新填的止损会被合并丢弃,近乎失效。
         existing = db.execute("SELECT * FROM positions WHERE ticker=? AND status='open' ORDER BY id LIMIT 1",
                               (tk,)).fetchone()
-        # 止损纪律:新建持仓止损必填;确需无止损须显式二次确认(no_stop_ack)。加仓合并沿用既有止损,不在此拦。
-        if not existing and stop is None and not no_stop_ack:
+        merge = False
+        if existing:
+            ex_stop = existing["stop"]
+            merge = (stop is None) or (ex_stop is not None and abs(stop - ex_stop) < 1e-9)
+        # 止损纪律:新建持仓止损必填;确需无止损须显式二次确认(no_stop_ack)。并入既有仓位沿用其止损,不在此拦。
+        if not merge and stop is None and not no_stop_ack:
             return jsonify({"error": "止损必填 —— 每一笔都应有止损把风险封顶。确需无止损(如短期套利)请二次确认。",
                             "need_stop": True}), 400
-        if existing:
+        if merge:
             new_shares = existing["shares"] + add_shares
             new_entry = (existing["shares"] * existing["entry"] + add_shares * add_entry) / new_shares
             qn = f"{add_shares:g}" if float(add_shares).is_integer() else f"{add_shares}"
-            tn = f"{new_shares:g}" if float(new_shares).is_integer() else f"{new_shares}"
-            tag = f"[加仓 {today} +{qn}@{add_entry:g}|共{tn}股 均价{round(new_entry, 4):g}]"
+            tag = f"[加仓+{qn}@{add_entry:g}]"                              # 简化备注(任务1)
             new_note = ((existing["note"] + " ") if existing["note"] else "") + tag
             new_mp = mp if mp is not None else existing["manual_price"]   # 提供新现价则更新,否则保留
             db.execute("UPDATE positions SET shares=?, entry=?, note=?, manual_price=? WHERE id=?",
                        (new_shares, new_entry, new_note, new_mp, existing["id"]))
             pos_id = existing["id"]
         else:
+            # 止损不同的加仓:单独成行,注明是加仓;全新建仓则用用户备注
+            note = d.get("note") or ("[加仓·独立止损]" if existing else "")
             cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price,no_stop_ack) VALUES(?,?,?,?,?,?, 'open', ?, ?, ?)",
                              (tk, add_shares, add_entry, stop, _num(d.get("target")),
-                              today, d.get("note") or "", mp, no_stop_ack))
+                              today, note, mp, no_stop_ack))
             pos_id = cur.lastrowid
         db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'buy',?,?,NULL,?,?,?)",
                    (pos_id, tk, add_shares, add_entry, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
         db.commit()
-        return jsonify({"ok": True, "merged": bool(existing)})
+        return jsonify({"ok": True, "merged": merge})
     # GET: 带实时盈亏
     return jsonify(_portfolio_state(db))
 
@@ -3289,6 +3295,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .sidenav button{background:transparent;border:1px solid var(--border);color:var(--muted);padding:10px 14px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500;text-align:left}
   .sidenav button:hover{color:var(--text);border-color:var(--accent)}
   .sidenav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  /* 顶部横向导航(任务6):7 个目录移到行情栏下方,左侧空间全留给自选股 */
+  .topnav{flex-direction:row;flex-wrap:wrap;gap:8px;padding:10px 24px 12px;border-bottom:1px solid var(--border);background:#0a0d12}
+  .topnav button{font-size:13px;padding:8px 14px;text-align:center}
   .search{display:flex;gap:6px}
   .search input{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-size:14px;width:100%;min-width:0;text-transform:uppercase}
   .search button{background:var(--accent);border:none;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer;font-size:14px;white-space:nowrap}
@@ -3416,11 +3425,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .sec-edit-row .se-tk{grid-column:1/-1}
   .sec-edit-row input,.sec-edit-row textarea{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:7px 9px;border-radius:6px;font-size:13px;width:100%}
   .sec-edit-row textarea{min-height:46px;resize:vertical;text-transform:uppercase;font-family:inherit}
-  .capbar{background:linear-gradient(135deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:18px;display:flex;flex-direction:column;gap:10px;max-width:640px}
+  .capbar{background:linear-gradient(135deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:18px;display:flex;flex-direction:column;gap:10px}
   .capbar .caprow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .capbar .caplabel{color:var(--muted);font-size:14px;font-weight:600;margin-right:4px}
   .capbar .capcur{font-size:24px;font-weight:700;color:var(--muted)}
   .capbar input{background:var(--bg);border:1px solid var(--border);color:var(--text);font-size:26px;font-weight:800;padding:5px 12px;border-radius:8px;width:200px}
+  /* 阈值输入(单笔最大风险 / 组合最大热度):小字号、去掉上下调节箭头、仅手动输入、支持1位小数 */
+  .capbar input.thresh{font-size:15px;font-weight:600;width:78px;padding:5px 8px;-moz-appearance:textfield}
+  .capbar input.thresh::-webkit-outer-spin-button,.capbar input.thresh::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
   .capbar .capmeta{display:flex;gap:20px;flex-wrap:wrap;font-size:13px;color:var(--muted)}
   .subtabs{display:flex;gap:6px;margin:14px 0}
   .subtabs button{background:var(--panel);border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px}.subtabs button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -3429,21 +3441,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <body>
 
 <div class="marketbar" id="marketbar"><span class="muted">大盘加载中…</span></div>
+<!-- 顶部横向导航(任务6):行情栏下方,左侧空间留给自选股 -->
+<nav class="sidenav topnav">
+  <button id="nav-stock" class="active" onclick="switchPage('stock')">📊 个股看板</button>
+  <button id="nav-positions" onclick="switchPage('positions')">💼 持仓</button>
+  <button id="nav-perf" onclick="switchPage('perf')">🎯 绩效面板</button>
+  <button id="nav-tracker" onclick="switchPage('tracker')">📍 枢轴跟踪</button>
+  <button id="nav-review" onclick="switchPage('review')">📓 每日复盘</button>
+  <button id="nav-equity" onclick="switchPage('equity')">📈 资金曲线</button>
+  <button id="nav-heatmap" onclick="switchPage('heatmap')">🔥 市场热力图</button>
+</nav>
 <div id="alertBanner"></div>
 
 <div class="app">
- <!-- 全局左侧栏:品牌 + 导航 + 搜索 + 自选股 -->
+ <!-- 全局左侧栏:品牌 + 搜索 + 自选股(导航已上移到顶部) -->
  <aside class="sidebar">
    <div class="brand">📈 看板 <span style="font-size:11px;color:var(--muted);font-weight:500">v{{VERSION}}</span></div>
-   <nav class="sidenav">
-     <button id="nav-stock" class="active" onclick="switchPage('stock')">📊 个股看板</button>
-     <button id="nav-positions" onclick="switchPage('positions')">💼 持仓</button>
-     <button id="nav-perf" onclick="switchPage('perf')">🎯 绩效面板</button>
-     <button id="nav-tracker" onclick="switchPage('tracker')">📍 枢轴跟踪</button>
-     <button id="nav-review" onclick="switchPage('review')">📓 每日复盘</button>
-     <button id="nav-equity" onclick="switchPage('equity')">📈 资金曲线</button>
-     <button id="nav-heatmap" onclick="switchPage('heatmap')">🔥 市场热力图</button>
-   </nav>
    <div class="search" id="stockSearch">
      <input id="tickerInput" placeholder="代码 如 AAPL" value="AAPL" />
      <button onclick="loadTicker()">查询</button>
@@ -4112,9 +4125,9 @@ async function loadTrack(){
     </div>
     <div class="caprow" style="font-size:12px;margin-top:6px;gap:6px;flex-wrap:wrap">
       <span class="caplabel" title="单笔止损触发时最多亏损占账户的比例;超阈值的计算器/持仓行标红。SEPA 建议 0.5–2%">单笔最大风险</span>
-      <input id="maxRiskInput" type="number" step="0.1" value="${maxRiskPct}" style="width:60px" onkeydown="if(event.key==='Enter')saveRiskThresholds()"><span class="capcur">%</span>
+      <input id="maxRiskInput" class="thresh" type="number" inputmode="decimal" step="0.1" min="0" value="${maxRiskPct}" onkeydown="if(event.key==='Enter')saveRiskThresholds()"><span class="capcur">%</span>
       <span class="caplabel" style="margin-left:10px" title="组合总风险敞口(Σ风险)占账户的比例上限,即「组合热度」;超阈值标红。SEPA 建议别过高">组合最大热度</span>
-      <input id="maxHeatInput" type="number" step="0.5" value="${maxHeatPct}" style="width:60px" onkeydown="if(event.key==='Enter')saveRiskThresholds()"><span class="capcur">%</span>
+      <input id="maxHeatInput" class="thresh" type="number" inputmode="decimal" step="0.1" min="0" value="${maxHeatPct}" onkeydown="if(event.key==='Enter')saveRiskThresholds()"><span class="capcur">%</span>
       <button class="search" style="margin:0" onclick="saveRiskThresholds()">保存阈值</button>
     </div>
     <div class="muted" style="font-size:11px">仓位计算默认从这里取值;修改后下方比例与「概览页仓位计算」同步。盈亏按 yfinance 延迟现价对开仓价实时计算。</div>
@@ -4176,7 +4189,7 @@ async function loadTrack(){
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
   renderTrades();
 }
-const TRADES_PER_PAGE=20;
+const TRADES_PER_PAGE=10;
 function renderTrades(){
   const box=document.getElementById("tradeBox");if(!box)return;
   const all=window._allTrades||[];
