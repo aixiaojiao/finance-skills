@@ -152,6 +152,9 @@ def init_db():
     pos_cols = [r[1] for r in con.execute("PRAGMA table_info(positions)").fetchall()]
     if "manual_price" not in pos_cols:
         con.execute("ALTER TABLE positions ADD COLUMN manual_price REAL")
+    # 迁移:止损纪律——无止损需二次确认打标(no_stop_ack=1 表示「确知无止损、非遗漏」),风险统计里单列
+    if "no_stop_ack" not in pos_cols:
+        con.execute("ALTER TABLE positions ADD COLUMN no_stop_ack INTEGER DEFAULT 0")
     # 迁移:为旧库 watchlist 补 sort 列,并按 added_at 回填初始顺序
     wl_cols = [r[1] for r in con.execute("PRAGMA table_info(watchlist)").fetchall()]
     if "sort" not in wl_cols:
@@ -2272,9 +2275,15 @@ def api_positions():
         today = time.strftime("%Y-%m-%d")
         add_shares, add_entry = float(d["shares"]), float(d["entry"])
         mp = _num(d.get("manual_price"))
+        stop = _num(d.get("stop"))
+        no_stop_ack = 1 if d.get("no_stop_ack") else 0
         # 加仓合并:同标的已有未平仓仓位则按加权成本并入,不再新建一行
         existing = db.execute("SELECT * FROM positions WHERE ticker=? AND status='open' ORDER BY id LIMIT 1",
                               (tk,)).fetchone()
+        # 止损纪律:新建持仓止损必填;确需无止损须显式二次确认(no_stop_ack)。加仓合并沿用既有止损,不在此拦。
+        if not existing and stop is None and not no_stop_ack:
+            return jsonify({"error": "止损必填 —— 每一笔都应有止损把风险封顶。确需无止损(如短期套利)请二次确认。",
+                            "need_stop": True}), 400
         if existing:
             new_shares = existing["shares"] + add_shares
             new_entry = (existing["shares"] * existing["entry"] + add_shares * add_entry) / new_shares
@@ -2287,9 +2296,9 @@ def api_positions():
                        (new_shares, new_entry, new_note, new_mp, existing["id"]))
             pos_id = existing["id"]
         else:
-            cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price) VALUES(?,?,?,?,?,?, 'open', ?, ?)",
-                             (tk, add_shares, add_entry, _num(d.get("stop")), _num(d.get("target")),
-                              today, d.get("note") or "", mp))
+            cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price,no_stop_ack) VALUES(?,?,?,?,?,?, 'open', ?, ?, ?)",
+                             (tk, add_shares, add_entry, stop, _num(d.get("target")),
+                              today, d.get("note") or "", mp, no_stop_ack))
             pos_id = cur.lastrowid
         db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'buy',?,?,NULL,?,?,?)",
                    (pos_id, tk, add_shares, add_entry, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
@@ -2309,6 +2318,8 @@ def _portfolio_state(db):
     arow = db.execute("SELECT value FROM settings WHERE key='accountValue'").fetchone()
     acct = float(arow["value"]) if arow and arow["value"] else None
     total_mv = total_cost = total_pl = total_risk = 0.0
+    no_stop_cost = 0.0                                      # 无止损持仓的成本敞口(其下行风险未封顶,不计入 total_risk)
+    no_stop_count = 0
     for r in rows:
         manual = r.get("manual_price") is not None
         r["manual"] = manual
@@ -2332,6 +2343,8 @@ def _portfolio_state(db):
             r["toStopPct"] = ((r["stop"] / price - 1) * 100) if r["stop"] else None
             # 风险敞口($):从现价回落到止损会亏多少(现价−止损)×股数;止损≥成本则为锁定的利润回吐
             r["riskDollar"] = ((price - r["stop"]) * r["shares"]) if r["stop"] else None
+            # 单笔风险占账户%(仅正风险有意义;锁利为负不算风险)——供前端对照「单笔最大风险%」阈值标红
+            r["riskPct"] = (max(0.0, r["riskDollar"]) / acct * 100) if (r["riskDollar"] is not None and acct) else None
             if r["stop"] and r["status"] == "open":
                 rps = r["entry"] - r["stop"]
                 if rps > 0:                                   # 止损低于成本:正常 R 倍数
@@ -2345,9 +2358,14 @@ def _portfolio_state(db):
                 total_pl += mv - cost
                 if r["stop"]:
                     total_risk += max(0.0, (price - r["stop"]) * r["shares"])
+            if not r["stop"]:                               # 无止损:下行风险不封顶,单列成本敞口
+                no_stop_count += 1
+                no_stop_cost += cost
     summary = {"openCount": len(open_rows), "totalMarketValue": total_mv, "totalCost": total_cost,
                "totalPL": total_pl, "totalPLPct": (total_pl / total_cost * 100) if total_cost else None,
                "totalRisk": total_risk, "account": acct,
+               "noStopCount": no_stop_count, "noStopCost": no_stop_cost,     # 无止损持仓:数量 + 成本敞口
+               "noStopCostPct": (no_stop_cost / acct * 100) if acct else None,
                "investedPct": (total_cost / acct * 100) if acct else None,   # 已投入成本占账户
                "marketPct": (total_mv / acct * 100) if acct else None,        # 持仓市值占账户=仓位占账户
                "riskPct": (total_risk / acct * 100) if acct else None}
@@ -2405,9 +2423,18 @@ def api_position_one(pid):
         db.commit()
         return jsonify({"ok": True})
     else:
-        for field in ("shares", "entry", "stop", "target", "note", "manual_price"):
+        for field in ("shares", "entry", "stop", "target", "note", "manual_price", "no_stop_ack"):
             if field in d:
-                db.execute(f"UPDATE positions SET {field}=? WHERE id=?", (_num(d[field]) if field != "note" else d[field], pid))
+                if field == "note":
+                    val = d[field]
+                elif field == "no_stop_ack":
+                    val = 1 if d[field] else 0
+                else:
+                    val = _num(d[field])
+                db.execute(f"UPDATE positions SET {field}=? WHERE id=?", (val, pid))
+        # 编辑里重新填了止损 → 清除无止损标记(不再是「确认无止损」状态)
+        if d.get("stop") not in (None, "", 0):
+            db.execute("UPDATE positions SET no_stop_ack=0 WHERE id=?", (pid,))
         # 改了股数/成本时,若该仓位只有一笔买入且无卖出,同步修正其交易明细(如期权忘记×100 的手误)
         if "shares" in d or "entry" in d:
             buys = db.execute("SELECT id FROM trades WHERE position_id=? AND action='buy'", (pid,)).fetchall()
@@ -3575,6 +3602,8 @@ function calcSize(p){
   const bindClass=sharesByRisk<=sharesByPos?"sell":"hold";
   const t1=entry*1.08,t2=entry*1.15;          // SEPA: +8% 卖一半, +15% 再卖25%
   const R=riskPerShare,rr1=(t1-entry)/R,rr2=(t2-entry)/R;
+  const stopPct=(entry-stop)/entry*100;   // 止损距离(%);Minervini 右侧交易建议 7–8% 以内
+  const extWarn=stopPct>10?`<div class="error" style="margin-bottom:8px">⚠ 止损距离 ${stopPct.toFixed(1)}% 已超 Minervini 建议的 7–8%。这通常意味着买点离基座/枢轴过远(追高)。右侧交易应在枢轴附近入场把止损收窄到 7–8% 以内;否则考虑等回踩或换更贴近支撑的入场点。</div>`:'';
 
   if(shares<=0){
     res.innerHTML=`<div class="error">在当前条件下可买股数为 0 —— 风险上限或仓位上限太小,或止损距离太宽(每股风险 $${fmtNum(riskPerShare)})。</div>`;return;
@@ -3582,6 +3611,7 @@ function calcSize(p){
   // 计算上下文:条件一变(calcSize 重跑)即覆盖,股数输入框被重置回最大值
   window["_sizerCtx_"+p]={entry,stop,account,maxShares:shares,riskPerShare,ticker};
   res.innerHTML=`
+   ${extWarn}
    <div class="bindbox">
      <div><div class="muted" style="font-size:12px">买入股数 <span style="font-size:11px">(默认最大,可改)</span></div>
        <div class="row" style="align-items:baseline;gap:6px">
@@ -3619,11 +3649,14 @@ function renderSizerDerived(p){
   const h=document.getElementById(p+"hShares");
   if(h)h.innerHTML=`最大可买 ${ctx.maxShares.toLocaleString()} 股`
     +(over?' · <span class="red">已超最大,风险/仓位将超标</span>':(shares>0&&shares<ctx.maxShares?' · <span class="muted">低于最大</span>':''));
+  const riskPct=riskDollar/acc*100,maxRiskPct=parseFloat(getSetting("maxRiskPct","1.5"));
+  const riskOver=riskPct>maxRiskPct;
+  const riskCard=`<div class="card"><div class="k">占总资产(风险)${riskOver?` <span class="red" style="font-size:11px" title="单笔风险超过阈值 ${maxRiskPct}%">⚠超阈值</span>`:""}</div><div class="v ${riskOver?'red':''}">${riskPct.toFixed(2)}%</div></div>`;
   el.innerHTML=`
      ${card("投入资金",`$${fmtBig(capital)}`)}
      ${card("占总资产",`${(capital/acc*100).toFixed(1)}%`)}
      ${card("实际风险金额",`$${fmtBig(riskDollar)}`)}
-     ${card("占总资产(风险)",`${(riskDollar/acc*100).toFixed(2)}%`)}
+     ${riskCard}
      ${card("每股风险",`$${fmtNum(ctx.riskPerShare)}`)}
      ${card("止损距离",`${((ctx.entry-ctx.stop)/ctx.entry*100).toFixed(2)}%`)}`;
 }
@@ -3655,6 +3688,7 @@ async function loadTrack(){
   const s=d.summary||{};
   const open=d.positions.filter(p=>p.status==="open"),trades=d.trades||[];
   const acct=getSetting("accountValue","100000");
+  const maxRiskPct=getSetting("maxRiskPct","1.5"),maxHeatPct=getSetting("maxHeatPct","6");
   const freeCash=(s.totalMarketValue!=null&&acct)?(parseFloat(acct)-s.totalMarketValue):null;
   const capBar=`<div class="capbar">
     <div class="caprow"><span class="caplabel">总资金量</span><span class="capcur">$</span>
@@ -3665,6 +3699,13 @@ async function loadTrack(){
       <span>可用现金 <b>${freeCash!=null?'$'+fmtBig(freeCash):'—'}</b></span>
       <span>浮盈亏 <b class="${(s.totalPL||0)>=0?'green':'red'}">${s.totalPL!=null?(s.totalPL>=0?'+':'')+'$'+fmtBig(Math.abs(s.totalPL)):'—'}</b></span>
     </div>
+    <div class="caprow" style="font-size:12px;margin-top:6px;gap:6px;flex-wrap:wrap">
+      <span class="caplabel" title="单笔止损触发时最多亏损占账户的比例;超阈值的计算器/持仓行标红。SEPA 建议 0.5–2%">单笔最大风险</span>
+      <input id="maxRiskInput" type="number" step="0.1" value="${maxRiskPct}" style="width:60px" onkeydown="if(event.key==='Enter')saveRiskThresholds()"><span class="capcur">%</span>
+      <span class="caplabel" style="margin-left:10px" title="组合总风险敞口(Σ风险)占账户的比例上限,即「组合热度」;超阈值标红。SEPA 建议别过高">组合最大热度</span>
+      <input id="maxHeatInput" type="number" step="0.5" value="${maxHeatPct}" style="width:60px" onkeydown="if(event.key==='Enter')saveRiskThresholds()"><span class="capcur">%</span>
+      <button class="search" style="margin:0" onclick="saveRiskThresholds()">保存阈值</button>
+    </div>
     <div class="muted" style="font-size:11px">仓位计算默认从这里取值;修改后下方比例与「概览页仓位计算」同步。盈亏按 yfinance 延迟现价对开仓价实时计算。</div>
   </div>`;
   const sumCards=`<div class="grid" style="margin-bottom:18px">
@@ -3673,28 +3714,43 @@ async function loadTrack(){
     ${card("总成本",s.totalCost!=null?"$"+fmtBig(s.totalCost):"—")}
     <div class="card"><div class="k">总浮盈亏</div><div class="v ${(s.totalPL||0)>=0?'green':'red'}">${s.totalPL!=null?(s.totalPL>=0?"+":"")+"$"+fmtBig(Math.abs(s.totalPL)):"—"} ${s.totalPLPct!=null?`(${fmtPct(s.totalPLPct)})`:""}</div></div>
     ${card("仓位占账户",s.marketPct!=null?s.marketPct.toFixed(1)+"%":"—")}
-    <div class="card"><div class="k">组合风险敞口</div><div class="v ${(s.riskPct||0)>6?'red':''}">${s.totalRisk!=null?"$"+fmtBig(s.totalRisk):"—"} ${s.riskPct!=null?`(${s.riskPct.toFixed(2)}%)`:""}</div></div>
+    <div class="card"><div class="k">组合风险敞口${s.noStopCount?` <span class="red" title="${s.noStopCount} 个持仓未设止损,其下行风险未计入左侧数值,实际组合风险更高">· ⚠ ${s.noStopCount} 个无止损</span>`:""}</div>
+      <div class="v ${(s.riskPct||0)>parseFloat(maxHeatPct)?'red':''}" title="已计入止损的风险敞口 Σ(现价−止损)×股数,占账户即组合热度;阈值 ${maxHeatPct}%">${s.totalRisk!=null?"$"+fmtBig(s.totalRisk):"—"} ${s.riskPct!=null?`(${s.riskPct.toFixed(2)}%)`:""}</div>
+      ${s.noStopCount?`<div class="red" style="font-size:11px;margin-top:2px" title="无止损持仓的成本敞口,下行不封顶,未含在上面的风险数字里">+ 无止损成本敞口 $${fmtBig(s.noStopCost||0)}${s.noStopCostPct!=null?` (${s.noStopCostPct.toFixed(1)}%)`:""}</div>`:""}</div>
   </div>`;
   window._openPos=open;
+  const maxRiskNum=parseFloat(maxRiskPct);
   const openRows=open.map(p=>{
     const plc=(p.pl||0)>=0?"green":"red";
     // 止损≥成本=锁利(绿),否则=亏损风险(红);遵循绿赚红亏
     const locked=(p.stop!=null&&p.entry!=null&&p.stop>=p.entry);
     const stopc=p.stop==null?"":(locked?"green":"red");
+    const overRisk=(p.riskPct!=null&&p.riskPct>maxRiskNum);   // 单笔风险超阈值
+    const overTag=overRisk?` <span class="red" title="单笔风险 ${p.riskPct.toFixed(2)}% 超过阈值 ${maxRiskPct}%,仓位偏重或止损偏宽">⚠${p.riskPct.toFixed(1)}%</span>`:"";
     const riskCell=p.riskDollar!=null
-      ? `<span class="${stopc}" title="(现价−止损)×股数;${locked?'止损已在成本之上,这是会回吐的利润':'触及止损将亏损此金额'}">${p.riskDollar>=0?"":"-"}$${fmtBig(Math.abs(p.riskDollar))}</span>`
-      : '<span class="red" title="未设止损,下行风险不封顶">未设止损</span>';
+      ? `<span class="${stopc}" title="(现价−止损)×股数;${locked?'止损已在成本之上,这是会回吐的利润':'触及止损将亏损此金额'}">${p.riskDollar>=0?"":"-"}$${fmtBig(Math.abs(p.riskDollar))}</span>${overTag}`
+      : (p.no_stop_ack
+          ? '<span class="muted" title="已确认无止损(如短期套利);下行风险不封顶,已在风险敞口卡单列">无止损·已确认</span>'
+          : '<span class="red" title="未设止损,下行风险不封顶">未设止损</span>');
     return `<tr id="posrow-${p.id}">
       <td><b class="wchip" style="cursor:pointer;padding:2px 6px" onclick="loadTicker('${p.ticker}')">${p.ticker}</b></td>
       <td>${fmtNum(p.shares,0)}</td><td>${fmtNum(p.entry)}</td><td>${fmtNum(p.price)}${p.manual?' <span class="tag" title="手填现价,不走实时行情(期权/港股等)">手填</span>':''}</td>
       <td class="${plc}">${p.pl!=null?(p.pl>=0?"+":"")+fmtBig(p.pl):"—"} ${p.plPct!=null?`(${fmtPct(p.plPct)})`:""}</td>
-      <td>${fmtNum(p.stop)}</td><td class="${stopc}" title="现价到止损还要跌多少;止损在成本之上则锁利(绿)">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
+      <td>${p.stop!=null?fmtNum(p.stop):(p.no_stop_ack?'<span class="muted">无</span>':'<span class="red">—</span>')}</td><td class="${stopc}" title="现价到止损还要跌多少;止损在成本之上则锁利(绿)">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
       <td>${riskCell}</td>
       <td class="muted">${p.note||""}</td>
       <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a onclick="openJournal(${p.id},'${p.ticker}',{hadStop:${p.stop!=null}})" title="记录 setup/理由/信念/情绪(事后也可补)">日志${jmap[p.id]?" ✍":""}</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
   window._allTrades=trades;window._tradePage=0;
+  // 止损纪律 banner:只对「遗漏」(未确认)的无止损持仓报警;已二次确认(no_stop_ack)的不再打扰
+  const noStopUnacked=open.filter(p=>p.stop==null&&!p.no_stop_ack);
+  const banner=noStopUnacked.length?`<div style="background:rgba(220,60,60,.12);border:1px solid var(--red);color:var(--red);padding:11px 14px;border-radius:10px;margin-bottom:14px;font-weight:600">
+    ⚠ ${noStopUnacked.length} 个持仓未设止损,组合风险未封顶 ——
+    ${noStopUnacked.map(p=>`<a onclick="flashPosRow(${p.id})" style="color:var(--red);text-decoration:underline;cursor:pointer;margin:0 5px">${p.ticker}</a>`).join("")}
+    <div style="font-weight:400;font-size:12px;margin-top:4px">点代码定位到该行 → 补一个止损;确需无止损(如短期套利)可在「改」里勾选确认,即可消除此提示并单列其成本敞口。</div>
+  </div>`:"";
   el.innerHTML=`
+    ${banner}
     ${capBar}
     ${sumCards}
     <div class="cmpbar"><b>手动添加:</b>
@@ -3740,11 +3796,37 @@ async function saveAccount(){
   try{await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accountValue:String(v)})});}catch(e){}
   loadTrack();
 }
+// 保存止损纪律阈值:单笔最大风险% / 组合最大热度%
+async function saveRiskThresholds(){
+  const r=parseFloat(document.getElementById("maxRiskInput").value),h=parseFloat(document.getElementById("maxHeatInput").value);
+  if(!(r>0)||!(h>0)){alert("阈值需为正数");return;}
+  setSetting("maxRiskPct",r);setSetting("maxHeatPct",h);
+  loadTrack();
+}
+// banner 点代码:定位到对应持仓行并高亮闪烁
+function flashPosRow(id){
+  const tr=document.getElementById("posrow-"+id);if(!tr)return;
+  tr.scrollIntoView({behavior:"smooth",block:"center"});
+  tr.style.transition="background .3s";const orig=tr.style.background;
+  tr.style.background="rgba(220,60,60,.28)";
+  setTimeout(()=>{tr.style.background=orig;},1200);
+}
 async function addPositionManual(){
   const tk=document.getElementById("npTicker").value.trim().toUpperCase();
   const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value),mp=parseFloat(document.getElementById("npPrice").value);
   if(!tk||!shares||!entry){alert("代码/股数/买入价必填");return;}
-  await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop||null,manual_price:mp>0?mp:null})});
+  const existing=(window._openPos||[]).find(p=>p.ticker===tk);
+  let noStopAck=0;
+  if(!(stop>0)){
+    // 加仓到已有止损的仓位则沿用其止损,无需确认;否则要求二次确认才允许无止损记入
+    if(!(existing&&existing.stop!=null)){
+      if(!confirm(`${tk} 未填止损。每一笔都应有止损把风险封顶。\n仍以「无止损」记入吗?(仅短期套利等特殊情况;将单列其成本敞口)`))return;
+      noStopAck=1;
+    }
+  }
+  const r=await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop>0?stop:null,manual_price:mp>0?mp:null,no_stop_ack:noStopAck})});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert(e.error||"记入失败");return;}
+  ["npTicker","npShares","npEntry","npStop","npPrice"].forEach(k=>{const e=document.getElementById(k);if(e)e.value="";});
   loadTrack();
 }
 // 行内平仓表单:输入平仓价 + 平仓数量(默认全部);数量<持仓为部分平仓(减仓)
@@ -3801,7 +3883,13 @@ async function savePosition(id){
   const shares=parseFloat(v("shares")),entry=parseFloat(v("entry"));
   if(!(shares>0)||!(entry>0)){alert("股数/买入价必须为正数");return;}
   // 止损可高于成本(移动止损锁利),不做 stop<entry 限制
-  const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note"),manual_price:numOrNull(v("mprice"))};
+  const stop=numOrNull(v("stop"));
+  let noStopAck=0;
+  if(stop==null){   // 保存时把止损清空 → 二次确认;确认则打无止损标(风险敞口卡单列)
+    if(!confirm("保存后该持仓将没有止损,下行风险不封顶。确认清空止损?"))return;
+    noStopAck=1;
+  }
+  const body={shares,entry,stop,target:numOrNull(v("target")),note:v("note"),manual_price:numOrNull(v("mprice")),no_stop_ack:noStopAck};
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   loadTrack();
 }
