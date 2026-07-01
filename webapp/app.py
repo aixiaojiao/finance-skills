@@ -4123,9 +4123,9 @@ async function loadTrack(){
     ${card("总成本",s.totalCost!=null?"$"+fmtBig(s.totalCost):"—")}
     <div class="card"><div class="k">总浮盈亏</div><div class="v ${(s.totalPL||0)>=0?'green':'red'}">${s.totalPL!=null?(s.totalPL>=0?"+":"")+"$"+fmtBig(Math.abs(s.totalPL)):"—"} ${s.totalPLPct!=null?`(${fmtPct(s.totalPLPct)})`:""}</div></div>
     ${card("仓位占账户",s.marketPct!=null?s.marketPct.toFixed(1)+"%":"—")}
-    <div class="card"><div class="k">组合风险敞口${s.noStopCount?` <span class="red" title="${s.noStopCount} 个持仓未设止损,其下行风险未计入左侧数值,实际组合风险更高">· ⚠ ${s.noStopCount} 个无止损</span>`:""}</div>
+    <div class="card"><div class="k">组合风险敞口</div>
       <div class="v ${(s.riskPct||0)>parseFloat(maxHeatPct)?'red':''}" title="已计入止损的风险敞口 Σ(现价−止损)×股数,占账户即组合热度;阈值 ${maxHeatPct}%">${s.totalRisk!=null?"$"+fmtBig(s.totalRisk):"—"} ${s.riskPct!=null?`(${s.riskPct.toFixed(2)}%)`:""}</div>
-      ${s.noStopCount?`<div class="red" style="font-size:11px;margin-top:2px" title="无止损持仓的成本敞口,下行不封顶,未含在上面的风险数字里">+ 无止损成本敞口 $${fmtBig(s.noStopCost||0)}${s.noStopCostPct!=null?` (${s.noStopCostPct.toFixed(1)}%)`:""}</div>`:""}</div>
+      ${s.noStopCount?`<div style="font-size:11px;margin-top:4px" title="${s.noStopCount} 个持仓未设止损,其成本敞口 $${fmtBig(s.noStopCost||0)}${s.noStopCostPct!=null?`(${s.noStopCostPct.toFixed(1)}%)`:""} 下行不封顶,未计入上方风险,实际组合风险更高"><span class="red">⚠ ${s.noStopCount} 无止损</span> <span class="muted">敞口 $${fmtBig(s.noStopCost||0)}</span></div>`:""}</div>
   </div>`;
   window._openPos=open;
   const maxRiskNum=parseFloat(maxRiskPct);
@@ -4153,10 +4153,10 @@ async function loadTrack(){
   window._allTrades=trades;window._tradePage=0;
   // 止损纪律 banner:只对「遗漏」(未确认)的无止损持仓报警;已二次确认(no_stop_ack)的不再打扰
   const noStopUnacked=open.filter(p=>p.stop==null&&!p.no_stop_ack);
-  const banner=noStopUnacked.length?`<div style="background:rgba(220,60,60,.12);border:1px solid var(--red);color:var(--red);padding:11px 14px;border-radius:10px;margin-bottom:14px;font-weight:600">
-    ⚠ ${noStopUnacked.length} 个持仓未设止损,组合风险未封顶 ——
-    ${noStopUnacked.map(p=>`<a onclick="flashPosRow(${p.id})" style="color:var(--red);text-decoration:underline;cursor:pointer;margin:0 5px">${p.ticker}</a>`).join("")}
-    <div style="font-weight:400;font-size:12px;margin-top:4px">点代码定位到该行 → 补一个止损;确需无止损(如短期套利)可在「改」里勾选确认,即可消除此提示并单列其成本敞口。</div>
+  const banner=noStopUnacked.length?`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:rgba(239,83,80,.07);border-left:3px solid var(--red);border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:13px">
+    <span style="color:var(--red);font-weight:600;white-space:nowrap">⚠ ${noStopUnacked.length} 个未设止损</span>
+    <span style="display:flex;gap:6px;flex-wrap:wrap">${noStopUnacked.map(p=>`<a onclick="flashPosRow(${p.id})" style="cursor:pointer;background:rgba(239,83,80,.12);color:var(--red);padding:2px 8px;border-radius:10px;font-size:12px;text-decoration:none">${p.ticker}</a>`).join("")}</span>
+    <span class="muted" style="font-size:11px;margin-left:auto">点代码定位补止损,或在「改」里确认无止损</span>
   </div>`:"";
   el.innerHTML=`
     ${banner}
