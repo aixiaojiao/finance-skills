@@ -136,6 +136,17 @@ def init_db():
     CREATE TABLE IF NOT EXISTS snapshots(
         date TEXT PRIMARY KEY, payload TEXT, review TEXT, created_at TEXT
     );
+    -- 结构化交易日志:一条持仓一份日志(position_id 主键)。入场时填 setup/理由/信念/情绪,
+    --   退出时补退出理由/错误标签/教训。绩效面板按 setup 分组即取自此表。mistake_tags 存 JSON 数组。
+    CREATE TABLE IF NOT EXISTS journal(
+        position_id INTEGER PRIMARY KEY,
+        ticker TEXT,
+        setup_type TEXT, entry_reason TEXT,
+        conviction INTEGER, emotion INTEGER,
+        exit_reason TEXT, exit_note TEXT,
+        mistake_tags TEXT, lesson TEXT,
+        created_at TEXT, updated_at TEXT
+    );
     """)
     # 迁移:持仓支持「手填现价」(期权/港股等无实时行情的标的)——非空即视为手动定价,不拉 yfinance
     pos_cols = [r[1] for r in con.execute("PRAGMA table_info(positions)").fetchall()]
@@ -2416,6 +2427,166 @@ def api_trade_one(tid):
     return jsonify({"ok": True})
 
 
+# ============================ 结构化交易日志 + 绩效面板 ============================
+
+JOURNAL_FIELDS = ("setup_type", "entry_reason", "conviction", "emotion",
+                  "exit_reason", "exit_note", "mistake_tags", "lesson")
+
+
+def _journal_row_to_dict(r):
+    d = dict(r)
+    # mistake_tags 存 JSON 数组字符串,回传时解析为列表(容错:非 JSON 则按空列表)
+    try:
+        d["mistake_tags"] = json.loads(d["mistake_tags"]) if d.get("mistake_tags") else []
+    except Exception:
+        d["mistake_tags"] = []
+    return d
+
+
+@app.route("/api/journal", methods=["GET"])
+def api_journal_all():
+    """全部交易日志,按 position_id 建字典,供持仓页/绩效页快速查有无日志。"""
+    rows = get_db().execute("SELECT * FROM journal").fetchall()
+    return jsonify({str(r["position_id"]): _journal_row_to_dict(r) for r in rows})
+
+
+@app.route("/api/journal/<int:pid>", methods=["GET", "POST"])
+def api_journal_one(pid):
+    db = get_db()
+    if request.method == "GET":
+        r = db.execute("SELECT * FROM journal WHERE position_id=?", (pid,)).fetchone()
+        return jsonify(_journal_row_to_dict(r) if r else {})
+    d = request.get_json(force=True, silent=True) or {}
+    pos = db.execute("SELECT ticker FROM positions WHERE id=?", (pid,)).fetchone()
+    if pos is None:
+        return jsonify({"error": "持仓不存在"}), 404
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    exists = db.execute("SELECT 1 FROM journal WHERE position_id=?", (pid,)).fetchone()
+    vals = {}
+    for f in JOURNAL_FIELDS:
+        if f not in d:
+            continue
+        if f == "mistake_tags":
+            tags = d[f] if isinstance(d[f], list) else []
+            vals[f] = json.dumps(tags, ensure_ascii=False)
+        elif f in ("conviction", "emotion"):
+            vals[f] = _num(d[f])
+        else:
+            vals[f] = d[f]
+    if exists:
+        if vals:
+            sets = ", ".join(f"{k}=?" for k in vals) + ", updated_at=?"
+            db.execute(f"UPDATE journal SET {sets} WHERE position_id=?",
+                       (*vals.values(), now, pid))
+    else:
+        cols = ["position_id", "ticker", "created_at", "updated_at", *vals.keys()]
+        db.execute(f"INSERT INTO journal({', '.join(cols)}) VALUES({', '.join('?' * len(cols))})",
+                   (pid, pos["ticker"], now, now, *vals.values()))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+def _parse_date(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+@app.route("/api/performance", methods=["GET"])
+def api_performance():
+    """基于已平仓持仓 + 交易流水 + 日志的绩效聚合(Minervini 最看重的数字)。
+    一笔=一个已平仓 position:已实现盈亏=其所有 sell 的 pl 之和;成本=其所有 buy 的 shares×price 之和。"""
+    db = get_db()
+    closed = db.execute("SELECT * FROM positions WHERE status='closed'").fetchall()
+    # 该 position 的买入成本 / 卖出已实现盈亏
+    buys = {}
+    sells = {}
+    for r in db.execute("SELECT position_id, action, shares, price, pl FROM trades WHERE position_id IS NOT NULL"):
+        if r["action"] == "buy":
+            b = buys.setdefault(r["position_id"], [0.0, 0.0])
+            b[0] += (r["shares"] or 0) * (r["price"] or 0)   # 成本额
+            b[1] += (r["shares"] or 0)                        # 买入股数
+        elif r["action"] == "sell":
+            s = sells.setdefault(r["position_id"], 0.0)
+            sells[r["position_id"]] = s + (r["pl"] or 0.0)
+    jrows = {r["position_id"]: r for r in db.execute("SELECT position_id, setup_type FROM journal")}
+
+    trades = []
+    for p in closed:
+        pid = p["id"]
+        cost = buys.get(pid, [None, None])[0]
+        realized = sells.get(pid)
+        if realized is None:                                 # 无卖出流水(异常)则跳过
+            continue
+        # 成本兜底:无 buy 流水时用 entry×|shares|(shares 已被清仓覆盖为末笔,不精确,仅兜底)
+        if not cost:
+            cost = abs((p["entry"] or 0) * (p["shares"] or 0)) or None
+        pl_pct = (realized / cost * 100) if cost else None
+        od, cd = _parse_date(p["opened_at"]), _parse_date(p["closed_at"])
+        hold = (cd - od).days if (od and cd) else None
+        jr = jrows.get(pid)
+        setup = jr["setup_type"] if jr else None
+        trades.append({
+            "id": pid, "ticker": p["ticker"], "openedAt": p["opened_at"], "closedAt": p["closed_at"],
+            "holdDays": hold, "realized": realized, "plPct": pl_pct,
+            "win": realized > 0, "hadStop": p["stop"] is not None, "setup": setup or "未记录",
+        })
+
+    def _agg(items):
+        n = len(items)
+        wins = [t for t in items if t["win"]]
+        losses = [t for t in items if not t["win"]]
+        gains = [t["plPct"] for t in wins if t["plPct"] is not None]
+        losspct = [t["plPct"] for t in losses if t["plPct"] is not None]
+        avg_gain = (sum(gains) / len(gains)) if gains else None
+        avg_loss = (sum(losspct) / len(losspct)) if losspct else None   # 负值
+        win_rate = (len(wins) / n * 100) if n else None
+        loss_rate = (len(losses) / n * 100) if n else None
+        payoff = (avg_gain / abs(avg_loss)) if (avg_gain and avg_loss) else None
+        # 期望值(%/笔)= 胜率×均盈% − 败率×|均亏%|
+        expectancy = None
+        if win_rate is not None:
+            expectancy = (win_rate / 100) * (avg_gain or 0) - (loss_rate / 100) * abs(avg_loss or 0)
+        return {"count": n, "wins": len(wins), "losses": len(losses),
+                "winRate": win_rate, "avgGainPct": avg_gain, "avgLossPct": avg_loss,
+                "payoff": payoff, "expectancyPct": expectancy}
+
+    overall = _agg(trades)
+    # 平均持有天数:盈利单 vs 亏损单
+    hw = [t["holdDays"] for t in trades if t["win"] and t["holdDays"] is not None]
+    hl = [t["holdDays"] for t in trades if not t["win"] and t["holdDays"] is not None]
+    overall["avgHoldWin"] = (sum(hw) / len(hw)) if hw else None
+    overall["avgHoldLoss"] = (sum(hl) / len(hl)) if hl else None
+    # 纪律达成率:平仓时设有止损的比例(自动判定,不手填)
+    overall["disciplineRate"] = (sum(1 for t in trades if t["hadStop"]) / len(trades) * 100) if trades else None
+    # 最大回撤(已实现盈亏曲线):按平仓日期累计,峰值到谷底的最大回落($)
+    ordered = sorted((t for t in trades if t["closedAt"]), key=lambda t: t["closedAt"])
+    cum = peak = 0.0
+    max_dd = 0.0
+    for t in ordered:
+        cum += t["realized"]
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+    overall["maxDrawdown"] = max_dd
+
+    # 按 setup 分组
+    by_setup = {}
+    for t in trades:
+        by_setup.setdefault(t["setup"], []).append(t)
+    setups = []
+    for name, items in by_setup.items():
+        a = _agg(items)
+        a["setup"] = name
+        setups.append(a)
+    setups.sort(key=lambda x: (x["expectancyPct"] is None, -(x["expectancyPct"] or 0)))
+
+    trades.sort(key=lambda t: (t["closedAt"] or ""), reverse=True)
+    return jsonify({"overall": overall, "bySetup": setups, "trades": trades})
+
+
 # ============================ 每日复盘:组合快照 ============================
 
 def take_portfolio_snapshot(date_str):
@@ -2763,6 +2934,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #alertBanner:not(:empty){padding:8px 24px;background:rgba(239,83,80,.12);border-bottom:1px solid var(--red)}
   #alertBanner .ab{color:var(--red);font-size:13px;font-weight:600;margin-right:14px}
   .hidden{display:none}
+  /* 弹窗(交易日志) */
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50;display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 16px}
+  .modal{background:var(--bg);border:1px solid var(--border);border-radius:14px;padding:22px 24px;width:100%;max-width:720px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .modal h3{margin:0 0 4px;font-size:18px}
+  .jfield{margin-bottom:14px}
+  .jfield>label{display:block;color:var(--muted);font-size:12px;margin-bottom:6px}
+  .jfield input[type=text],.jfield textarea,.jfield select{width:100%;box-sizing:border-box;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:9px 11px;border-radius:8px;font-size:14px}
+  .jfield textarea{min-height:64px;resize:vertical;line-height:1.6}
+  .chipset{display:flex;flex-wrap:wrap;gap:7px}
+  .chip{border:1px solid var(--border);background:var(--panel);color:var(--muted);padding:5px 12px;border-radius:20px;font-size:13px;cursor:pointer;user-select:none}
+  .chip.on{background:rgba(88,166,255,.18);border-color:var(--accent);color:var(--accent)}
+  .chip.mist.on{background:rgba(239,83,80,.16);border-color:var(--red);color:var(--red)}
+  .scale{display:flex;gap:6px}
+  .scale .chip{width:34px;text-align:center;padding:5px 0}
+  .disc-line{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;margin:2px 0 4px}
+  .disc-ok{color:var(--green)}.disc-bad{color:var(--red)}
   /* 对比 */
   #cmpChart{width:100%;height:420px;border:1px solid var(--border);border-radius:10px;overflow:hidden}
   .cmpbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
@@ -2830,6 +3017,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
    <nav class="sidenav">
      <button id="nav-stock" class="active" onclick="switchPage('stock')">📊 个股看板</button>
      <button id="nav-positions" onclick="switchPage('positions')">💼 持仓</button>
+     <button id="nav-perf" onclick="switchPage('perf')">🎯 绩效面板</button>
      <button id="nav-review" onclick="switchPage('review')">📓 每日复盘</button>
      <button id="nav-equity" onclick="switchPage('equity')">📈 资金曲线</button>
      <button id="nav-heatmap" onclick="switchPage('heatmap')">🔥 市场热力图</button>
@@ -2862,6 +3050,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <!-- 持仓页 -->
   <div id="page-positions" class="hidden"><div class="loading">加载持仓…</div></div>
 
+  <!-- 绩效面板页 -->
+  <div id="page-perf" class="hidden"><div class="loading">加载绩效…</div></div>
+
   <!-- 每日复盘页 -->
   <div id="page-review" class="hidden"><div class="loading">加载复盘…</div></div>
 
@@ -2889,6 +3080,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
  </main>
 </div>
+<div id="journalModal" class="hidden"></div>
 
 <script>
 const POPULAR=["AAPL","TSLA","NVDA","MSFT","GOOGL","AMZN","META","AMD"];
@@ -2908,12 +3100,13 @@ const heatColor=c=>{if(c==null)return"#30363d";const x=Math.max(-3,Math.min(3,c)
 function switchPage(p){
   curPage=p;
   try{localStorage.setItem("curPage",p);}catch(e){}   // 记住当前页,刷新后恢复
-  ["stock","positions","review","equity","heatmap"].forEach(x=>{
+  ["stock","positions","perf","review","equity","heatmap"].forEach(x=>{
     document.getElementById("page-"+x).classList.toggle("hidden",p!==x);
     document.getElementById("nav-"+x).classList.toggle("active",p===x);
   });
   if(p==="heatmap" && !window._heatLoaded) loadHeatmap();
   if(p==="positions") loadPositions();
+  if(p==="perf") loadPerf();
   if(p==="review") loadReview();
   if(p==="equity") loadEquity();
 }
@@ -3458,6 +3651,7 @@ function loadPositions(){
 async function loadTrack(){
   const el=document.getElementById("posTrack");
   const d=await j("/api/positions");
+  const jmap=await j("/api/journal").catch(()=>({}));   // 已填日志的持仓(标 ✍)
   const s=d.summary||{};
   const open=d.positions.filter(p=>p.status==="open"),trades=d.trades||[];
   const acct=getSetting("accountValue","100000");
@@ -3497,7 +3691,7 @@ async function loadTrack(){
       <td>${fmtNum(p.stop)}</td><td class="${stopc}" title="现价到止损还要跌多少;止损在成本之上则锁利(绿)">${p.toStopPct!=null?fmtPct(p.toStopPct):"—"}</td>
       <td>${riskCell}</td>
       <td class="muted">${p.note||""}</td>
-      <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
+      <td><a onclick="editPosition(${p.id})">改</a> · <a onclick="closePosition(${p.id},${p.price||0})">平仓</a> · <a onclick="openJournal(${p.id},'${p.ticker}',{hadStop:${p.stop!=null}})" title="记录 setup/理由/信念/情绪(事后也可补)">日志${jmap[p.id]?" ✍":""}</a> · <a style="color:var(--red)" onclick="delPosition(${p.id})">删</a></td>
     </tr>`;}).join("");
   window._allTrades=trades;window._tradePage=0;
   el.innerHTML=`
@@ -3610,6 +3804,113 @@ async function savePosition(id){
   const body={shares,entry,stop:numOrNull(v("stop")),target:numOrNull(v("target")),note:v("note"),manual_price:numOrNull(v("mprice"))};
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   loadTrack();
+}
+
+// ---------- 结构化交易日志(弹窗) ----------
+const SETUP_TYPES=["VCP突破","杯柄","平台整理","高紧密旗形(HTF)","均线回踩","Power Play","反转日","其他"];
+const EXIT_REASONS=["触止损","到目标减仓","跌破20MA","大盘转弱","情绪化割肉","其他"];
+const MISTAKE_TAGS=["追高","止损过宽","仓位过重","无视大盘","过早离场","死扛"];
+let _jDraft=null;
+async function openJournal(pid,ticker,ctx){
+  ctx=ctx||{};
+  const jr=await j("/api/journal/"+pid)||{};
+  _jDraft={pid,mistakes:new Set(jr.mistake_tags||[]),conviction:jr.conviction||0,emotion:jr.emotion||0};
+  const esc=s=>String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
+  const setupOpts='<option value="">— 选择 setup —</option>'+SETUP_TYPES.map(t=>`<option ${jr.setup_type===t?"selected":""}>${t}</option>`).join("");
+  const exitOpts='<option value="">— 选择退出理由 —</option>'+EXIT_REASONS.map(t=>`<option ${jr.exit_reason===t?"selected":""}>${t}</option>`).join("");
+  const scale=(name,val)=>`<div class="scale" id="j-${name}">`+[1,2,3,4,5].map(n=>`<span class="chip ${val==n?"on":""}" onclick="setScale('${name}',${n})">${n}</span>`).join("")+`</div>`;
+  const mist='<div class="chipset">'+MISTAKE_TAGS.map(t=>`<span class="chip mist ${_jDraft.mistakes.has(t)?"on":""}" onclick="toggleMistake(this,'${t}')">${t}</span>`).join("")+`</div>`;
+  const disc=(ctx.hadStop!=null)?`<div class="disc-line"><span class="${ctx.hadStop?"disc-ok":"disc-bad"}">纪律自评(自动)· 止损:${ctx.hadStop?"有 ✓":"无 ✗"}</span><span class="muted">此项自动判定,无需手填</span></div>`:"";
+  const m=document.getElementById("journalModal");
+  m.innerHTML=`<div class="modal-bg" onclick="if(event.target===this)closeJournal()"><div class="modal">
+    <h3>交易日志 · ${ticker} <span class="muted" style="font-size:12px">#${pid}</span></h3>
+    ${disc}
+    <div class="jfield"><label>Setup 类型</label><select id="j-setup">${setupOpts}</select></div>
+    <div class="jfield"><label>入场理由(为什么现在买:枢轴 / 量 / 大盘配合…)</label><textarea id="j-entry">${esc(jr.entry_reason)}</textarea></div>
+    <div class="jfield" style="display:flex;gap:36px;flex-wrap:wrap">
+      <div><label>信念度(1–5)</label>${scale("conv",_jDraft.conviction)}</div>
+      <div><label>下单情绪(1 平静 – 5 FOMO/冲动)</label>${scale("emo",_jDraft.emotion)}</div>
+    </div>
+    <div class="jfield"><label>退出理由</label><select id="j-exit">${exitOpts}</select>
+      <input type="text" id="j-exitnote" placeholder="退出补充说明(选填)" value="${esc(jr.exit_note)}" style="margin-top:8px"></div>
+    <div class="jfield"><label>错误标签(多选)</label>${mist}</div>
+    <div class="jfield"><label>教训(这笔最大的一条心得)</label><textarea id="j-lesson">${esc(jr.lesson)}</textarea></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:6px">
+      <button class="search" style="margin:0;background:var(--panel);color:var(--muted)" onclick="closeJournal()">取消</button>
+      <button class="search" style="margin:0" onclick="saveJournal()">保存日志</button>
+    </div>
+  </div></div>`;
+  m.classList.remove("hidden");
+}
+function setScale(name,n){
+  if(name==="conv")_jDraft.conviction=n; else _jDraft.emotion=n;
+  const box=document.getElementById("j-"+name);if(!box)return;
+  [...box.children].forEach((c,i)=>c.classList.toggle("on",i+1===n));
+}
+function toggleMistake(el,tag){
+  if(_jDraft.mistakes.has(tag)){_jDraft.mistakes.delete(tag);el.classList.remove("on");}
+  else{_jDraft.mistakes.add(tag);el.classList.add("on");}
+}
+function closeJournal(){const m=document.getElementById("journalModal");m.classList.add("hidden");m.innerHTML="";_jDraft=null;}
+async function saveJournal(){
+  if(!_jDraft)return;
+  const g=id=>{const e=document.getElementById(id);return e?e.value.trim():"";};
+  const body={setup_type:g("j-setup"),entry_reason:g("j-entry"),
+    conviction:_jDraft.conviction||null,emotion:_jDraft.emotion||null,
+    exit_reason:g("j-exit"),exit_note:g("j-exitnote"),
+    mistake_tags:[..._jDraft.mistakes],lesson:g("j-lesson")};
+  await fetch("/api/journal/"+_jDraft.pid,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  closeJournal();
+  if(curPage==="perf")loadPerf(); else if(document.getElementById("posTrack"))loadTrack();
+}
+
+// ---------- 绩效面板 ----------
+async function loadPerf(){
+  const el=document.getElementById("page-perf");
+  el.innerHTML='<div class="loading">加载绩效…</div>';
+  const d=await j("/api/performance");
+  const o=d.overall||{};
+  const head=`<div class="section-title" style="margin-top:6px">绩效面板 <span class="tag">基于已平仓交易 + 交易日志实时聚合</span></div>`;
+  if(!o.count){
+    el.innerHTML=head+`<div class="muted" style="font-size:13px">暂无已平仓交易。平掉一笔后,这里会自动统计胜率、盈亏比、期望值等;给持仓填「日志」并标注 setup,还能看到分 setup 的表现。</div>`;
+    return;
+  }
+  const pc=v=>v==null?"—":(v>=0?"+":"")+v.toFixed(2)+"%";
+  const expClass=(o.expectancyPct||0)>=0?"green":"red";
+  const payoffClass=(o.payoff!=null&&o.payoff>=2)?"green":((o.payoff!=null&&o.payoff<1)?"red":"");
+  const cards=`<div class="grid" style="margin-bottom:8px">
+    <div class="card"><div class="k">胜率 (batting average)</div><div class="v">${o.winRate!=null?o.winRate.toFixed(1)+"%":"—"} <span class="muted" style="font-size:12px">${o.wins}/${o.count}</span></div></div>
+    <div class="card"><div class="k">平均盈利%</div><div class="v green">${pc(o.avgGainPct)}</div></div>
+    <div class="card"><div class="k">平均亏损%</div><div class="v red">${pc(o.avgLossPct)}</div></div>
+    <div class="card"><div class="k">盈亏比(目标 ≥2:1)</div><div class="v ${payoffClass}">${o.payoff!=null?o.payoff.toFixed(2)+":1":"—"}</div></div>
+    <div class="card"><div class="k">期望值 /笔</div><div class="v ${expClass}">${pc(o.expectancyPct)}</div></div>
+    <div class="card"><div class="k">最大回撤(已实现)</div><div class="v red">${o.maxDrawdown?"-$"+fmtBig(o.maxDrawdown):"$0"}</div></div>
+    <div class="card"><div class="k">平均持有 盈/亏(天)</div><div class="v">${o.avgHoldWin!=null?o.avgHoldWin.toFixed(0):"—"} / ${o.avgHoldLoss!=null?o.avgHoldLoss.toFixed(0):"—"}</div></div>
+    <div class="card"><div class="k">纪律达成率(有止损)</div><div class="v">${o.disciplineRate!=null?o.disciplineRate.toFixed(0)+"%":"—"}</div></div>
+  </div>
+  <div class="small">期望值 = 胜率×平均盈利 − 败率×平均亏损,为一笔交易的数学期望;>0 即正期望策略。盈亏比 = 平均盈利 ÷ |平均亏损|,Minervini 目标 ≥2:1。最大回撤基于已实现盈亏曲线的峰谷回落。</div>`;
+  // 分 setup
+  const sr=(d.bySetup||[]).map(x=>`<tr>
+    <td>${x.setup}</td><td>${x.count}</td>
+    <td>${x.winRate!=null?x.winRate.toFixed(0)+"%":"—"}</td>
+    <td class="green">${pc(x.avgGainPct)}</td><td class="red">${pc(x.avgLossPct)}</td>
+    <td>${x.payoff!=null?x.payoff.toFixed(2)+":1":"—"}</td>
+    <td class="${(x.expectancyPct||0)>=0?'green':'red'}">${pc(x.expectancyPct)}</td></tr>`).join("");
+  const setupTable=`<div class="section-title" style="font-size:14px">按 Setup 分组(找出哪类最赚钱,加码它、淘汰差的)</div>
+    <table><thead><tr><th>Setup</th><th>笔数</th><th>胜率</th><th>均盈</th><th>均亏</th><th>盈亏比</th><th>期望/笔</th></tr></thead><tbody>${sr}</tbody></table>
+    <div class="small">未给日志标 setup 的交易归入「未记录」。给持仓填日志并选 setup,分组才有意义。</div>`;
+  // 逐笔明细
+  const tr=(d.trades||[]).map(t=>`<tr>
+    <td><b>${t.ticker}</b></td><td class="muted">${t.setup}</td>
+    <td class="muted">${t.openedAt||"—"}</td><td class="muted">${t.closedAt||"—"}</td>
+    <td>${t.holdDays!=null?t.holdDays:"—"}</td>
+    <td class="${t.plPct>=0?'green':'red'}">${pc(t.plPct)}</td>
+    <td class="${t.realized>=0?'green':'red'}">${t.realized>=0?"+":""}$${fmtBig(t.realized)}</td>
+    <td>${t.hadStop?'<span class="green" title="平仓时设有止损">有</span>':'<span class="red" title="无止损">无</span>'}</td>
+    <td><a onclick="openJournal(${t.id},'${t.ticker}',{hadStop:${t.hadStop}})">日志</a></td></tr>`).join("");
+  const tradeTable=`<div class="section-title" style="font-size:14px">逐笔明细(已平仓)</div>
+    <table><thead><tr><th>代码</th><th>Setup</th><th>开仓</th><th>平仓</th><th>持有天</th><th>盈亏%</th><th>已实现</th><th>止损</th><th>日志</th></tr></thead><tbody>${tr}</tbody></table>`;
+  el.innerHTML=head+cards+setupTable+tradeTable;
 }
 
 // ---------- 每日复盘 ----------
