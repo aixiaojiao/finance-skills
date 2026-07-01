@@ -3264,7 +3264,9 @@ def api_cache_status():
 
 @app.route("/")
 def index():
-    return Response(INDEX_HTML.replace("{{VERSION}}", APP_VERSION), mimetype="text/html")
+    resp = Response(INDEX_HTML.replace("{{VERSION}}", APP_VERSION), mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"   # 页面每次更新即时可见,免手动强刷
+    return resp
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -4199,7 +4201,7 @@ async function loadTrack(){
       <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npPrice" placeholder="现价(手填,选填)" type="number" title="期权/港股等无实时行情时手填现价;留空则走 yfinance" style="width:130px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
-    ${open.length?`<table class="postbl"><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>操作(编号)</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
+    ${open.length?`<table class="postbl"><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注(操作编号)</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
     <div id="tradeBox"></div>
     <div class="small">组合风险敞口 = Σ(现价−止损)×股数,占账户比例即「组合热度」,SEPA 建议总热度别过高。现价为 yfinance 延迟数据。</div>`;
   renderTrades();
