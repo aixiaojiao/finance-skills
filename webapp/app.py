@@ -41,7 +41,7 @@ app = Flask(__name__)
 # ============================ SQLite 持久化 ============================
 # 持仓 / 自选 / 预警 / 设置 落盘,跨设备。路径可用 DASHBOARD_DB 覆盖。
 
-APP_VERSION = "1.3.3"   # 版本号(见 CHANGELOG.md);按语义化版本管理
+APP_VERSION = "1.4.0"   # 版本号(见 CHANGELOG.md);按语义化版本管理
 
 DB_PATH = os.environ.get("DASHBOARD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "dashboard.db"))
 
@@ -665,6 +665,31 @@ def _daily_report_enabled():
     return (r is None) or str(r[0]) != "0"     # 用户已明确要日报:默认开,显式设 '0' 才关
 
 
+def _snapshot_confirm_enabled():
+    """资金快照「确认窗口」开关(settings.snapshotConfirmEnabled,默认关)。
+    开启后:自然日窗口(美东0点→0点),17:00 落临时快照并提醒补录,美东次日0:00 超时自动锁定;
+    用户补录后可在持仓页提前『确认并锁定』。关闭则维持旧行为(8点→8点窗口,20:00 锁定)。"""
+    con = _cache_db()
+    try:
+        r = con.execute("SELECT value FROM settings WHERE key='snapshotConfirmEnabled'").fetchone()
+    finally:
+        con.close()
+    return bool(r) and str(r[0]) == "1"
+
+
+def _snapshot_status():
+    """今日资金快照的确认状态,供持仓页横幅。pending=已生成临时快照但尚未锁定(确认窗口内)。"""
+    if not _snapshot_confirm_enabled():
+        return {"confirmEnabled": False, "pending": False}
+    today = _snapshot_date()
+    con = _cache_db()
+    try:
+        r = con.execute("SELECT locked_at FROM equity_snapshots WHERE date=?", (today,)).fetchone()
+    finally:
+        con.close()
+    return {"confirmEnabled": True, "pending": bool(r) and not r[0], "date": today}
+
+
 def _money(v):
     return "—" if v is None else f"{v:,.2f}"
 
@@ -781,6 +806,26 @@ def _daily_report_loop():
                 _mark_fired(snap_key)
         except Exception:
             pass
+        # 资金曲线「确认窗口」:确认模式下,17:00 先落临时快照(locked_at 留空)并提醒补录;
+        # 用户补录后可提前确认锁定,否则美东次日 0:00 由 _equity_snapshot_loop 超时自动锁。
+        try:
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            if _snapshot_confirm_enabled() and now_et.weekday() < 5:
+                today = now_et.date().isoformat()
+                con = _cache_db()
+                try:
+                    r = con.execute("SELECT locked_at FROM equity_snapshots WHERE date=?", (today,)).fetchone()
+                finally:
+                    con.close()
+                if not (r and r[0]):                                # 尚未锁定 → 落/刷新临时快照
+                    _capture_snapshot(today, lock=False)
+                    pk = f"snapconfirm:{today}"
+                    if _tg_relay_webhook() and pk not in _fired_keys():
+                        _tg_send("📸 今日资金快照已生成(临时)。\n如今天有<b>未录入的持仓变动</b>,请到持仓页补录,"
+                                 "补录后点『确认并锁定今日快照』;\n否则将于<b>美东次日 0:00</b>按当前持仓自动锁定。")
+                        _mark_fired(pk)
+        except Exception:
+            pass
 
 
 def _alert_push_loop():
@@ -815,16 +860,29 @@ def _scheduler_loop():
 
 
 def _equity_snapshot_loop():
-    # 每天美东 20:00 锁定当日资金快照(8点→8点窗口收盘)。结转手动总资金量 + 抓持仓收盘市值。
+    # 锁定资金快照。旧行为:每天美东 20:00 锁当日(8点→8点窗口)。
+    # 确认模式:改为美东次日 0:00 锁「刚结束的自然日」,且仅当该日尚未被用户提前『确认锁定』。
     while True:
         et = datetime.now(ZoneInfo("America/New_York"))
-        target = et.replace(hour=20, minute=0, second=0, microsecond=0)
+        lock_hour = 0 if _snapshot_confirm_enabled() else 20
+        target = et.replace(hour=lock_hour, minute=0, second=0, microsecond=0)
         if target <= et:
             target += timedelta(days=1)
         time.sleep(max(60, (target - et).total_seconds()))
         try:
             now_et = datetime.now(ZoneInfo("America/New_York"))
-            _capture_snapshot(now_et.date().isoformat())   # 此刻刚过 20:00,锁定的正是当日窗口
+            if _snapshot_confirm_enabled():
+                # 刚过美东 0:00:锁定昨天(刚结束的自然日);已被提前确认(locked_at 已写)则跳过
+                lock_date = (now_et - timedelta(hours=1)).date().isoformat()
+                con = _cache_db()
+                try:
+                    r = con.execute("SELECT locked_at FROM equity_snapshots WHERE date=?", (lock_date,)).fetchone()
+                finally:
+                    con.close()
+                if not (r and r[0]):
+                    _capture_snapshot(lock_date, lock=True)
+            else:
+                _capture_snapshot(now_et.date().isoformat())   # 旧行为:刚过 20:00,锁定当日窗口
         except Exception:
             pass
 
@@ -2142,11 +2200,12 @@ def _live_prices(tickers):
 # ============================ 资金曲线快照(8点→8点窗口) ============================
 
 def _snapshot_date(et=None):
-    """当前更新归属哪一天的快照。美东 20:00 为窗口界限:<20:00 算今天,≥20:00 归到明天。
-    即 date=D 的快照,收集 (D-1)20:00 ~ D 19:59(美东)之间的最后一次更新,在 D 日 20:00 锁定。"""
+    """当前更新归属哪一天的快照。
+    旧行为(确认模式关):美东 20:00 为窗口界限,<20:00 算今天、≥20:00 归到明天,20:00 锁定。
+    确认模式开:改为自然日窗口(美东 0:00→0:00),date 即当前美东日期,美东次日 0:00 锁定。"""
     et = et or datetime.now(ZoneInfo("America/New_York"))
     d = et.date()
-    if et.hour >= 20:
+    if not _snapshot_confirm_enabled() and et.hour >= 20:
         d = d + timedelta(days=1)
     return d.isoformat()
 
@@ -2165,9 +2224,11 @@ def _upsert_account_snapshot(date_str, value):
         con.close()
 
 
-def _capture_snapshot(date_str, manual_value=None, mark_manual=False):
-    """完整锁定某日快照:抓当前持仓现价算市值/成本并存持仓明细。account_value 优先级:
-    传入 manual_value > 该日已存手动值 > 当前 accountValue 设置(结转)。供 20:00 定时任务与「今日快照」按钮调用。"""
+def _capture_snapshot(date_str, manual_value=None, mark_manual=False, lock=True):
+    """完整快照某日:抓当前持仓现价算市值/成本并存持仓明细。account_value 优先级:
+    传入 manual_value > 该日已存手动值 > 当前 accountValue 设置(结转)。供锁定任务与「今日快照」按钮调用。
+    lock=True 写 locked_at(锁定);lock=False 为临时快照(locked_at 留空,确认窗口内可再更新),
+    且绝不覆盖已存在的 locked_at(用 COALESCE 保护——临时刷新不会误解锁已锁定的当日)。"""
     con = _cache_db()
     try:
         rows = con.execute("SELECT ticker,shares,entry FROM positions WHERE status='open'").fetchall()
@@ -2190,14 +2251,16 @@ def _capture_snapshot(date_str, manual_value=None, mark_manual=False):
             av = float(s[0]) if s and s[0] else None
         net_flow = (ex[1] if ex else 0) or 0
         manual_flag = 1 if (mark_manual or (ex and ex[2])) else 0
+        locked_at = datetime.now(timezone.utc).isoformat() if lock else None
         con.execute(
             """INSERT INTO equity_snapshots(date,account_value,net_flow,market_value,cost,positions_json,manual,locked_at)
                VALUES(?,?,?,?,?,?,?,?)
                ON CONFLICT(date) DO UPDATE SET account_value=excluded.account_value,
                  market_value=excluded.market_value, cost=excluded.cost,
-                 positions_json=excluded.positions_json, manual=excluded.manual, locked_at=excluded.locked_at""",
+                 positions_json=excluded.positions_json, manual=excluded.manual,
+                 locked_at=COALESCE(excluded.locked_at, equity_snapshots.locked_at)""",
             (date_str, av, net_flow, mv, cost, json.dumps(pj, ensure_ascii=False),
-             manual_flag, datetime.now(timezone.utc).isoformat()))
+             manual_flag, locked_at))
         con.commit()
     finally:
         con.close()
@@ -2252,6 +2315,9 @@ def api_equity():
         d = request.get_json(force=True, silent=True) or {}
         if d.get("action") == "capture":        # 「今日快照」:用当前总资金量 + 持仓即时锁定当日
             _capture_snapshot(_snapshot_date())
+            return jsonify({"ok": True})
+        if d.get("action") == "confirm":         # 确认窗口内:补录完成后提前锁定今日快照(否则次日0点自动锁)
+            _capture_snapshot(_snapshot_date(), lock=True)
             return jsonify({"ok": True})
         date_str = (d.get("date") or _snapshot_date()).strip()
         av = _num(d.get("accountValue"))
@@ -2314,6 +2380,26 @@ def api_equity_one(date_str):
     return jsonify({"ok": True})
 
 
+def _resolve_trade_ts(d):
+    """补录支持:请求可带 trade_date(YYYY-MM-DD)指定成交日期,默认今天、不得晚于今天。
+    返回 (at, ts):
+      at = 纯日期,写入交易明细「日期」列 / opened_at / closed_at,并驱动复盘按日筛选;
+      ts = 该日期 + 当前时刻,用于排序(ORDER BY ts)——补录的历史日排在当日之前,同日按录入先后。
+    trade_date 非法或为未来日期时抛 ValueError,由调用方转 400。"""
+    now = time.localtime()
+    today = time.strftime("%Y-%m-%d", now)
+    raw = (d.get("trade_date") or "").strip()
+    if not raw:
+        return today, time.strftime("%Y-%m-%d %H:%M:%S", now)
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        raise ValueError("成交日期格式应为 YYYY-MM-DD")
+    if dt > today:
+        raise ValueError("成交日期不能晚于今天")
+    return dt, dt + time.strftime(" %H:%M:%S", now)
+
+
 @app.route("/api/positions", methods=["GET", "POST"])
 def api_positions():
     db = get_db()
@@ -2322,7 +2408,10 @@ def api_positions():
         tk = (d.get("ticker") or "").strip().upper()
         if not tk or not d.get("shares") or not d.get("entry"):
             return jsonify({"error": "ticker / shares / entry 必填"}), 400
-        today = time.strftime("%Y-%m-%d")
+        try:
+            at, ts = _resolve_trade_ts(d)          # 补录:trade_date 可指定成交日期,默认今天
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
         add_shares, add_entry = float(d["shares"]), float(d["entry"])
         mp = _num(d.get("manual_price"))
         stop = _num(d.get("stop"))
@@ -2351,14 +2440,16 @@ def api_positions():
             # 全新建仓或止损不同的独立加仓:备注仅存用户手写内容(操作留痕靠交易明细编号)
             cur = db.execute("INSERT INTO positions(ticker,shares,entry,stop,target,opened_at,status,note,manual_price,no_stop_ack) VALUES(?,?,?,?,?,?, 'open', ?, ?, ?)",
                              (tk, add_shares, add_entry, stop, _num(d.get("target")),
-                              today, d.get("note") or "", mp, no_stop_ack))
+                              at, d.get("note") or "", mp, no_stop_ack))
             pos_id = cur.lastrowid
         db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'buy',?,?,NULL,?,?,?)",
-                   (pos_id, tk, add_shares, add_entry, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
+                   (pos_id, tk, add_shares, add_entry, at, ts, d.get("note") or ""))
         db.commit()
         return jsonify({"ok": True, "merged": merge})
-    # GET: 带实时盈亏
-    return jsonify(_portfolio_state(db))
+    # GET: 带实时盈亏 + 今日快照确认状态(持仓页横幅用)
+    state = _portfolio_state(db)
+    state["snapshot"] = _snapshot_status()
+    return jsonify(state)
 
 
 def _portfolio_state(db):
@@ -2450,13 +2541,16 @@ def api_position_one(pid):
             qty = cur_shares                                   # 默认/全部视为清仓
         else:
             qty = -abs(qty) if cur_shares < 0 else abs(qty)    # 部分:对齐持仓方向
-        today = time.strftime("%Y-%m-%d")
+        try:
+            at, ts = _resolve_trade_ts(d)          # 补录:trade_date 可指定成交日期,默认今天
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
         pl = (px - row["entry"]) * qty
         sell_cur = db.execute("INSERT INTO trades(position_id,ticker,action,shares,price,pl,at,ts,note) VALUES(?,?,'sell',?,?,?,?,?,?)",
-                              (pid, row["ticker"], qty, px, pl, today, time.strftime("%Y-%m-%d %H:%M:%S"), d.get("note") or ""))
+                              (pid, row["ticker"], qty, px, pl, at, ts, d.get("note") or ""))
         if abs(qty) >= abs(cur_shares):                        # 清仓
             db.execute("UPDATE positions SET status='closed', exit_price=?, closed_at=?, shares=? WHERE id=?",
-                       (px, today, qty, pid))
+                       (px, at, qty, pid))
             # 清仓:累计该标的所有卖出的已实现盈亏,写进本笔流水备注,便于复盘看总盈利
             total = db.execute("SELECT COALESCE(SUM(pl),0) FROM trades WHERE position_id=? AND action='sell'",
                                (pid,)).fetchone()[0] or 0.0
@@ -4190,7 +4284,15 @@ async function loadTrack(){
     <span style="display:flex;gap:6px;flex-wrap:wrap">${noStopUnacked.map(p=>`<a onclick="flashPosRow(${p.id})" style="cursor:pointer;background:rgba(239,83,80,.12);color:var(--red);padding:2px 8px;border-radius:10px;font-size:12px;text-decoration:none">${p.ticker}</a>`).join("")}</span>
     <span class="muted" style="font-size:11px;margin-left:auto">点代码定位补止损,或在「改」里确认无止损</span>
   </div>`:"";
+  // 资金快照确认窗口横幅:临时快照已生成、待你补录+确认(美东次日0点超时自动锁)
+  const snap=d.snapshot||{};
+  const snapBanner=snap.pending?`<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:rgba(88,166,255,.08);border-left:3px solid var(--accent);border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:13px">
+    <span style="font-weight:600;white-space:nowrap">📸 今日资金快照待确认</span>
+    <span class="muted" style="font-size:12px">已生成临时快照。补录完今天的持仓变动后点右侧确认;超时(美东次日0:00)将按当前持仓自动锁定。</span>
+    <button class="search" style="margin:0 0 0 auto" onclick="confirmSnapshot()">确认并锁定今日快照</button>
+  </div>`:"";
   el.innerHTML=`
+    ${snapBanner}
     ${banner}
     ${capBar}
     ${sumCards}
@@ -4200,6 +4302,7 @@ async function loadTrack(){
       <input id="npEntry" placeholder="买入价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npStop" placeholder="止损价" type="number" style="width:90px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
       <input id="npPrice" placeholder="现价(手填,选填)" type="number" title="期权/港股等无实时行情时手填现价;留空则走 yfinance" style="width:130px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:8px">
+      <input id="npDate" type="date" value="${todayStr()}" max="${todayStr()}" title="成交日期(补录用):默认今天,可改为过去的日期,交易明细即按此日期显示与排序" style="background:var(--panel);border:1px solid var(--border);color:var(--text);padding:7px;border-radius:8px">
       <button class="search" style="margin:0" onclick="addPositionManual()">添加</button></div>
     ${open.length?`<table class="postbl"><thead><tr><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>浮盈亏</th><th>止损</th><th>距止损</th><th>风险敞口</th><th>备注(操作编号)</th><th>操作</th></tr></thead><tbody>${openRows}</tbody></table>`:'<div class="muted">暂无持仓。可用上方①计算器算好后一键记入,或这里手动添加。</div>'}
     <div id="tradeBox"></div>
@@ -4252,9 +4355,12 @@ function flashPosRow(id){
   tr.style.background="rgba(220,60,60,.28)";
   setTimeout(()=>{tr.style.background=orig;},1200);
 }
+// 本地当天日期 YYYY-MM-DD(交易日期输入框的默认值/上限,补录只允许今天及以前)
+function todayStr(){const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");}
 async function addPositionManual(){
   const tk=document.getElementById("npTicker").value.trim().toUpperCase();
   const shares=parseFloat(document.getElementById("npShares").value),entry=parseFloat(document.getElementById("npEntry").value),stop=parseFloat(document.getElementById("npStop").value),mp=parseFloat(document.getElementById("npPrice").value);
+  const tradeDate=(document.getElementById("npDate")||{}).value||"";
   if(!tk||!shares||!entry){alert("代码/股数/买入价必填");return;}
   const existing=(window._openPos||[]).find(p=>p.ticker===tk);
   let noStopAck=0;
@@ -4265,9 +4371,10 @@ async function addPositionManual(){
       noStopAck=1;
     }
   }
-  const r=await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop>0?stop:null,manual_price:mp>0?mp:null,no_stop_ack:noStopAck})});
+  const r=await fetch("/api/positions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:tk,shares,entry,stop:stop>0?stop:null,manual_price:mp>0?mp:null,no_stop_ack:noStopAck,trade_date:tradeDate})});
   if(!r.ok){const e=await r.json().catch(()=>({}));alert(e.error||"记入失败");return;}
   ["npTicker","npShares","npEntry","npStop","npPrice"].forEach(k=>{const e=document.getElementById(k);if(e)e.value="";});
+  const nd=document.getElementById("npDate");if(nd)nd.value=todayStr();   // 日期重置回今天
   loadTrack();
 }
 // 行内平仓表单:输入平仓价 + 平仓数量(默认全部);数量<持仓为部分平仓(减仓)
@@ -4279,7 +4386,8 @@ function closePosition(id,price){
     <td><input id="cp-shares-${id}" ${ist} value="${p.shares??""}" max="${p.shares??""}" placeholder="平仓数量"></td>
     <td class="muted">成本 ${fmtNum(p.entry)}</td>
     <td><input id="cp-price-${id}" ${ist} value="${price?price.toFixed(2):""}" placeholder="平仓价"></td>
-    <td colspan="4" class="muted">持仓 ${fmtNum(p.shares,0)} 股;数量小于持仓即部分减仓,会保留剩余仓位并注明</td>
+    <td colspan="2" class="muted">持仓 ${fmtNum(p.shares,0)} 股;数量小于持仓即部分减仓,会保留剩余仓位并注明</td>
+    <td colspan="2"><input id="cp-date-${id}" type="date" value="${todayStr()}" max="${todayStr()}" title="成交日期(补录用):默认今天,可改为过去的日期" style="background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px"></td>
     <td><input id="cp-note-${id}" value="" style="width:110px;background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px" placeholder="备注"></td>
     <td><a onclick="confirmClose(${id})">确认平仓</a> · <a onclick="loadTrack()">取消</a></td>`;
   const f=document.getElementById("cp-price-"+id);if(f){f.focus();}
@@ -4291,7 +4399,7 @@ async function confirmClose(id){
   const qtyRaw=v("shares"),qty=qtyRaw===""?null:parseFloat(qtyRaw);
   if(qtyRaw!==""&&(!isFinite(qty)||qty===0)){alert("平仓数量不能为 0");return;}  // 允许负数(空头/卖出开仓的期权)
   await fetch("/api/positions/"+id,{method:"PUT",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({action:"close",exit_price:px,shares:qty,note:v("note")})});
+    body:JSON.stringify({action:"close",exit_price:px,shares:qty,note:v("note"),trade_date:v("date")})});
   loadTrack();
 }
 async function delPosition(id){
@@ -4708,10 +4816,23 @@ let _equityRange="all";
 const _rangeLabel={all:"全部","30":"近30天","7":"近7天"};
 async function loadEquity(){
   const el=document.getElementById("page-equity");
-  el.innerHTML=`<div class="section-title" style="margin-top:6px">资金曲线 · 收益跟踪 <span class="tag">每日快照 · 美东20:00锁定</span></div>
-    <div class="muted" style="font-size:13px;margin-bottom:12px">总资金量以你在<b>持仓页顶部「更新」</b>的手动值为准(含期权/港股,自动算不准);每天美东20:00把当天最后一次更新固化为当日快照。出入金请在下表对应日填「净入金」以剔除其对收益的影响。</div>
+  const confirmOn=getSetting("snapshotConfirmEnabled","0")==="1";
+  const lockTag=confirmOn?"每日快照 · 美东次日0:00锁定(确认窗口开)":"每日快照 · 美东20:00锁定";
+  el.innerHTML=`<div class="section-title" style="margin-top:6px">资金曲线 · 收益跟踪 <span class="tag">${lockTag}</span></div>
+    <div class="cmpbar" style="margin-bottom:10px;font-size:13px">
+      <label style="display:flex;align-items:center;gap:7px;cursor:pointer">
+        <input type="checkbox" ${confirmOn?"checked":""} onchange="toggleSnapConfirm(this.checked)" style="width:16px;height:16px;cursor:pointer">
+        <b>补录确认窗口</b></label>
+      <span class="muted" style="font-size:12px">开启后:美东17:00 先落<b>临时快照</b>并提醒(Telegram+持仓页横幅),留时间给你补录当天的持仓变动;补录后到持仓页点『确认并锁定』,超时(美东次日0:00)则按当前持仓自动锁定。适合持仓非实时录入的情况。</span>
+    </div>
+    <div class="muted" style="font-size:13px;margin-bottom:12px">总资金量以你在<b>持仓页顶部「更新」</b>的手动值为准(含期权/港股,自动算不准);把当天最后一次更新固化为当日快照。出入金请在下表对应日填「净入金」以剔除其对收益的影响。</div>
     <div id="equityBody"><div class="loading">加载中…</div></div>`;
   renderEquity();
+}
+// 切换「补录确认窗口」开关(持久化到 settings + localStorage)
+async function toggleSnapConfirm(on){
+  setSetting("snapshotConfirmEnabled",on?"1":"0");
+  loadEquity();
 }
 async function renderEquity(){
   const d=await j("/api/equity?range="+_equityRange);
@@ -4813,6 +4934,11 @@ function drawEquityChart(series){
 async function captureToday(){
   await fetch("/api/equity",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"capture"})});
   renderEquity();
+}
+// 确认窗口:补录完成后提前锁定今日快照(持仓页横幅按钮)
+async function confirmSnapshot(){
+  await fetch("/api/equity",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"confirm"})});
+  if(document.getElementById("posTrack"))loadTrack();
 }
 async function addSnap(){
   const date=document.getElementById("snapDate").value.trim();
